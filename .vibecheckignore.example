@@ -1,0 +1,8 @@
+# Copy to .vibecheckignore. Paths here are excluded from scanning.
+node_modules/
+dist/
+build/
+vendor/
+.git/
+*.min.js
+coverage/

@@ -1,0 +1,26 @@
+# .github/workflows/vibecheck.yml — copy into your repo.
+# Hardened option: pin actions to a commit SHA (not @vN); version tags shown
+# here for readability.
+name: VibeCheck Security
+on: [push, pull_request]
+jobs:
+  vibecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }        # full history for secret scanning
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pipx install semgrep
+      - uses: aquasecurity/setup-trivy@v0.2.3    # trivy on PATH — no curl|sh
+      - name: Install gitleaks (pinned release, download-to-file)
+        run: |
+          v=8.21.2
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz"
+          sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+      - name: Run VibeCheck
+        run: ./TestAndVibes/vibecheck.sh --fail-on high
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: vibecheck-report, path: vibecheck-report/ }

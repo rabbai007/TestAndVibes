@@ -1,0 +1,25 @@
+# Add to .gitlab-ci.yml. Secret scan blocks; SAST/deps report-first until triaged.
+stages: [security]
+
+vibecheck:
+  stage: security
+  image: ubuntu:24.04
+  variables:
+    TRIVY_VERSION: "0.69.3"
+    GITLEAKS_VERSION: "8.21.2"
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl git python3-pip openssl ca-certificates tar
+    - pip install --quiet semgrep
+    # download-to-file + verify-by-pinned-version (no piping a remote script to a shell)
+    - curl -sSfL -o /tmp/trivy.tar.gz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+    - tar -xzf /tmp/trivy.tar.gz -C /usr/local/bin trivy
+    - curl -sSfL -o /tmp/gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+    - tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+  script:
+    - ./TestAndVibes/vibecheck.sh --fail-on high
+  artifacts:
+    when: always
+    paths: [vibecheck-report/]
+  rules:
+    - if: $CI_MERGE_REQUEST_IID
+    - if: $CI_COMMIT_BRANCH

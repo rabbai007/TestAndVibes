@@ -1,0 +1,10 @@
+# Optional config (copy to vibecheck.yml). All flags also work on the CLI.
+fail_on: high            # never | low | medium | high | critical | any
+out: vibecheck-report
+dynamic:
+  # url: https://staging.my-app.com   # uncomment to enable dynamic checks
+scanners:
+  secrets: true          # trufflehog / gitleaks
+  sast: true             # semgrep
+  dependencies: true     # trivy / osv-scanner / npm audit
+  iac: true              # trivy config (Docker/Terraform/K8s)
