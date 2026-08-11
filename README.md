@@ -16,7 +16,7 @@ read-only dynamic** checks against a URL you control:
 | 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) | semgrep |
 | 📦 Dependencies | Known CVEs in your lockfiles | trivy, osv-scanner, npm audit |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
-| 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version | curl, openssl |
+| 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
 
 > **Not a replacement for a professional penetration test.** This is automated
 > baseline hardening + regression prevention. For production systems handling
@@ -24,10 +24,30 @@ read-only dynamic** checks against a URL you control:
 
 ---
 
+## It fails closed
+
+A security gate has to distinguish **"nothing found"** from **"nothing looked."**
+When a pass cannot complete — no lockfile to scan, a scanner that crashed or
+isn't installed, an unreachable URL, an IaC file that won't parse — VibeCheck
+reports **ERROR** and exits **3**. It never renders an unscanned area as clean.
+
+```
+▶ 3. Dependency vulnerabilities
+  ⨯ ERROR: no scannable lockfile for: node — commit a lockfile
+    (npm i --package-lock-only) or --skip-deps. Dependencies NOT scanned.
+
+  ⨯ 1 pass(es) could not complete — those areas are UNKNOWN, not clean
+  ✗ INCOMPLETE — 1 pass(es) failed to run (exit 3).
+```
+
+If a pass genuinely doesn't apply to your repo, skip it **explicitly**
+(`--skip-deps`) so the report records the decision. `--no-fail-on-error` exists
+for migration, but it reintroduces the failure mode this design prevents.
+
 ## Quick start
 
 ```bash
-# 1. install the underlying scanners (Homebrew + pipx; or install manually)
+# 1. install jq (required) + the underlying scanners
 ./vibecheck.sh --install
 
 # 2. scan the current directory (static only)
@@ -41,8 +61,7 @@ read-only dynamic** checks against a URL you control:
 ```
 
 Drop `vibecheck.sh` into any repo (or keep it in one place and point `--dir` at
-targets). No config required; it degrades gracefully when a scanner is missing
-(prints an install hint and skips that pass).
+targets). No config required.
 
 ## Options
 
@@ -51,31 +70,53 @@ targets). No config required; it degrades gracefully when a scanner is missing
 | `--dir PATH` | `.` | Directory to scan |
 | `--url URL` | — | Enable dynamic checks against this URL (implies `--dynamic`) |
 | `--all` | — | Static + dynamic |
-| `--fail-on LEVEL` | `high` | Exit non-zero at/above `never\|low\|medium\|high\|critical\|any` |
+| `--fail-on LEVEL` | `high` | Exit 1 at/above `never\|low\|medium\|high\|critical\|any` |
+| `--no-fail-on-error` | — | Don't exit 3 on an incomplete pass (**unsafe** — see above) |
 | `--out DIR` | `vibecheck-report` | Where to write the report + raw tool output |
-| `--install` | — | Install the scanners and exit |
-| `--help` | — | Usage |
+| `--config PATH` | `./vibecheck.yml` | Config file (see [`config/`](config/)) |
+| `--semgrep-config X` | `auto` | Semgrep ruleset; `p/ci` avoids the network |
+| `--secrets-strict` | — | Rate unverified secrets high instead of medium |
+| `--skip-secrets`/`-sast`/`-deps`/`-iac` | — | Explicitly skip a pass (recorded as *skipped*) |
+| `--install` | — | Install jq + the scanners and exit |
+| `--version`, `--help` | — | Version / usage |
 
-**Exit codes:** `0` clean at/under threshold · `1` findings over threshold · `2` error.
+**Exit codes:** `0` clean · `1` findings at/above threshold · `2` usage error ·
+`3` a pass could not complete (fail-closed).
 
 ## Output
 
 A human-readable console summary, plus `vibecheck-report/`:
-- `report.md` — consolidated findings + a severity summary table
+- `report.md` — per-pass status table + every finding with `file:line`, rule ID,
+  and a reference link, grouped by severity
+- `vibecheck.sarif` — SARIF 2.1.0 for GitHub Code Scanning or any SARIF viewer
+- `findings.json` — machine-readable findings
 - raw JSON from each scanner (`semgrep.json`, `trivy-deps.json`, …) for triage
 
 Every scanner produces false positives. **Triage before acting** — the report
 is a starting point, not a verdict.
 
+## Configuration
+
+Optional. Copy [`config/vibecheck.example.yml`](config/vibecheck.example.yml) to
+`vibecheck.yml` (auto-detected) and/or
+[`.vibecheckignore.example`](.vibecheckignore.example) to `.vibecheckignore`.
+CLI flags override the config file. Ignore patterns are passed through to
+semgrep, trivy, and trufflehog.
+
 ## CI integration
 
 Snippets in [`ci/`](ci/):
 - **GitLab CI** — [`ci/gitlab-ci.snippet.yml`](ci/gitlab-ci.snippet.yml)
-- **GitHub Actions** — [`ci/github-actions.yml`](ci/github-actions.yml)
+- **GitHub Actions** — [`ci/github-actions.yml`](ci/github-actions.yml) (uploads
+  SARIF to the Security tab; needs `security-events: write`)
 
 Recommended rollout: run secret + dependency scanning as **blocking** from day
 one (near-zero false positives), and SAST as **report-first** until you've
 triaged the initial baseline — then flip it to blocking.
+
+Treat an **exit 3 as a real failure**, not noise: it means an area wasn't
+scanned. The usual causes are an uncommitted lockfile or a scanner missing from
+the runner image — both worth fixing rather than suppressing.
 
 ## Hardening checklist
 
@@ -86,12 +127,18 @@ OWASP theme and is the highest-value 30 minutes you'll spend on a new app.
 
 ## Requirements
 
-Bash (macOS/Linux), plus whichever scanners you want active:
+Bash (macOS/Linux) and **[`jq`](https://jqlang.github.io/jq/)** (required — all
+scanner output is parsed as JSON), plus the scanners you want active:
 [semgrep](https://semgrep.dev) · [trivy](https://trivy.dev) ·
 [grype](https://github.com/anchore/grype) ·
 [trufflehog](https://github.com/trufflesecurity/trufflehog) ·
 [gitleaks](https://github.com/gitleaks/gitleaks) · `curl`, `openssl` (usually preinstalled).
-`--install` sets up the first five via Homebrew + pipx.
+`--install` sets these up via Homebrew + pipx.
+
+A scanner that is missing makes its pass an **ERROR**, not a silent skip — use
+`--skip-*` if you don't want that pass. Note `--semgrep-config auto` fetches
+rules from semgrep.dev and needs network access; use `--semgrep-config p/ci` on
+air-gapped runners.
 
 ## Philosophy
 

@@ -1,10 +1,13 @@
-# Optional config (copy to vibecheck.yml). All flags also work on the CLI.
+# Optional config (copy to vibecheck.yml). CLI flags override these values.
+# Only the keys below are read — this is a fixed-key subset, not general YAML.
 fail_on: high            # never | low | medium | high | critical | any
+fail_on_error: true      # false = do NOT exit 3 when a pass cannot complete
+                         #         (unsafe: an unscanned area then reads as clean)
 out: vibecheck-report
 dynamic:
   # url: https://staging.my-app.com   # uncomment to enable dynamic checks
 scanners:
   secrets: true          # trufflehog / gitleaks
   sast: true             # semgrep
-  dependencies: true     # trivy / osv-scanner / npm audit
-  iac: true              # trivy config (Docker/Terraform/K8s)
+  dependencies: true     # trivy / grype / npm audit
+  iac: true              # trivy config (Docker/Terraform/K8s/Helm)

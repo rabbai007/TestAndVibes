@@ -3,6 +3,11 @@
 # here for readability.
 name: VibeCheck Security
 on: [push, pull_request]
+
+permissions:
+  contents: read
+  security-events: write        # required to upload SARIF to Code Scanning
+
 jobs:
   vibecheck:
     runs-on: ubuntu-latest
@@ -13,14 +18,31 @@ jobs:
         with: { python-version: "3.12" }
       - run: pipx install semgrep
       - uses: aquasecurity/setup-trivy@v0.2.3    # trivy on PATH — no curl|sh
+      - name: Install jq (required by VibeCheck)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
       - name: Install gitleaks (pinned release, download-to-file)
         run: |
           v=8.21.2
           curl -sSfL -o /tmp/gitleaks.tar.gz \
             "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz"
           sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+
+      # Exit codes: 0 clean · 1 findings over threshold · 2 usage error
+      #             3 a pass could not complete (fail-closed)
+      # Exit 3 means an area was NOT scanned — treat it as a real failure, not
+      # noise. If a pass legitimately cannot run here, skip it explicitly
+      # (--skip-deps etc.) rather than passing --no-fail-on-error.
       - name: Run VibeCheck
         run: ./TestAndVibes/vibecheck.sh --fail-on high
+
+      # Upload even when the gate fails, so findings land in the Security tab.
+      - name: Upload SARIF to Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: vibecheck-report/vibecheck.sarif
+          category: vibecheck
+
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: vibecheck-report, path: vibecheck-report/ }
