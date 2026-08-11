@@ -38,6 +38,10 @@ SECRETS_STRICT=0        # 1 = unverified secrets count as high, not medium
 DO_SECRETS=1; DO_SAST=1; DO_DEPS=1; DO_IAC=1
 DO_PDF=0                # 1 = also render report.pdf (needs Chrome/wkhtmltopdf/weasyprint)
 DO_OPEN=0               # 1 = open the HTML report in the default browser
+BASELINE=""             # path to an accepted-findings baseline
+USE_BASELINE=1          # 0 = ignore any baseline file that exists
+WRITE_BASELINE=0        # 1 = merge current findings into the baseline and exit
+BASELINE_STALE_DAYS=90  # warn about accepted entries older than this
 
 # ── pretty output ──
 if [ -t 1 ]; then C_R=$'\033[31m'; C_Y=$'\033[33m'; C_G=$'\033[32m'; C_B=$'\033[36m'; C_D=$'\033[2m'; C_0=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -76,6 +80,9 @@ OPTIONS
   --skip-iac           Skip the IaC pass
   --pdf                Also render DIR/report.pdf (Chrome, wkhtmltopdf, or weasyprint)
   --open               Open the HTML report in your default browser when done
+  --baseline PATH      Accepted-findings file (default: ./.vibecheck-baseline.json)
+  --write-baseline     Accept every current finding into the baseline, then exit
+  --no-baseline        Ignore any baseline file and gate on everything
   --install            Install the underlying scanners and exit
   --version            Print version and exit
   -h, --help           This help
@@ -163,6 +170,9 @@ while [ $# -gt 0 ]; do
     --skip-iac) DO_IAC=0; shift;;
     --pdf) DO_PDF=1; shift;;
     --open) DO_OPEN=1; shift;;
+    --baseline) BASELINE="${2:?--baseline needs a path}"; shift 2;;
+    --write-baseline) WRITE_BASELINE=1; shift;;
+    --no-baseline) USE_BASELINE=0; shift;;
     --install) SELF_INSTALL=1; shift;;
     --version) say "VibeCheck v$VERSION"; exit 0;;
     -h|--help) usage;;
@@ -207,17 +217,34 @@ REPORT="$OUTDIR/report.md"
 HTML="$OUTDIR/report.html"
 PDF="$OUTDIR/report.pdf"
 FINDINGS="$OUTDIR/.findings.jsonl"
+ACTIVE="$OUTDIR/.active.jsonl"      # findings that count toward the gate
+ACCEPTED="$OUTDIR/.accepted.jsonl"  # findings suppressed by the baseline
 STATUS="$OUTDIR/.status.jsonl"
 SARIF="$OUTDIR/vibecheck.sarif"
-: > "$FINDINGS"; : > "$STATUS"
+: > "$FINDINGS"; : > "$STATUS"; : > "$ACTIVE"; : > "$ACCEPTED"
+
+# ── fingerprinting ──
+# Identity for baselining is tool|rule|file|title — deliberately NOT the line
+# number, which shifts whenever anything above the finding is edited and would
+# make every accepted entry reappear on the next commit. The title is included
+# so two hits of the same rule in one file stay distinct.
+sha12() {
+  if have shasum;    then shasum -a 256 2>/dev/null | cut -c1-12
+  elif have sha256sum; then sha256sum 2>/dev/null | cut -c1-12
+  elif have openssl; then openssl dgst -sha256 2>/dev/null | sed 's/.*= *//' | cut -c1-12
+  else cksum | tr -d ' ' | cut -c1-12   # stability is what matters, not strength
+  fi
+}
+fingerprint() { printf '%s|%s|%s|%s' "$1" "$2" "$3" "$4" | sha12; }
 
 # ── findings + status stores (single source of truth for every output) ──
 # add_finding  tool severity rule file line title [helpUri]
 add_finding() {
+  local fp; fp="$(fingerprint "$1" "$3" "$4" "$6")"
   jq -cn --arg tool "$1" --arg sev "$2" --arg rule "$3" --arg file "$4" \
-         --arg line "${5:-0}" --arg title "$6" --arg help "${7:-}" \
+         --arg line "${5:-0}" --arg title "$6" --arg help "${7:-}" --arg fp "$fp" \
     '{tool:$tool, severity:$sev, rule:$rule, file:$file,
-      line:(($line|tonumber?)//0), title:$title, help:$help}' >> "$FINDINGS"
+      line:(($line|tonumber?)//0), title:$title, help:$help, fingerprint:$fp}' >> "$FINDINGS"
 }
 # set_status  pass  ok|findings|skipped|error  detail
 set_status() {
@@ -227,8 +254,29 @@ set_status() {
 # pass_error  pass  message   → records ERROR (drives fail-closed exit 3)
 pass_error() { err "$2"; set_status "$1" error "$2"; }
 
-sev_count() { jq -s --arg s "$1" '[.[]|select(.severity==$s)]|length' "$FINDINGS"; }
+sev_count() { jq -s --arg s "$1" '[.[]|select(.severity==$s)]|length' "$ACTIVE"; }
 rel() { printf '%s' "${1#$TARGET/}"; }
+
+# ── baseline (accepted findings) ──
+# Resolve after TARGET is known so a repo-local baseline is picked up.
+if [ "$USE_BASELINE" = 1 ] && [ -z "$BASELINE" ]; then
+  for c in "$TARGET/.vibecheck-baseline.json" "./.vibecheck-baseline.json"; do
+    [ -f "$c" ] && { BASELINE="$c"; break; }
+  done
+fi
+if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ]; then
+  if [ ! -f "$BASELINE" ]; then
+    [ "$WRITE_BASELINE" = 1 ] || { err "baseline not found: $BASELINE"; exit 2; }
+  elif ! jq -e '.entries' "$BASELINE" >/dev/null 2>&1; then
+    err "baseline is not valid VibeCheck baseline JSON: $BASELINE"; exit 2
+  fi
+fi
+# days since a YYYY-MM-DD date (portable across GNU/BSD date); empty if unparseable
+days_since() {
+  local d="$1" e
+  e="$(date -j -f '%Y-%m-%d' "$d" +%s 2>/dev/null || date -d "$d" +%s 2>/dev/null || echo '')"
+  [ -n "$e" ] && echo $(( ( $(date +%s) - e ) / 86400 )) || echo ''
+}
 
 # ── exclusions (.vibecheckignore, else sane defaults) ──
 IGNORE_FILE=""
@@ -758,13 +806,83 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# baseline: split findings into active (gated) and accepted (suppressed)
+# ═══════════════════════════════════════════════════════════════════
+ERRORS=$(jq -s '[.[]|select(.status=="error")]|length' "$STATUS")
+
+# --write-baseline: accept everything currently found. Existing entries keep
+# their original date and reason so re-running never erases why something was
+# accepted; only genuinely new findings are added.
+if [ "$WRITE_BASELINE" = 1 ]; then
+  head2 "Baseline"
+  [ -n "$BASELINE" ] || BASELINE="$TARGET/.vibecheck-baseline.json"
+  today="$(date '+%Y-%m-%d')"
+  prev="$OUTDIR/.prev-baseline.json"
+  if [ -f "$BASELINE" ] && jq -e '.entries' "$BASELINE" >/dev/null 2>&1; then
+    cp "$BASELINE" "$prev"
+  else
+    printf '{"version":1,"entries":[]}' > "$prev"
+  fi
+  jq -s --slurpfile prev "$prev" --arg today "$today" '
+    ($prev[0].entries // []) as $old |
+    ($old | map({key:.fingerprint, value:.}) | from_entries) as $bykey |
+    { version: 1,
+      generated: $today,
+      note: "VibeCheck accepted findings. Entries suppress a finding from the exit-code gate; they are still listed in the report. Delete an entry to re-gate it.",
+      entries: ( map({ fingerprint, tool, rule, file, title })
+                 | unique_by(.fingerprint)
+                 | map( . as $n
+                        | ($bykey[$n.fingerprint] // null) as $o
+                        | $n + { added: ($o.added // $today),
+                                 reason: ($o.reason // "") } )
+                 | sort_by(.tool, .rule, .file) )
+    }' "$FINDINGS" > "$BASELINE"
+  n_new=$(jq -s --slurpfile prev "$prev" '
+    ([$prev[0].entries[]?.fingerprint]) as $old |
+    [ .[] | select(.fingerprint as $f | ($old|index($f))|not) ] | unique_by(.fingerprint) | length' "$FINDINGS")
+  n_all=$(jq '.entries|length' "$BASELINE")
+  ok "baseline written: $BASELINE ($n_all accepted, $n_new newly added)"
+  say "  ${C_D}add a 'reason' to each entry so the next reader knows why it was accepted${C_0}"
+  say "  ${C_D}re-run without --write-baseline to scan against it${C_0}"
+  exit 0
+fi
+
+BASE_N=0; BASE_STALE=0
+if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ] && [ -f "$BASELINE" ]; then
+  jq -r '.entries[]?.fingerprint' "$BASELINE" 2>/dev/null | sort -u > "$OUTDIR/.bl-fps"
+  # An accepted finding is suppressed from the gate but still reported.
+  jq -c --slurpfile bl <(jq '[.entries[]?.fingerprint]' "$BASELINE") \
+    'select((.fingerprint as $f | $bl[0] | index($f)) != null)' "$FINDINGS" > "$ACCEPTED"
+  jq -c --slurpfile bl <(jq '[.entries[]?.fingerprint]' "$BASELINE") \
+    'select((.fingerprint as $f | $bl[0] | index($f)) == null)' "$FINDINGS" > "$ACTIVE"
+  BASE_N=$(jq -s 'length' "$ACCEPTED")
+  head2 "Baseline"
+  say "  ${C_D}$BASELINE${C_0}"
+  [ "$BASE_N" -gt 0 ] && warn "$BASE_N finding(s) accepted by baseline — excluded from the gate, still listed in the report" \
+                      || ok "no findings matched the baseline"
+  # Staleness: prompt re-review without breaking the build on a timer.
+  while IFS=$'\t' read -r fpr added; do
+    [ -z "${added:-}" ] && continue
+    d="$(days_since "$added")"
+    [ -n "$d" ] && [ "$d" -gt "$BASELINE_STALE_DAYS" ] && BASE_STALE=$((BASE_STALE+1))
+  done < <(jq -r '.entries[]? | [.fingerprint, (.added//"")] | @tsv' "$BASELINE" 2>/dev/null)
+  [ "$BASE_STALE" -gt 0 ] && warn "$BASE_STALE baseline entr(ies) older than $BASELINE_STALE_DAYS days — re-review whether they are still acceptable"
+  # An unused entry usually means the finding was fixed: worth pruning.
+  bl_total=$(jq '.entries|length' "$BASELINE")
+  unused=$((bl_total - BASE_N))
+  [ "$unused" -gt 0 ] && say "  ${C_D}$unused baseline entr(ies) matched nothing (fixed or moved) — prune with --write-baseline${C_0}"
+else
+  cp "$FINDINGS" "$ACTIVE"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # outputs: report.md · findings.json · SARIF
 # ═══════════════════════════════════════════════════════════════════
 CRIT=$(sev_count critical); HIGH=$(sev_count high); MED=$(sev_count medium); LOW=$(sev_count low)
 TOTAL=$((CRIT+HIGH+MED+LOW))
-ERRORS=$(jq -s '[.[]|select(.status=="error")]|length' "$STATUS")
 
-jq -s '.' "$FINDINGS" > "$OUTDIR/findings.json"
+jq -s '{active: ., accepted: $acc[0]}' --slurpfile acc <(jq -s '.' "$ACCEPTED") "$ACTIVE" \
+  > "$OUTDIR/findings.json"
 
 {
   echo "# VibeCheck security report"
@@ -806,9 +924,19 @@ jq -s '.' "$FINDINGS" > "$OUTDIR/findings.json"
       echo "| Tool | Rule | Location | Detail |"
       echo "|---|---|---|---|"
       jq -rs --arg s "$s" '.[] | select(.severity==$s)
-        | "| \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)\(if .line>0 then ":\(.line)" else "" end)`" end) | \(.title|gsub("\\|";"\\\\|")) \(if .help=="" then "" else "([ref](\(.help)))" end) |"' "$FINDINGS"
+        | "| \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)\(if .line>0 then ":\(.line)" else "" end)`" end) | \(.title|gsub("\\|";"\\\\|")) \(if .help=="" then "" else "([ref](\(.help)))" end) |"' "$ACTIVE"
       echo
     done
+  fi
+  if [ "$BASE_N" -gt 0 ]; then
+    echo "## Accepted (baseline)"
+    echo
+    echo "Suppressed from the exit-code gate by \`$(basename "$BASELINE")\`. Still present in the code."
+    echo
+    echo "| Severity | Tool | Rule | Location | Detail |"
+    echo "|---|---|---|---|---|"
+    jq -rs '.[] | "| \(.severity) | \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)`" end) | \(.title|gsub("\\|";"\\\\|")) |"' "$ACCEPTED"
+    echo
   fi
   echo "_Raw scanner output in \`$OUTDIR/\`. SARIF: \`$(basename "$SARIF")\`._"
   echo "_Scanners produce false positives — triage before acting._"
@@ -841,6 +969,7 @@ jq -s --arg ver "$VERSION" --arg uri "$TOOL_URL" '
         ruleId: (.tool + "." + .rule),
         level: (.severity|level),
         message: { text: .title },
+        partialFingerprints: { vibecheckFingerprint: .fingerprint },
         properties: { "security-severity": (.severity|secsev), tool: .tool },
         locations: [{ physicalLocation: (
           { artifactLocation: { uri: (if .file == "" then "." else .file end) } }
@@ -848,7 +977,7 @@ jq -s --arg ver "$VERSION" --arg uri "$TOOL_URL" '
         )}]
       })
     }]
-  }' "$FINDINGS" > "$SARIF" 2>/dev/null || {
+  }' "$ACTIVE" > "$SARIF" 2>/dev/null || {
     err "failed to generate SARIF"; }
 
 # ── gate (computed before the report so the verdict can be rendered in it) ──
@@ -992,8 +1121,10 @@ for s in critical high medium low; do
     "$cls" "$n" "$(sev_icon "$s")" "$s"
 done
 printf '</div>\n'
-printf '<p style="font-size:.85rem;color:var(--muted)">%s finding(s) total across %s scan pass(es).</p>\n' \
+printf '<p style="font-size:.85rem;color:var(--muted)">%s finding(s) counted across %s scan pass(es)' \
   "$TOTAL" "$(jq -s 'length' "$STATUS")"
+[ "$BASE_N" -gt 0 ] && printf ', plus %s accepted via baseline (listed below, excluded from the verdict)' "$BASE_N"
+printf '.</p>\n'
 
 # ── coverage / pass status ──
 printf '<h2>Scan coverage</h2>\n'
@@ -1024,9 +1155,24 @@ else
     jq -rs --arg s "$s" '.[] | select(.severity==$s) |
       "<tr><td>\(.tool|@html)</td><td><code>\(.rule|@html)</code></td>" +
       "<td class=\"loc\">" + (if .file=="" then "—" else "<code>\(.file|@html)\(if .line>0 then ":\(.line)" else "" end)</code>" end) + "</td>" +
-      "<td>\(.title|@html)" + (if .help=="" then "" else " <a href=\"\(.help|@html)\">ref</a>" end) + "</td></tr>"' "$FINDINGS"
+      "<td>\(.title|@html)" + (if .help=="" then "" else " <a href=\"\(.help|@html)\">ref</a>" end) + "</td></tr>"' "$ACTIVE"
     printf '</tbody></table>\n'
   done
+fi
+
+# ── accepted (baseline) — visible, but excluded from the gate ──
+if [ "$BASE_N" -gt 0 ]; then
+  printf '<h2>Accepted findings</h2>\n'
+  printf '<p>%s finding(s) are suppressed from the exit-code gate by <code>%s</code>. They are <strong>still present in the code</strong> — accepted, not fixed.</p>\n' \
+    "$BASE_N" "$(printf '%s' "$(basename "$BASELINE")" | sed 's/&/\&amp;/g;s/</\&lt;/g')"
+  [ "$BASE_STALE" -gt 0 ] && printf '<div class="note"><strong>%s entr(ies) older than %s days.</strong> Re-review whether these are still acceptable.</div>\n' "$BASE_STALE" "$BASELINE_STALE_DAYS"
+  printf '<table><thead><tr><th>Severity</th><th>Tool</th><th>Rule</th><th>Location</th><th>Detail</th></tr></thead><tbody>\n'
+  jq -rs '.[] |
+    "<tr><td><span class=\"pill s-\(.severity)\">\(.severity)</span></td><td>\(.tool|@html)</td>" +
+    "<td><code>\(.rule|@html)</code></td>" +
+    "<td class=\"loc\">" + (if .file=="" then "—" else "<code>\(.file|@html)</code>" end) + "</td>" +
+    "<td>\(.title|@html)</td></tr>"' "$ACCEPTED"
+  printf '</tbody></table>\n'
 fi
 
 # ── methodology + scope ──
@@ -1079,6 +1225,7 @@ if [ "$ERRORS" -gt 0 ]; then
   printf '  %s⨯ %s pass(es) could not complete — those areas are UNKNOWN, not clean%s\n' "$C_R$C_BOLD" "$ERRORS" "$C_0"
   jq -rs '.[]|select(.status=="error")|"      · \(.pass): \(.detail)"' "$STATUS"
 fi
+[ "$BASE_N" -gt 0 ] && printf '  %s+ %s accepted via baseline (excluded from the gate)%s\n' "$C_D" "$BASE_N" "$C_0"
 say "  report: $C_BOLD$REPORT$C_0"
 say "  html:   $C_BOLD$HTML$C_0"
 [ "$DO_PDF" = 1 ] && [ -s "$PDF" ] && say "  pdf:    $C_BOLD$PDF$C_0"
