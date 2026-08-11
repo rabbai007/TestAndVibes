@@ -77,6 +77,11 @@ targets). No config required.
 | `--semgrep-config X` | `auto` | Semgrep ruleset; `p/ci` avoids the network |
 | `--secrets-strict` | — | Rate unverified secrets high instead of medium |
 | `--skip-secrets`/`-sast`/`-deps`/`-iac` | — | Explicitly skip a pass (recorded as *skipped*) |
+| `--pdf` | — | Also render `report.pdf` (Chrome / wkhtmltopdf / weasyprint) |
+| `--open` | — | Open the HTML report in your browser when done |
+| `--baseline PATH` | `./.vibecheck-baseline.json` | Accepted-findings file |
+| `--write-baseline` | — | Accept every current finding, then exit |
+| `--no-baseline` | — | Ignore the baseline and gate on everything |
 | `--install` | — | Install jq + the scanners and exit |
 | `--version`, `--help` | — | Version / usage |
 
@@ -88,12 +93,35 @@ targets). No config required.
 A human-readable console summary, plus `vibecheck-report/`:
 - `report.md` — per-pass status table + every finding with `file:line`, rule ID,
   and a reference link, grouped by severity
+- `report.html` — formatted, self-contained report (print/PDF-ready); `--pdf`
+  also writes `report.pdf`
 - `vibecheck.sarif` — SARIF 2.1.0 for GitHub Code Scanning or any SARIF viewer
-- `findings.json` — machine-readable findings
+- `findings.json` — machine-readable findings (`active` and `accepted`)
 - raw JSON from each scanner (`semgrep.json`, `trivy-deps.json`, …) for triage
 
 Every scanner produces false positives. **Triage before acting** — the report
 is a starting point, not a verdict.
+
+## Adopting on an existing codebase
+
+A first scan of a mature repo will surface a lot. Accept the current state as a
+baseline, then gate only on what's new:
+
+```bash
+./vibecheck.sh --write-baseline     # accept everything found today
+./vibecheck.sh --fail-on high       # from now on, only NEW findings fail
+```
+
+Commit `.vibecheck-baseline.json` — it's shared team state. Each entry records
+when it was accepted and has a `reason` field; fill it in so the next reader
+knows why. Entries older than 90 days warn, and entries that no longer match
+anything are flagged as prunable (usually meaning the finding was fixed).
+
+Findings in the baseline stay **visible in every report** — they're accepted,
+not hidden. Two things the baseline deliberately cannot do: suppress an
+**ERROR** (you can accept a known risk, but never "we didn't scan this"), or
+survive a change to the finding itself. Identity excludes line numbers, so
+unrelated edits above a finding won't resurrect it.
 
 ## Configuration
 

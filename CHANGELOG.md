@@ -5,9 +5,48 @@ All notable changes to **VibeCheck** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased] — 0.3.0 in progress
 
-_Nothing yet._
+### Added
+
+- **Baseline of accepted findings** — adopt VibeCheck on an existing codebase
+  without triaging everything at once. `--write-baseline` accepts every current
+  finding; subsequent runs gate only on what is new. `--baseline PATH` selects a
+  file (default `./.vibecheck-baseline.json`), `--no-baseline` ignores it.
+  - Identity is `sha256(tool|rule|file|title)` and deliberately **excludes the
+    line number**, which shifts whenever anything above a finding is edited —
+    including it would resurrect every accepted entry on the next commit. Also
+    emitted as SARIF `partialFingerprints`.
+  - **An ERROR state is not baselineable.** Accepting a finding is a judgement
+    about known risk; accepting "this area was never scanned" would reintroduce
+    the fail-open behaviour 0.2.0 removed.
+  - Accepted findings stay **visible** — listed in the console, both reports, and
+    counted in the summary — but excluded from the gate and from SARIF.
+  - Entries record an `added` date and a `reason` field for a human to fill in.
+    Entries older than 90 days warn but still suppress. Re-running
+    `--write-baseline` preserves existing dates and reasons; entries matching
+    nothing are reported as prunable.
+- **HTML and PDF reports** — `report.html` is generated on every run;
+  `--pdf` renders `report.pdf` (headless Chrome, falling back to wkhtmltopdf then
+  weasyprint) and `--open` opens the report in your browser. The HTML embeds all
+  styling and references nothing external, so it survives being emailed.
+  - Severity is a row of stat tiles rather than a chart, each pairing colour with
+    an icon and a label so colour never carries meaning alone.
+  - The document states its own limits: the verdict leads, a coverage table shows
+    which passes ran and which errored, and a closing scope block states this is
+    an automated scan rather than a penetration test.
+
+### Fixed
+
+- `ci/github-actions.yml` referenced `aquasecurity/setup-trivy@v0.2.3`, which does
+  not exist — copying the template produced an immediate CI failure. Now v0.3.1.
+- `.gitignore` pattern `vibecheck.yml` was unanchored and matched at any depth,
+  silently excluding `.github/workflows/vibecheck.yml` from commits.
+
+### Added (CI)
+
+- `.github/workflows/vibecheck.yml` — the repository is now gated by its own tool,
+  with every action pinned to a commit SHA.
 
 ## [0.2.0] — 2026-08-11
 
