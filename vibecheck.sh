@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
 
 # ── defaults (overridable by vibecheck.yml, then CLI flags) ──
@@ -36,6 +36,13 @@ SELF_INSTALL=0
 SEMGREP_CONFIG="auto"
 SECRETS_STRICT=0        # 1 = unverified secrets count as high, not medium
 DO_SECRETS=1; DO_SAST=1; DO_DEPS=1; DO_IAC=1
+DO_PDF=0                # 1 = also render report.pdf (needs Chrome/wkhtmltopdf/weasyprint)
+DO_OPEN=0               # 1 = open the HTML report in the default browser
+DIFF_REF=""             # gate only on findings in files changed vs this git ref
+BASELINE=""             # path to an accepted-findings baseline
+USE_BASELINE=1          # 0 = ignore any baseline file that exists
+WRITE_BASELINE=0        # 1 = merge current findings into the baseline and exit
+BASELINE_STALE_DAYS=90  # warn about accepted entries older than this
 
 # ── pretty output ──
 if [ -t 1 ]; then C_R=$'\033[31m'; C_Y=$'\033[33m'; C_G=$'\033[32m'; C_B=$'\033[36m'; C_D=$'\033[2m'; C_0=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -72,12 +79,22 @@ OPTIONS
   --skip-sast          Skip the SAST pass
   --skip-deps          Skip the dependency pass
   --skip-iac           Skip the IaC pass
+  --pdf                Also render DIR/report.pdf (Chrome, wkhtmltopdf, or weasyprint)
+  --open               Open the HTML report in your default browser when done
+  --diff REF           PR mode: gate only on findings in files changed vs REF
+                       (e.g. --diff origin/main). Findings elsewhere are still
+                       reported. Run a full scan on your default branch too.
+  --baseline PATH      Accepted-findings file (default: ./.vibecheck-baseline.json)
+  --write-baseline     Accept every current finding into the baseline, then exit
+  --no-baseline        Ignore any baseline file and gate on everything
   --install            Install the underlying scanners and exit
   --version            Print version and exit
   -h, --help           This help
 
 OUTPUT
   DIR/report.md        Consolidated findings + per-pass status
+  DIR/report.html      Formatted, self-contained report (print/PDF-ready)
+  DIR/report.pdf       Same report as PDF (with --pdf)
   DIR/vibecheck.sarif  SARIF 2.1.0 (GitHub Code Scanning / any SARIF viewer)
   DIR/findings.json    Machine-readable findings
   DIR/*.json           Raw per-scanner output for triage
@@ -155,6 +172,12 @@ while [ $# -gt 0 ]; do
     --skip-sast) DO_SAST=0; shift;;
     --skip-deps) DO_DEPS=0; shift;;
     --skip-iac) DO_IAC=0; shift;;
+    --pdf) DO_PDF=1; shift;;
+    --open) DO_OPEN=1; shift;;
+    --diff) DIFF_REF="${2:?--diff needs a git ref}"; shift 2;;
+    --baseline) BASELINE="${2:?--baseline needs a path}"; shift 2;;
+    --write-baseline) WRITE_BASELINE=1; shift;;
+    --no-baseline) USE_BASELINE=0; shift;;
     --install) SELF_INSTALL=1; shift;;
     --version) say "VibeCheck v$VERSION"; exit 0;;
     -h|--help) usage;;
@@ -196,18 +219,37 @@ TARGET="$(cd "$TARGET" && pwd)"
 mkdir -p "$OUTDIR" || { err "cannot create out dir: $OUTDIR"; exit 2; }
 OUTDIR="$(cd "$OUTDIR" && pwd)"
 REPORT="$OUTDIR/report.md"
+HTML="$OUTDIR/report.html"
+PDF="$OUTDIR/report.pdf"
 FINDINGS="$OUTDIR/.findings.jsonl"
+ACTIVE="$OUTDIR/.active.jsonl"      # findings that count toward the gate
+ACCEPTED="$OUTDIR/.accepted.jsonl"  # findings suppressed by the baseline
 STATUS="$OUTDIR/.status.jsonl"
 SARIF="$OUTDIR/vibecheck.sarif"
-: > "$FINDINGS"; : > "$STATUS"
+: > "$FINDINGS"; : > "$STATUS"; : > "$ACTIVE"; : > "$ACCEPTED"
+
+# ── fingerprinting ──
+# Identity for baselining is tool|rule|file|title — deliberately NOT the line
+# number, which shifts whenever anything above the finding is edited and would
+# make every accepted entry reappear on the next commit. The title is included
+# so two hits of the same rule in one file stay distinct.
+sha12() {
+  if have shasum;    then shasum -a 256 2>/dev/null | cut -c1-12
+  elif have sha256sum; then sha256sum 2>/dev/null | cut -c1-12
+  elif have openssl; then openssl dgst -sha256 2>/dev/null | sed 's/.*= *//' | cut -c1-12
+  else cksum | tr -d ' ' | cut -c1-12   # stability is what matters, not strength
+  fi
+}
+fingerprint() { printf '%s|%s|%s|%s' "$1" "$2" "$3" "$4" | sha12; }
 
 # ── findings + status stores (single source of truth for every output) ──
 # add_finding  tool severity rule file line title [helpUri]
 add_finding() {
+  local fp; fp="$(fingerprint "$1" "$3" "$4" "$6")"
   jq -cn --arg tool "$1" --arg sev "$2" --arg rule "$3" --arg file "$4" \
-         --arg line "${5:-0}" --arg title "$6" --arg help "${7:-}" \
+         --arg line "${5:-0}" --arg title "$6" --arg help "${7:-}" --arg fp "$fp" \
     '{tool:$tool, severity:$sev, rule:$rule, file:$file,
-      line:(($line|tonumber?)//0), title:$title, help:$help}' >> "$FINDINGS"
+      line:(($line|tonumber?)//0), title:$title, help:$help, fingerprint:$fp}' >> "$FINDINGS"
 }
 # set_status  pass  ok|findings|skipped|error  detail
 set_status() {
@@ -217,8 +259,29 @@ set_status() {
 # pass_error  pass  message   → records ERROR (drives fail-closed exit 3)
 pass_error() { err "$2"; set_status "$1" error "$2"; }
 
-sev_count() { jq -s --arg s "$1" '[.[]|select(.severity==$s)]|length' "$FINDINGS"; }
+sev_count() { jq -s --arg s "$1" '[.[]|select(.severity==$s)]|length' "$ACTIVE"; }
 rel() { printf '%s' "${1#$TARGET/}"; }
+
+# ── baseline (accepted findings) ──
+# Resolve after TARGET is known so a repo-local baseline is picked up.
+if [ "$USE_BASELINE" = 1 ] && [ -z "$BASELINE" ]; then
+  for c in "$TARGET/.vibecheck-baseline.json" "./.vibecheck-baseline.json"; do
+    [ -f "$c" ] && { BASELINE="$c"; break; }
+  done
+fi
+if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ]; then
+  if [ ! -f "$BASELINE" ]; then
+    [ "$WRITE_BASELINE" = 1 ] || { err "baseline not found: $BASELINE"; exit 2; }
+  elif ! jq -e '.entries' "$BASELINE" >/dev/null 2>&1; then
+    err "baseline is not valid VibeCheck baseline JSON: $BASELINE"; exit 2
+  fi
+fi
+# days since a YYYY-MM-DD date (portable across GNU/BSD date); empty if unparseable
+days_since() {
+  local d="$1" e
+  e="$(date -j -f '%Y-%m-%d' "$d" +%s 2>/dev/null || date -d "$d" +%s 2>/dev/null || echo '')"
+  [ -n "$e" ] && echo $(( ( $(date +%s) - e ) / 86400 )) || echo ''
+}
 
 # ── exclusions (.vibecheckignore, else sane defaults) ──
 IGNORE_FILE=""
@@ -320,24 +383,60 @@ elif have trufflehog; then
     if [ $((nv+nu)) -gt 0 ]; then set_status secrets findings "$nv verified, $nu unverified"; else set_status secrets ok "0 secrets"; fi
   fi
 elif have gitleaks; then
-  gl="$OUTDIR/gitleaks.json"
-  # 0.1.0 treated ANY non-zero gitleaks exit as "secrets found" — including
-  # "not a git repo". gitleaks: 0 = clean, 1 = leaks, other = real error.
-  if [ -d "$TARGET/.git" ]; then gitleaks detect --source "$TARGET" --no-banner --report-format json -r "$gl" >/dev/null 2>&1
-  else gitleaks detect --source "$TARGET" --no-git --no-banner --report-format json -r "$gl" >/dev/null 2>&1; fi
-  gl_rc=$?
-  if [ "$gl_rc" -gt 1 ]; then
-    pass_error secrets "gitleaks exited $gl_rc (scan did not complete)"
-  elif [ ! -f "$gl" ] || ! jq -e . "$gl" >/dev/null 2>&1; then
+  gl="$OUTDIR/gitleaks.json"; glh="$OUTDIR/.gitleaks-history.json"
+  rm -f "$gl" "$glh"
+  # gitleaks exit codes: 0 = clean, 1 = leaks found, >1 = the scan itself failed.
+  # (0.1.0 treated ANY non-zero exit as "secrets found", including "not a git repo".)
+  #
+  # `detect` is deprecated in gitleaks 8.19+ in favour of the `git` and `dir`
+  # subcommands, and `--no-git` goes with it. Probe for the modern CLI and fall
+  # back, so both old and new installs work.
+  gl_modern=0
+  gitleaks dir --help >/dev/null 2>&1 && gl_modern=1
+  gl_fail=0; gl_files=""
+  gl_run() { # report-file  args...
+    local out="$1"; shift
+    gitleaks "$@" --no-banner --report-format json -r "$out" >/dev/null 2>&1
+    local rc=$?
+    [ "$rc" -gt 1 ] && { gl_fail=$rc; return 1; }
+    [ -f "$out" ] && gl_files="$gl_files $out"
+    return 0
+  }
+  # Scan history AND the working tree, matching the trufflehog path. Previously
+  # only history was scanned on a git repo, so an uncommitted secret — the exact
+  # thing a pre-commit check should catch — was invisible.
+  if [ "$gl_modern" = 1 ]; then
+    [ -d "$TARGET/.git" ] && gl_run "$glh" git "$TARGET"
+    gl_run "$gl" dir "$TARGET"
+  else
+    if [ -d "$TARGET/.git" ]; then gl_run "$glh" detect --source "$TARGET"
+                                   gl_run "$gl" detect --source "$TARGET" --no-git
+    else gl_run "$gl" detect --source "$TARGET" --no-git; fi
+  fi
+
+  if [ "$gl_fail" -gt 1 ]; then
+    pass_error secrets "gitleaks exited $gl_fail (scan did not complete)"
+  elif [ -z "${gl_files// /}" ]; then
     pass_error secrets "gitleaks produced no parseable report"
   else
-    n=0
-    while IFS=$'\t' read -r ruleid file lineno desc; do
-      [ -z "${ruleid:-}" ] && continue
-      n=$((n+1)); add_finding gitleaks high "gitleaks.$ruleid" "$(rel "$file")" "$lineno" "${desc:-Secret detected}" ""
-    done < <(jq -r '.[]? | [(.RuleID//"unknown"), (.File//""), ((.StartLine//0)|tostring), ((.Description//"")|gsub("\n";" "))] | @tsv' "$gl" 2>/dev/null)
-    [ "$n" -gt 0 ] && { bad "gitleaks: $n potential secret(s)"; set_status secrets findings "$n"; } \
-                   || { ok "gitleaks: no secrets"; set_status secrets ok "0 secrets"; }
+    for f in $gl_files; do
+      jq -e . "$f" >/dev/null 2>&1 || { pass_error secrets "gitleaks wrote unparseable JSON to $f"; gl_fail=99; break; }
+    done
+    if [ "$gl_fail" != 99 ]; then
+      n=0
+      while IFS=$'\t' read -r ruleid file lineno desc; do
+        [ -z "${ruleid:-}" ] && continue
+        n=$((n+1)); add_finding gitleaks high "gitleaks.$ruleid" "$(rel "$file")" "$lineno" "${desc:-Secret detected}" ""
+      # `gitleaks git` reports repo-relative paths while `gitleaks dir` reports
+      # absolute ones, so normalise BEFORE dedup or the same secret is counted
+      # twice — once from history, once from the working tree.
+      done < <(jq -r -s --arg t "$TARGET/" 'add // [] | .[]?
+                  | [(.RuleID//"unknown"), ((.File//"")|ltrimstr($t)), ((.StartLine//0)|tostring),
+                     ((.Description//"")|gsub("[\n\t]";" "))] | @tsv' \
+                  $gl_files 2>/dev/null | sort -u)
+      [ "$n" -gt 0 ] && { bad "gitleaks: $n potential secret(s)"; set_status secrets findings "$n"; } \
+                     || { ok "gitleaks: no secrets"; set_status secrets ok "0 secrets"; }
+    fi
   fi
 else
   pass_error secrets "no secret scanner installed (trufflehog or gitleaks) — cannot verify absence of secrets"
@@ -748,13 +847,132 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# outputs: report.md · findings.json · SARIF
+# baseline: split findings into active (gated) and accepted (suppressed)
 # ═══════════════════════════════════════════════════════════════════
-CRIT=$(sev_count critical); HIGH=$(sev_count high); MED=$(sev_count medium); LOW=$(sev_count low)
-TOTAL=$((CRIT+HIGH+MED+LOW))
 ERRORS=$(jq -s '[.[]|select(.status=="error")]|length' "$STATUS")
 
-jq -s '.' "$FINDINGS" > "$OUTDIR/findings.json"
+# --write-baseline: accept everything currently found. Existing entries keep
+# their original date and reason so re-running never erases why something was
+# accepted; only genuinely new findings are added.
+if [ "$WRITE_BASELINE" = 1 ]; then
+  head2 "Baseline"
+  [ -n "$BASELINE" ] || BASELINE="$TARGET/.vibecheck-baseline.json"
+  today="$(date '+%Y-%m-%d')"
+  prev="$OUTDIR/.prev-baseline.json"
+  if [ -f "$BASELINE" ] && jq -e '.entries' "$BASELINE" >/dev/null 2>&1; then
+    cp "$BASELINE" "$prev"
+  else
+    printf '{"version":1,"entries":[]}' > "$prev"
+  fi
+  jq -s --slurpfile prev "$prev" --arg today "$today" '
+    ($prev[0].entries // []) as $old |
+    ($old | map({key:.fingerprint, value:.}) | from_entries) as $bykey |
+    { version: 1,
+      generated: $today,
+      note: "VibeCheck accepted findings. Entries suppress a finding from the exit-code gate; they are still listed in the report. Delete an entry to re-gate it.",
+      entries: ( map({ fingerprint, tool, rule, file, title })
+                 | unique_by(.fingerprint)
+                 | map( . as $n
+                        | ($bykey[$n.fingerprint] // null) as $o
+                        | $n + { added: ($o.added // $today),
+                                 reason: ($o.reason // "") } )
+                 | sort_by(.tool, .rule, .file) )
+    }' "$FINDINGS" > "$BASELINE"
+  n_new=$(jq -s --slurpfile prev "$prev" '
+    ([$prev[0].entries[]?.fingerprint]) as $old |
+    [ .[] | select(.fingerprint as $f | ($old|index($f))|not) ] | unique_by(.fingerprint) | length' "$FINDINGS")
+  n_all=$(jq '.entries|length' "$BASELINE")
+  ok "baseline written: $BASELINE ($n_all accepted, $n_new newly added)"
+  say "  ${C_D}add a 'reason' to each entry so the next reader knows why it was accepted${C_0}"
+  say "  ${C_D}re-run without --write-baseline to scan against it${C_0}"
+  exit 0
+fi
+
+BASE_N=0; BASE_STALE=0
+if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ] && [ -f "$BASELINE" ]; then
+  jq -r '.entries[]?.fingerprint' "$BASELINE" 2>/dev/null | sort -u > "$OUTDIR/.bl-fps"
+  # An accepted finding is suppressed from the gate but still reported.
+  jq -c --slurpfile bl <(jq '[.entries[]?.fingerprint]' "$BASELINE") \
+    'select((.fingerprint as $f | $bl[0] | index($f)) != null)' "$FINDINGS" > "$ACCEPTED"
+  jq -c --slurpfile bl <(jq '[.entries[]?.fingerprint]' "$BASELINE") \
+    'select((.fingerprint as $f | $bl[0] | index($f)) == null)' "$FINDINGS" > "$ACTIVE"
+  BASE_N=$(jq -s 'length' "$ACCEPTED")
+  head2 "Baseline"
+  say "  ${C_D}$BASELINE${C_0}"
+  [ "$BASE_N" -gt 0 ] && warn "$BASE_N finding(s) accepted by baseline — excluded from the gate, still listed in the report" \
+                      || ok "no findings matched the baseline"
+  # Staleness: prompt re-review without breaking the build on a timer.
+  while IFS=$'\t' read -r fpr added; do
+    [ -z "${added:-}" ] && continue
+    d="$(days_since "$added")"
+    [ -n "$d" ] && [ "$d" -gt "$BASELINE_STALE_DAYS" ] && BASE_STALE=$((BASE_STALE+1))
+  done < <(jq -r '.entries[]? | [.fingerprint, (.added//"")] | @tsv' "$BASELINE" 2>/dev/null)
+  [ "$BASE_STALE" -gt 0 ] && warn "$BASE_STALE baseline entr(ies) older than $BASELINE_STALE_DAYS days — re-review whether they are still acceptable"
+  # An unused entry usually means the finding was fixed: worth pruning.
+  bl_total=$(jq '.entries|length' "$BASELINE")
+  unused=$((bl_total - BASE_N))
+  [ "$unused" -gt 0 ] && say "  ${C_D}$unused baseline entr(ies) matched nothing (fixed or moved) — prune with --write-baseline${C_0}"
+else
+  cp "$FINDINGS" "$ACTIVE"
+fi
+
+# ── diff scope (PR mode) ──
+# Gate only on findings in files this change touched. Pre-existing findings
+# elsewhere are still reported, just not gated — that is the point: a PR should
+# fail for what it introduces, not for what it inherited.
+DIFF_N=0
+if [ -n "$DIFF_REF" ]; then
+  head2 "Diff scope"
+  if [ ! -d "$TARGET/.git" ] && ! git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
+    pass_error diff "--diff $DIFF_REF requires a git repository — scope could not be determined"
+  elif ! git -C "$TARGET" rev-parse --verify --quiet "$DIFF_REF" >/dev/null 2>&1; then
+    # Fail closed: silently scoping to nothing would turn --diff into "gate on
+    # nothing", which is exactly the fail-open behaviour this tool refuses.
+    pass_error diff "git ref '$DIFF_REF' not found — cannot determine what changed (fetch it, or drop --diff)"
+  else
+    CHANGED="$OUTDIR/.changed-files"
+    prefix="$(git -C "$TARGET" rev-parse --show-prefix 2>/dev/null)"
+    { git -C "$TARGET" diff --name-only "$DIFF_REF...HEAD" 2>/dev/null
+      git -C "$TARGET" diff --name-only HEAD 2>/dev/null; } \
+      | sed "s|^$prefix||" | sed '/^$/d' | sort -u > "$CHANGED"
+    n_changed=$(wc -l < "$CHANGED" | tr -d ' ')
+    say "  ${C_D}$n_changed file(s) changed vs $DIFF_REF${C_0}"
+    if [ "$n_changed" -eq 0 ]; then
+      ok "no files changed — nothing to gate on"
+    fi
+    OUTSCOPE="$OUTDIR/.outscope.jsonl"
+    # Dynamic findings describe the running application, not a file in the diff,
+    # so they always stay in scope.
+    jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
+      'select(.tool=="dynamic" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
+    jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
+      'select(.tool!="dynamic" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
+    DIFF_N=$(jq -s 'length' "$OUTSCOPE")
+    mv "$OUTDIR/.inscope.jsonl" "$ACTIVE"
+    [ "$DIFF_N" -gt 0 ] && warn "$DIFF_N pre-existing finding(s) outside the diff — reported, not gated" \
+                        || ok "no pre-existing findings outside the diff"
+    set_status diff ok "$n_changed file(s) changed vs $DIFF_REF; $DIFF_N finding(s) out of scope"
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# outputs: report.md · findings.json · SARIF
+# ═══════════════════════════════════════════════════════════════════
+# Recompute AFTER every pass, including the baseline and diff blocks above.
+# Reading a value captured earlier would drop errors raised by those blocks and
+# let an incomplete scan exit 0 — the fail-open behaviour this tool exists to
+# prevent.
+ERRORS=$(jq -s '[.[]|select(.status=="error")]|length' "$STATUS")
+
+CRIT=$(sev_count critical); HIGH=$(sev_count high); MED=$(sev_count medium); LOW=$(sev_count low)
+TOTAL=$((CRIT+HIGH+MED+LOW))
+
+# out_of_scope is included so the machine-readable output is complete: the raw
+# JSONL files are dot-prefixed internals and CI artifact uploads skip them.
+jq -s '{active: ., accepted: $acc[0], out_of_scope: $oos[0]}' \
+  --slurpfile acc <(jq -s '.' "$ACCEPTED") \
+  --slurpfile oos <(jq -s '.' "$OUTDIR/.outscope.jsonl" 2>/dev/null || echo '[]') \
+  "$ACTIVE" > "$OUTDIR/findings.json"
 
 {
   echo "# VibeCheck security report"
@@ -796,9 +1014,29 @@ jq -s '.' "$FINDINGS" > "$OUTDIR/findings.json"
       echo "| Tool | Rule | Location | Detail |"
       echo "|---|---|---|---|"
       jq -rs --arg s "$s" '.[] | select(.severity==$s)
-        | "| \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)\(if .line>0 then ":\(.line)" else "" end)`" end) | \(.title|gsub("\\|";"\\\\|")) \(if .help=="" then "" else "([ref](\(.help)))" end) |"' "$FINDINGS"
+        | "| \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)\(if .line>0 then ":\(.line)" else "" end)`" end) | \(.title|gsub("\\|";"\\\\|")) \(if .help=="" then "" else "([ref](\(.help)))" end) |"' "$ACTIVE"
       echo
     done
+  fi
+  if [ "$DIFF_N" -gt 0 ]; then
+    echo "## Outside the diff (not gated)"
+    echo
+    echo "Pre-existing findings in files not changed vs \`$DIFF_REF\`. Reported for awareness; they do not affect the exit code in \`--diff\` mode."
+    echo
+    echo "| Severity | Tool | Rule | Location | Detail |"
+    echo "|---|---|---|---|---|"
+    jq -rs '.[] | "| \(.severity) | \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)`" end) | \(.title|gsub("\\|";"\\\\|")) |"' "$OUTDIR/.outscope.jsonl"
+    echo
+  fi
+  if [ "$BASE_N" -gt 0 ]; then
+    echo "## Accepted (baseline)"
+    echo
+    echo "Suppressed from the exit-code gate by \`$(basename "$BASELINE")\`. Still present in the code."
+    echo
+    echo "| Severity | Tool | Rule | Location | Detail |"
+    echo "|---|---|---|---|---|"
+    jq -rs '.[] | "| \(.severity) | \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)`" end) | \(.title|gsub("\\|";"\\\\|")) |"' "$ACCEPTED"
+    echo
   fi
   echo "_Raw scanner output in \`$OUTDIR/\`. SARIF: \`$(basename "$SARIF")\`._"
   echo "_Scanners produce false positives — triage before acting._"
@@ -831,6 +1069,7 @@ jq -s --arg ver "$VERSION" --arg uri "$TOOL_URL" '
         ruleId: (.tool + "." + .rule),
         level: (.severity|level),
         message: { text: .title },
+        partialFingerprints: { vibecheckFingerprint: .fingerprint },
         properties: { "security-severity": (.severity|secsev), tool: .tool },
         locations: [{ physicalLocation: (
           { artifactLocation: { uri: (if .file == "" then "." else .file end) } }
@@ -838,20 +1077,10 @@ jq -s --arg ver "$VERSION" --arg uri "$TOOL_URL" '
         )}]
       })
     }]
-  }' "$FINDINGS" > "$SARIF" 2>/dev/null || {
+  }' "$ACTIVE" > "$SARIF" 2>/dev/null || {
     err "failed to generate SARIF"; }
 
-# ── summary + gate ──
-head2 "Summary"
-printf '  %sCRITICAL %s  %sHIGH %s  %sMEDIUM %s  %sLOW %s  (total %s)\n' \
-  "$C_R" "$CRIT" "$C_R" "$HIGH" "$C_Y" "$MED" "$C_D" "$LOW" "$TOTAL"
-if [ "$ERRORS" -gt 0 ]; then
-  printf '  %s⨯ %s pass(es) could not complete — those areas are UNKNOWN, not clean%s\n' "$C_R$C_BOLD" "$ERRORS" "$C_0"
-  jq -rs '.[]|select(.status=="error")|"      · \(.pass): \(.detail)"' "$STATUS"
-fi
-say "  report: $C_BOLD$REPORT$C_0"
-say "  sarif:  $C_BOLD$SARIF$C_0"
-
+# ── gate (computed before the report so the verdict can be rendered in it) ──
 gate=0; reason=""
 case "$FAIL_ON" in
   never)    gate=0;;
@@ -862,14 +1091,274 @@ case "$FAIL_ON" in
   critical) [ "$CRIT" -gt 0 ] && { gate=1; reason="critical"; };;
 esac
 
+if [ "$ERRORS" -gt 0 ] && [ "$FAIL_ON_ERROR" = 1 ]; then
+  VERDICT="INCOMPLETE"; V_CLASS="incomplete"; RC=3
+  V_TEXT="$ERRORS scan pass(es) could not complete. Those areas were NOT examined and are unknown — not clean."
+elif [ "$gate" = 1 ]; then
+  VERDICT="FAIL"; V_CLASS="fail"; RC=1
+  V_TEXT="Findings at or above the '$FAIL_ON' threshold ($reason)."
+else
+  VERDICT="PASS"; V_CLASS="pass"; RC=0
+  V_TEXT="No findings above the '$FAIL_ON' threshold."
+  [ "$ERRORS" -gt 0 ] && V_TEXT="$V_TEXT Note: $ERRORS pass(es) were incomplete and fail-on-error was disabled."
+fi
+
+# ── HTML report (self-contained, print/PDF-ready) ──
+# Severity uses the reserved status palette and always pairs colour with an icon
+# and a text label — two of these steps are sub-3:1 on a light surface, so colour
+# never carries meaning on its own.
+sev_icon() { case "$1" in critical) printf '✕';; high) printf '▲';; medium) printf '●';; *) printf '▪';; esac; }
+
+{
+cat <<'HTMLHEAD'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VibeCheck Security Report</title>
+<style>
+  :root{
+    --ink:#1a1a19; --ink-2:#4a4a47; --muted:#6b6b68; --rule:#e2e2df;
+    --surface:#fff; --surface-2:#faf9f7; --accent:#2b6cb0;
+    --crit:#d03b3b; --high:#ec835a; --med:#fab219; --low:#8a8a86; --good:#0ca30c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--surface);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:60rem;margin:0 auto;padding:2.5rem 2rem 4rem}
+  header{border-bottom:2px solid var(--ink);padding-bottom:1.25rem;margin-bottom:1.75rem}
+  .brand{font-size:.75rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 .35rem}
+  h1{font-size:1.9rem;line-height:1.2;margin:0 0 1rem;letter-spacing:-.01em}
+  h2{font-size:1.15rem;margin:2.5rem 0 .85rem;padding-bottom:.4rem;border-bottom:1px solid var(--rule);letter-spacing:-.005em}
+  h3{font-size:.95rem;margin:1.75rem 0 .6rem;display:flex;align-items:center;gap:.5rem}
+  p{margin:.6rem 0}
+  .meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));gap:.5rem 1.5rem;font-size:.84rem}
+  .meta div{display:flex;gap:.5rem;min-width:0}
+  .meta div.wide{grid-column:1/-1}   /* long paths/URLs get the full row */
+  .meta dt{color:var(--muted);min-width:5.5rem;flex:none}
+  .meta dd{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+           overflow-wrap:anywhere;min-width:0}
+  .verdict{border:1px solid;border-left-width:5px;border-radius:5px;padding:1rem 1.15rem;margin:1.5rem 0}
+  .verdict .vlabel{font-weight:700;font-size:1rem;display:flex;align-items:center;gap:.5rem;margin-bottom:.25rem}
+  .verdict p{margin:0;font-size:.9rem;color:var(--ink-2)}
+  .verdict.pass{border-color:var(--good);background:#f2fbf2}
+  .verdict.fail{border-color:var(--crit);background:#fdf3f3}
+  .verdict.incomplete{border-color:var(--crit);background:#fdf3f3}
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:.75rem;margin:1.25rem 0}
+  .tile{border:1px solid var(--rule);border-top:3px solid;border-radius:5px;padding:.8rem .9rem;background:var(--surface-2)}
+  .tile .ico{font-size:.8rem;line-height:1}
+  .tile .num{display:block;font-size:2rem;font-weight:650;line-height:1.1;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .tile .lab{font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:.35rem}
+  .t-crit{border-top-color:var(--crit)} .t-crit .ico{color:var(--crit)}
+  .t-high{border-top-color:var(--high)} .t-high .ico{color:var(--high)}
+  .t-med{border-top-color:var(--med)}  .t-med  .ico{color:var(--med)}
+  .t-low{border-top-color:var(--low)}  .t-low  .ico{color:var(--low)}
+  table{width:100%;border-collapse:collapse;font-size:.84rem;margin:.5rem 0 1rem}
+  thead{display:table-header-group}
+  th{text-align:left;font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
+     border-bottom:1px solid var(--ink);padding:.45rem .6rem .4rem;font-weight:600}
+  td{border-bottom:1px solid var(--rule);padding:.55rem .6rem;vertical-align:top}
+  tr{break-inside:avoid;page-break-inside:avoid}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}
+  td.loc{white-space:nowrap;color:var(--ink-2)}
+  .pill{display:inline-flex;align-items:center;gap:.3rem;font-size:.7rem;font-weight:600;
+        letter-spacing:.04em;text-transform:uppercase;white-space:nowrap}
+  .s-critical{color:var(--crit)} .s-high{color:var(--high)}
+  .s-medium{color:#8a6100} .s-low{color:var(--low)}
+  .st-ok{color:var(--good)} .st-error{color:var(--crit);font-weight:700}
+  .st-findings{color:var(--crit)} .st-skipped{color:var(--muted)}
+  .note{background:var(--surface-2);border:1px solid var(--rule);border-radius:5px;
+        padding:.85rem 1rem;font-size:.85rem;color:var(--ink-2);margin:1rem 0}
+  .note strong{color:var(--ink)}
+  .scope{border-left:3px solid var(--muted);padding:.15rem 0 .15rem .9rem;margin:1rem 0;
+         font-size:.85rem;color:var(--ink-2)}
+  footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
+         font-size:.78rem;color:var(--muted)}
+  a{color:var(--accent)} a:hover{text-decoration:underline}
+  .empty{color:var(--muted);font-style:italic}
+  @media (max-width:640px){ .kpis{grid-template-columns:repeat(2,1fr)} .wrap{padding:1.5rem 1rem 3rem} }
+  @media print{
+    @page{margin:16mm}
+    .wrap{max-width:none;padding:0}
+    body{font-size:10.5pt}
+    h2{margin-top:1.4rem} h1{font-size:1.6rem}
+    .verdict,.note,.tile{background:#fff!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+    h2,h3{break-after:avoid;page-break-after:avoid}
+    a{text-decoration:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+HTMLHEAD
+
+# ── header + metadata ──
+printf '<header>\n<p class="brand">Automated Security Audit</p>\n<h1>VibeCheck Security Report</h1>\n<dl class="meta">\n'
+printf '<div class="wide"><dt>Target</dt><dd>%s</dd></div>\n' "$(printf '%s' "$TARGET" | sed 's/&/\&amp;/g;s/</\&lt;/g')"
+printf '<div><dt>Scanned</dt><dd>%s</dd></div>\n' "$STAMP"
+[ -n "$URL" ] && printf '<div><dt>Dynamic</dt><dd>%s</dd></div>\n' "$(printf '%s' "$URL" | sed 's/&/\&amp;/g;s/</\&lt;/g')"
+printf '<div><dt>Stack</dt><dd>%s</dd></div>\n' "$(echo "$STACK" | tr -s ' ' | sed 's/^ //;s/ $//;s/&/\&amp;/g;s/</\&lt;/g')"
+printf '<div><dt>Threshold</dt><dd>%s</dd></div>\n' "$FAIL_ON"
+printf '<div><dt>Tool</dt><dd>VibeCheck v%s</dd></div>\n' "$VERSION"
+printf '</dl>\n</header>\n'
+
+# ── verdict ──
+case "$VERDICT" in
+  PASS)       vicon="✓";;
+  FAIL)       vicon="✗";;
+  *)          vicon="⨯";;
+esac
+printf '<div class="verdict %s"><div class="vlabel"><span>%s</span><span>%s</span></div><p>%s</p></div>\n' \
+  "$V_CLASS" "$vicon" "$VERDICT" "$V_TEXT"
+
+# ── executive summary: KPI row (headline numbers, not a chart) ──
+printf '<h2>Summary of findings</h2>\n<div class="kpis">\n'
+for s in critical high medium low; do
+  case "$s" in critical) cls=t-crit; n=$CRIT;; high) cls=t-high; n=$HIGH;; medium) cls=t-med; n=$MED;; low) cls=t-low; n=$LOW;; esac
+  printf '<div class="tile %s"><span class="num">%s</span><span class="lab"><span class="ico">%s</span>%s</span></div>\n' \
+    "$cls" "$n" "$(sev_icon "$s")" "$s"
+done
+printf '</div>\n'
+printf '<p style="font-size:.85rem;color:var(--muted)">%s finding(s) counted across %s scan pass(es)' \
+  "$TOTAL" "$(jq -s 'length' "$STATUS")"
+[ "$BASE_N" -gt 0 ] && printf ', plus %s accepted via baseline (listed below, excluded from the verdict)' "$BASE_N"
+printf '.</p>\n'
+
+# ── coverage / pass status ──
+printf '<h2>Scan coverage</h2>\n'
+printf '<p>Every pass reports its own status. A pass marked <strong>ERROR</strong> did not complete: that area was <em>not examined</em>, and its absence of findings means nothing.</p>\n'
+printf '<table><thead><tr><th>Pass</th><th>Status</th><th>Detail</th></tr></thead><tbody>\n'
+jq -rs '.[] |
+  (if .status=="error" then "st-error|⨯ ERROR"
+   elif .status=="findings" then "st-findings|✗ findings"
+   elif .status=="skipped" then "st-skipped|— skipped"
+   else "st-ok|✓ clean" end) as $s |
+  "<tr><td>\(.pass)</td><td class=\"\($s|split("|")[0])\">\($s|split("|")[1])</td><td>\(.detail|@html)</td></tr>"' "$STATUS"
+printf '</tbody></table>\n'
+
+if [ "$ERRORS" -gt 0 ]; then
+  printf '<div class="note"><strong>⨯ Incomplete coverage.</strong> %s pass(es) failed to run. VibeCheck fails closed: an area it could not scan is reported as unknown rather than clean.</div>\n' "$ERRORS"
+fi
+
+# ── findings ──
+printf '<h2>Findings</h2>\n'
+if [ "$TOTAL" -eq 0 ]; then
+  printf '<p class="empty">No findings recorded at or above the reporting floor.</p>\n'
+else
+  for s in critical high medium low; do
+    n=$(sev_count "$s"); [ "$n" -eq 0 ] && continue
+    printf '<h3><span class="pill s-%s">%s %s</span><span style="color:var(--muted);font-weight:400">(%s)</span></h3>\n' \
+      "$s" "$(sev_icon "$s")" "$s" "$n"
+    printf '<table><thead><tr><th>Tool</th><th>Rule</th><th>Location</th><th>Detail</th></tr></thead><tbody>\n'
+    jq -rs --arg s "$s" '.[] | select(.severity==$s) |
+      "<tr><td>\(.tool|@html)</td><td><code>\(.rule|@html)</code></td>" +
+      "<td class=\"loc\">" + (if .file=="" then "—" else "<code>\(.file|@html)\(if .line>0 then ":\(.line)" else "" end)</code>" end) + "</td>" +
+      "<td>\(.title|@html)" + (if .help=="" then "" else " <a href=\"\(.help|@html)\">ref</a>" end) + "</td></tr>"' "$ACTIVE"
+    printf '</tbody></table>\n'
+  done
+fi
+
+# ── outside the diff — visible, but not gated in PR mode ──
+if [ "$DIFF_N" -gt 0 ]; then
+  printf '<h2>Outside the diff</h2>\n'
+  printf '<p>%s pre-existing finding(s) in files not changed vs <code>%s</code>. Reported for awareness; they do not affect the verdict in diff mode. Run a full scan on your default branch to gate on these.</p>\n' \
+    "$DIFF_N" "$(printf '%s' "$DIFF_REF" | sed 's/&/\&amp;/g;s/</\&lt;/g')"
+  printf '<table><thead><tr><th>Severity</th><th>Tool</th><th>Rule</th><th>Location</th><th>Detail</th></tr></thead><tbody>\n'
+  jq -rs '.[] |
+    "<tr><td><span class=\"pill s-\(.severity)\">\(.severity)</span></td><td>\(.tool|@html)</td>" +
+    "<td><code>\(.rule|@html)</code></td>" +
+    "<td class=\"loc\">" + (if .file=="" then "—" else "<code>\(.file|@html)</code>" end) + "</td>" +
+    "<td>\(.title|@html)</td></tr>"' "$OUTDIR/.outscope.jsonl"
+  printf '</tbody></table>\n'
+fi
+
+# ── accepted (baseline) — visible, but excluded from the gate ──
+if [ "$BASE_N" -gt 0 ]; then
+  printf '<h2>Accepted findings</h2>\n'
+  printf '<p>%s finding(s) are suppressed from the exit-code gate by <code>%s</code>. They are <strong>still present in the code</strong> — accepted, not fixed.</p>\n' \
+    "$BASE_N" "$(printf '%s' "$(basename "$BASELINE")" | sed 's/&/\&amp;/g;s/</\&lt;/g')"
+  [ "$BASE_STALE" -gt 0 ] && printf '<div class="note"><strong>%s entr(ies) older than %s days.</strong> Re-review whether these are still acceptable.</div>\n' "$BASE_STALE" "$BASELINE_STALE_DAYS"
+  printf '<table><thead><tr><th>Severity</th><th>Tool</th><th>Rule</th><th>Location</th><th>Detail</th></tr></thead><tbody>\n'
+  jq -rs '.[] |
+    "<tr><td><span class=\"pill s-\(.severity)\">\(.severity)</span></td><td>\(.tool|@html)</td>" +
+    "<td><code>\(.rule|@html)</code></td>" +
+    "<td class=\"loc\">" + (if .file=="" then "—" else "<code>\(.file|@html)</code>" end) + "</td>" +
+    "<td>\(.title|@html)</td></tr>"' "$ACCEPTED"
+  printf '</tbody></table>\n'
+fi
+
+# ── methodology + scope ──
+printf '<h2>Methodology &amp; scope</h2>\n'
+printf '<p>VibeCheck orchestrates open-source scanners and consolidates their output. Passes run over the target directory; dynamic checks, when enabled, issue a single unauthenticated GET and a TLS handshake against the supplied URL — no payloads, no exploitation.</p>\n'
+printf '<div class="scope"><strong>This is an automated scan, not a penetration test.</strong> It detects known and mechanical issues: leaked credentials, vulnerable dependencies, insecure code patterns, misconfiguration, and missing transport controls. It does <strong>not</strong> detect business-logic flaws — broken access control, multi-tenant data leakage, authorisation bypasses, or insecure workflows — which require a human reviewer who understands the application&rsquo;s intent. Scanners also produce false positives; triage before acting.</div>\n'
+printf '<p style="font-size:.85rem;color:var(--muted)">Raw scanner output, SARIF, and machine-readable findings are alongside this file in <code>%s</code>.</p>\n' \
+  "$(printf '%s' "$(basename "$OUTDIR")" | sed 's/&/\&amp;/g;s/</\&lt;/g')"
+
+printf '<footer>Generated by VibeCheck v%s on %s · Threshold <code>%s</code> · Exit code %s</footer>\n' \
+  "$VERSION" "$STAMP" "$FAIL_ON" "$RC"
+printf '</div>\n</body>\n</html>\n'
+} > "$HTML"
+
+# ── PDF (optional) ──
+if [ "$DO_PDF" = 1 ]; then
+  pdf_ok=0
+  CHROME=""
+  for c in "google-chrome" "google-chrome-stable" "chromium" "chromium-browser" "msedge"; do
+    have "$c" && { CHROME="$c"; break; }
+  done
+  if [ -z "$CHROME" ]; then
+    for p in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+             "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+             "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"; do
+      [ -x "$p" ] && { CHROME="$p"; break; }
+    done
+  fi
+  if [ -n "$CHROME" ]; then
+    # headless Chrome honours the print stylesheet, which the others approximate
+    "$CHROME" --headless --disable-gpu --no-sandbox --no-pdf-header-footer \
+      --print-to-pdf="$PDF" "file://$HTML" >/dev/null 2>&1 && [ -s "$PDF" ] && pdf_ok=1
+  fi
+  if [ "$pdf_ok" = 0 ] && have wkhtmltopdf; then
+    wkhtmltopdf --enable-local-file-access -q "$HTML" "$PDF" >/dev/null 2>&1 && [ -s "$PDF" ] && pdf_ok=1
+  fi
+  if [ "$pdf_ok" = 0 ] && have weasyprint; then
+    weasyprint "$HTML" "$PDF" >/dev/null 2>&1 && [ -s "$PDF" ] && pdf_ok=1
+  fi
+  # A missing PDF converter is a reporting gap, not a failed scan — warn, never
+  # change the exit code.
+  [ "$pdf_ok" = 1 ] || warn "PDF not generated: install Chrome, wkhtmltopdf, or weasyprint"
+fi
+
+# ── summary ──
+head2 "Summary"
+printf '  %sCRITICAL %s  %sHIGH %s  %sMEDIUM %s  %sLOW %s  (total %s)\n' \
+  "$C_R" "$CRIT" "$C_R" "$HIGH" "$C_Y" "$MED" "$C_D" "$LOW" "$TOTAL"
+if [ "$ERRORS" -gt 0 ]; then
+  printf '  %s⨯ %s pass(es) could not complete — those areas are UNKNOWN, not clean%s\n' "$C_R$C_BOLD" "$ERRORS" "$C_0"
+  jq -rs '.[]|select(.status=="error")|"      · \(.pass): \(.detail)"' "$STATUS"
+fi
+[ "$BASE_N" -gt 0 ] && printf '  %s+ %s accepted via baseline (excluded from the gate)%s\n' "$C_D" "$BASE_N" "$C_0"
+[ "$DIFF_N" -gt 0 ] && printf '  %s+ %s pre-existing outside the diff (reported, not gated)%s\n' "$C_D" "$DIFF_N" "$C_0"
+say "  report: $C_BOLD$REPORT$C_0"
+say "  html:   $C_BOLD$HTML$C_0"
+[ "$DO_PDF" = 1 ] && [ -s "$PDF" ] && say "  pdf:    $C_BOLD$PDF$C_0"
+say "  sarif:  $C_BOLD$SARIF$C_0"
+
+if [ "$DO_OPEN" = 1 ]; then
+  if have open; then open "$HTML" >/dev/null 2>&1
+  elif have xdg-open; then xdg-open "$HTML" >/dev/null 2>&1
+  else warn "could not open a browser automatically — file://$HTML"; fi
+fi
+
 # Fail closed: an incomplete scan is not a pass. Exit 3 is distinct from 1 so CI
 # can tell "we found problems" from "we could not look".
-if [ "$ERRORS" -gt 0 ] && [ "$FAIL_ON_ERROR" = 1 ]; then
-  bad "INCOMPLETE — $ERRORS pass(es) failed to run (exit 3). Fix the tooling or pass --no-fail-on-error."
-  [ "$gate" = 1 ] && bad "also: findings at/above '$FAIL_ON' threshold ($reason)"
-  exit 3
-fi
-if [ "$gate" = 1 ]; then bad "FAIL — findings at/above '$FAIL_ON' threshold ($reason)"; exit 1; fi
-[ "$ERRORS" -gt 0 ] && warn "passed threshold, but $ERRORS pass(es) were incomplete (--no-fail-on-error was set)"
-ok "PASS — no findings above '$FAIL_ON' threshold"
-exit 0
+case "$VERDICT" in
+  INCOMPLETE) bad "INCOMPLETE — $ERRORS pass(es) failed to run (exit 3). Fix the tooling or pass --no-fail-on-error."
+              [ "$gate" = 1 ] && bad "also: findings at/above '$FAIL_ON' threshold ($reason)";;
+  FAIL)       bad "FAIL — findings at/above '$FAIL_ON' threshold ($reason)";;
+  PASS)       [ "$ERRORS" -gt 0 ] && warn "passed threshold, but $ERRORS pass(es) were incomplete (--no-fail-on-error was set)"
+              ok "PASS — no findings above '$FAIL_ON' threshold";;
+esac
+exit "$RC"

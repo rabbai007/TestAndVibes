@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.3.0] — 2026-08-11
+
+Adoption release. 0.2.0 made the tool trustworthy; this makes it usable on a
+codebase that already exists — without weakening the fail-closed guarantee.
+
+### Added
+
+- **Baseline of accepted findings** — adopt VibeCheck on an existing codebase
+  without triaging everything at once. `--write-baseline` accepts every current
+  finding; subsequent runs gate only on what is new. `--baseline PATH` selects a
+  file (default `./.vibecheck-baseline.json`), `--no-baseline` ignores it.
+  - Identity is `sha256(tool|rule|file|title)` and deliberately **excludes the
+    line number**, which shifts whenever anything above a finding is edited —
+    including it would resurrect every accepted entry on the next commit. Also
+    emitted as SARIF `partialFingerprints`.
+  - **An ERROR state is not baselineable.** Accepting a finding is a judgement
+    about known risk; accepting "this area was never scanned" would reintroduce
+    the fail-open behaviour 0.2.0 removed.
+  - Accepted findings stay **visible** — listed in the console, both reports, and
+    counted in the summary — but excluded from the gate and from SARIF.
+  - Entries record an `added` date and a `reason` field for a human to fill in.
+    Entries older than 90 days warn but still suppress. Re-running
+    `--write-baseline` preserves existing dates and reasons; entries matching
+    nothing are reported as prunable.
+- **HTML and PDF reports** — `report.html` is generated on every run;
+  `--pdf` renders `report.pdf` (headless Chrome, falling back to wkhtmltopdf then
+  weasyprint) and `--open` opens the report in your browser. The HTML embeds all
+  styling and references nothing external, so it survives being emailed.
+  - Severity is a row of stat tiles rather than a chart, each pairing colour with
+    an icon and a label so colour never carries meaning alone.
+  - The document states its own limits: the verdict leads, a coverage table shows
+    which passes ran and which errored, and a closing scope block states this is
+    an automated scan rather than a penetration test.
+
+- **Diff-scoped gating** — `--diff REF` gates only on findings in files changed
+  against a git ref, so a pull request fails for what it introduces rather than
+  what it inherited. Findings outside the diff are still reported. Dynamic
+  findings always count, since they describe the running application rather than
+  a file in the diff. A missing ref or non-git target is an **ERROR (exit 3)**,
+  not a silent scope-to-nothing. Pairs with the baseline: use `--diff` on pull
+  requests and a full scan on your default branch.
+
+### Fixed
+
+- **The gitleaks path never scanned the working tree.** Only git history was
+  scanned on a repository, so an uncommitted secret — exactly what a pre-commit
+  check should catch — was invisible. Both history and the working tree are now
+  scanned, and results deduplicated (`gitleaks git` reports repo-relative paths
+  while `gitleaks dir` reports absolute ones, so the same secret was otherwise
+  counted twice).
+- **Migrated off the deprecated `gitleaks detect`/`--no-git`** to the `git` and
+  `dir` subcommands, with a capability probe so older installs still work.
+- `ci/github-actions.yml` referenced `aquasecurity/setup-trivy@v0.2.3`, which does
+  not exist — copying the template produced an immediate CI failure. Now v0.3.1.
+- `.gitignore` pattern `vibecheck.yml` was unanchored and matched at any depth,
+  silently excluding `.github/workflows/vibecheck.yml` from commits.
+
+### Added (CI)
+
+- `.github/workflows/vibecheck.yml` — the repository is now gated by its own tool,
+  with every action pinned to a commit SHA. Pull requests run in `--diff` mode;
+  pushes to `main` run a full scan.
+
 ## [0.2.0] — 2026-08-11
 
 **Correctness release. 0.1.0 could report a vulnerable app as clean — upgrade.**
