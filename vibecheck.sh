@@ -36,6 +36,8 @@ SELF_INSTALL=0
 SEMGREP_CONFIG="auto"
 SECRETS_STRICT=0        # 1 = unverified secrets count as high, not medium
 DO_SECRETS=1; DO_SAST=1; DO_DEPS=1; DO_IAC=1
+DO_PDF=0                # 1 = also render report.pdf (needs Chrome/wkhtmltopdf/weasyprint)
+DO_OPEN=0               # 1 = open the HTML report in the default browser
 
 # ── pretty output ──
 if [ -t 1 ]; then C_R=$'\033[31m'; C_Y=$'\033[33m'; C_G=$'\033[32m'; C_B=$'\033[36m'; C_D=$'\033[2m'; C_0=$'\033[0m'; C_BOLD=$'\033[1m'
@@ -72,12 +74,16 @@ OPTIONS
   --skip-sast          Skip the SAST pass
   --skip-deps          Skip the dependency pass
   --skip-iac           Skip the IaC pass
+  --pdf                Also render DIR/report.pdf (Chrome, wkhtmltopdf, or weasyprint)
+  --open               Open the HTML report in your default browser when done
   --install            Install the underlying scanners and exit
   --version            Print version and exit
   -h, --help           This help
 
 OUTPUT
   DIR/report.md        Consolidated findings + per-pass status
+  DIR/report.html      Formatted, self-contained report (print/PDF-ready)
+  DIR/report.pdf       Same report as PDF (with --pdf)
   DIR/vibecheck.sarif  SARIF 2.1.0 (GitHub Code Scanning / any SARIF viewer)
   DIR/findings.json    Machine-readable findings
   DIR/*.json           Raw per-scanner output for triage
@@ -155,6 +161,8 @@ while [ $# -gt 0 ]; do
     --skip-sast) DO_SAST=0; shift;;
     --skip-deps) DO_DEPS=0; shift;;
     --skip-iac) DO_IAC=0; shift;;
+    --pdf) DO_PDF=1; shift;;
+    --open) DO_OPEN=1; shift;;
     --install) SELF_INSTALL=1; shift;;
     --version) say "VibeCheck v$VERSION"; exit 0;;
     -h|--help) usage;;
@@ -196,6 +204,8 @@ TARGET="$(cd "$TARGET" && pwd)"
 mkdir -p "$OUTDIR" || { err "cannot create out dir: $OUTDIR"; exit 2; }
 OUTDIR="$(cd "$OUTDIR" && pwd)"
 REPORT="$OUTDIR/report.md"
+HTML="$OUTDIR/report.html"
+PDF="$OUTDIR/report.pdf"
 FINDINGS="$OUTDIR/.findings.jsonl"
 STATUS="$OUTDIR/.status.jsonl"
 SARIF="$OUTDIR/vibecheck.sarif"
@@ -841,17 +851,7 @@ jq -s --arg ver "$VERSION" --arg uri "$TOOL_URL" '
   }' "$FINDINGS" > "$SARIF" 2>/dev/null || {
     err "failed to generate SARIF"; }
 
-# ── summary + gate ──
-head2 "Summary"
-printf '  %sCRITICAL %s  %sHIGH %s  %sMEDIUM %s  %sLOW %s  (total %s)\n' \
-  "$C_R" "$CRIT" "$C_R" "$HIGH" "$C_Y" "$MED" "$C_D" "$LOW" "$TOTAL"
-if [ "$ERRORS" -gt 0 ]; then
-  printf '  %s⨯ %s pass(es) could not complete — those areas are UNKNOWN, not clean%s\n' "$C_R$C_BOLD" "$ERRORS" "$C_0"
-  jq -rs '.[]|select(.status=="error")|"      · \(.pass): \(.detail)"' "$STATUS"
-fi
-say "  report: $C_BOLD$REPORT$C_0"
-say "  sarif:  $C_BOLD$SARIF$C_0"
-
+# ── gate (computed before the report so the verdict can be rendered in it) ──
 gate=0; reason=""
 case "$FAIL_ON" in
   never)    gate=0;;
@@ -862,14 +862,241 @@ case "$FAIL_ON" in
   critical) [ "$CRIT" -gt 0 ] && { gate=1; reason="critical"; };;
 esac
 
+if [ "$ERRORS" -gt 0 ] && [ "$FAIL_ON_ERROR" = 1 ]; then
+  VERDICT="INCOMPLETE"; V_CLASS="incomplete"; RC=3
+  V_TEXT="$ERRORS scan pass(es) could not complete. Those areas were NOT examined and are unknown — not clean."
+elif [ "$gate" = 1 ]; then
+  VERDICT="FAIL"; V_CLASS="fail"; RC=1
+  V_TEXT="Findings at or above the '$FAIL_ON' threshold ($reason)."
+else
+  VERDICT="PASS"; V_CLASS="pass"; RC=0
+  V_TEXT="No findings above the '$FAIL_ON' threshold."
+  [ "$ERRORS" -gt 0 ] && V_TEXT="$V_TEXT Note: $ERRORS pass(es) were incomplete and fail-on-error was disabled."
+fi
+
+# ── HTML report (self-contained, print/PDF-ready) ──
+# Severity uses the reserved status palette and always pairs colour with an icon
+# and a text label — two of these steps are sub-3:1 on a light surface, so colour
+# never carries meaning on its own.
+sev_icon() { case "$1" in critical) printf '✕';; high) printf '▲';; medium) printf '●';; *) printf '▪';; esac; }
+
+{
+cat <<'HTMLHEAD'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VibeCheck Security Report</title>
+<style>
+  :root{
+    --ink:#1a1a19; --ink-2:#4a4a47; --muted:#6b6b68; --rule:#e2e2df;
+    --surface:#fff; --surface-2:#faf9f7; --accent:#2b6cb0;
+    --crit:#d03b3b; --high:#ec835a; --med:#fab219; --low:#8a8a86; --good:#0ca30c;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--surface);color:var(--ink);
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:60rem;margin:0 auto;padding:2.5rem 2rem 4rem}
+  header{border-bottom:2px solid var(--ink);padding-bottom:1.25rem;margin-bottom:1.75rem}
+  .brand{font-size:.75rem;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 .35rem}
+  h1{font-size:1.9rem;line-height:1.2;margin:0 0 1rem;letter-spacing:-.01em}
+  h2{font-size:1.15rem;margin:2.5rem 0 .85rem;padding-bottom:.4rem;border-bottom:1px solid var(--rule);letter-spacing:-.005em}
+  h3{font-size:.95rem;margin:1.75rem 0 .6rem;display:flex;align-items:center;gap:.5rem}
+  p{margin:.6rem 0}
+  .meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));gap:.5rem 1.5rem;font-size:.84rem}
+  .meta div{display:flex;gap:.5rem;min-width:0}
+  .meta div.wide{grid-column:1/-1}   /* long paths/URLs get the full row */
+  .meta dt{color:var(--muted);min-width:5.5rem;flex:none}
+  .meta dd{margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+           overflow-wrap:anywhere;min-width:0}
+  .verdict{border:1px solid;border-left-width:5px;border-radius:5px;padding:1rem 1.15rem;margin:1.5rem 0}
+  .verdict .vlabel{font-weight:700;font-size:1rem;display:flex;align-items:center;gap:.5rem;margin-bottom:.25rem}
+  .verdict p{margin:0;font-size:.9rem;color:var(--ink-2)}
+  .verdict.pass{border-color:var(--good);background:#f2fbf2}
+  .verdict.fail{border-color:var(--crit);background:#fdf3f3}
+  .verdict.incomplete{border-color:var(--crit);background:#fdf3f3}
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:.75rem;margin:1.25rem 0}
+  .tile{border:1px solid var(--rule);border-top:3px solid;border-radius:5px;padding:.8rem .9rem;background:var(--surface-2)}
+  .tile .ico{font-size:.8rem;line-height:1}
+  .tile .num{display:block;font-size:2rem;font-weight:650;line-height:1.1;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+  .tile .lab{font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:.35rem}
+  .t-crit{border-top-color:var(--crit)} .t-crit .ico{color:var(--crit)}
+  .t-high{border-top-color:var(--high)} .t-high .ico{color:var(--high)}
+  .t-med{border-top-color:var(--med)}  .t-med  .ico{color:var(--med)}
+  .t-low{border-top-color:var(--low)}  .t-low  .ico{color:var(--low)}
+  table{width:100%;border-collapse:collapse;font-size:.84rem;margin:.5rem 0 1rem}
+  thead{display:table-header-group}
+  th{text-align:left;font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);
+     border-bottom:1px solid var(--ink);padding:.45rem .6rem .4rem;font-weight:600}
+  td{border-bottom:1px solid var(--rule);padding:.55rem .6rem;vertical-align:top}
+  tr{break-inside:avoid;page-break-inside:avoid}
+  code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}
+  td.loc{white-space:nowrap;color:var(--ink-2)}
+  .pill{display:inline-flex;align-items:center;gap:.3rem;font-size:.7rem;font-weight:600;
+        letter-spacing:.04em;text-transform:uppercase;white-space:nowrap}
+  .s-critical{color:var(--crit)} .s-high{color:var(--high)}
+  .s-medium{color:#8a6100} .s-low{color:var(--low)}
+  .st-ok{color:var(--good)} .st-error{color:var(--crit);font-weight:700}
+  .st-findings{color:var(--crit)} .st-skipped{color:var(--muted)}
+  .note{background:var(--surface-2);border:1px solid var(--rule);border-radius:5px;
+        padding:.85rem 1rem;font-size:.85rem;color:var(--ink-2);margin:1rem 0}
+  .note strong{color:var(--ink)}
+  .scope{border-left:3px solid var(--muted);padding:.15rem 0 .15rem .9rem;margin:1rem 0;
+         font-size:.85rem;color:var(--ink-2)}
+  footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--rule);
+         font-size:.78rem;color:var(--muted)}
+  a{color:var(--accent)} a:hover{text-decoration:underline}
+  .empty{color:var(--muted);font-style:italic}
+  @media (max-width:640px){ .kpis{grid-template-columns:repeat(2,1fr)} .wrap{padding:1.5rem 1rem 3rem} }
+  @media print{
+    @page{margin:16mm}
+    .wrap{max-width:none;padding:0}
+    body{font-size:10.5pt}
+    h2{margin-top:1.4rem} h1{font-size:1.6rem}
+    .verdict,.note,.tile{background:#fff!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+    h2,h3{break-after:avoid;page-break-after:avoid}
+    a{text-decoration:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+HTMLHEAD
+
+# ── header + metadata ──
+printf '<header>\n<p class="brand">Automated Security Audit</p>\n<h1>VibeCheck Security Report</h1>\n<dl class="meta">\n'
+printf '<div class="wide"><dt>Target</dt><dd>%s</dd></div>\n' "$(printf '%s' "$TARGET" | sed 's/&/\&amp;/g;s/</\&lt;/g')"
+printf '<div><dt>Scanned</dt><dd>%s</dd></div>\n' "$STAMP"
+[ -n "$URL" ] && printf '<div><dt>Dynamic</dt><dd>%s</dd></div>\n' "$(printf '%s' "$URL" | sed 's/&/\&amp;/g;s/</\&lt;/g')"
+printf '<div><dt>Stack</dt><dd>%s</dd></div>\n' "$(echo "$STACK" | tr -s ' ' | sed 's/^ //;s/ $//;s/&/\&amp;/g;s/</\&lt;/g')"
+printf '<div><dt>Threshold</dt><dd>%s</dd></div>\n' "$FAIL_ON"
+printf '<div><dt>Tool</dt><dd>VibeCheck v%s</dd></div>\n' "$VERSION"
+printf '</dl>\n</header>\n'
+
+# ── verdict ──
+case "$VERDICT" in
+  PASS)       vicon="✓";;
+  FAIL)       vicon="✗";;
+  *)          vicon="⨯";;
+esac
+printf '<div class="verdict %s"><div class="vlabel"><span>%s</span><span>%s</span></div><p>%s</p></div>\n' \
+  "$V_CLASS" "$vicon" "$VERDICT" "$V_TEXT"
+
+# ── executive summary: KPI row (headline numbers, not a chart) ──
+printf '<h2>Summary of findings</h2>\n<div class="kpis">\n'
+for s in critical high medium low; do
+  case "$s" in critical) cls=t-crit; n=$CRIT;; high) cls=t-high; n=$HIGH;; medium) cls=t-med; n=$MED;; low) cls=t-low; n=$LOW;; esac
+  printf '<div class="tile %s"><span class="num">%s</span><span class="lab"><span class="ico">%s</span>%s</span></div>\n' \
+    "$cls" "$n" "$(sev_icon "$s")" "$s"
+done
+printf '</div>\n'
+printf '<p style="font-size:.85rem;color:var(--muted)">%s finding(s) total across %s scan pass(es).</p>\n' \
+  "$TOTAL" "$(jq -s 'length' "$STATUS")"
+
+# ── coverage / pass status ──
+printf '<h2>Scan coverage</h2>\n'
+printf '<p>Every pass reports its own status. A pass marked <strong>ERROR</strong> did not complete: that area was <em>not examined</em>, and its absence of findings means nothing.</p>\n'
+printf '<table><thead><tr><th>Pass</th><th>Status</th><th>Detail</th></tr></thead><tbody>\n'
+jq -rs '.[] |
+  (if .status=="error" then "st-error|⨯ ERROR"
+   elif .status=="findings" then "st-findings|✗ findings"
+   elif .status=="skipped" then "st-skipped|— skipped"
+   else "st-ok|✓ clean" end) as $s |
+  "<tr><td>\(.pass)</td><td class=\"\($s|split("|")[0])\">\($s|split("|")[1])</td><td>\(.detail|@html)</td></tr>"' "$STATUS"
+printf '</tbody></table>\n'
+
+if [ "$ERRORS" -gt 0 ]; then
+  printf '<div class="note"><strong>⨯ Incomplete coverage.</strong> %s pass(es) failed to run. VibeCheck fails closed: an area it could not scan is reported as unknown rather than clean.</div>\n' "$ERRORS"
+fi
+
+# ── findings ──
+printf '<h2>Findings</h2>\n'
+if [ "$TOTAL" -eq 0 ]; then
+  printf '<p class="empty">No findings recorded at or above the reporting floor.</p>\n'
+else
+  for s in critical high medium low; do
+    n=$(sev_count "$s"); [ "$n" -eq 0 ] && continue
+    printf '<h3><span class="pill s-%s">%s %s</span><span style="color:var(--muted);font-weight:400">(%s)</span></h3>\n' \
+      "$s" "$(sev_icon "$s")" "$s" "$n"
+    printf '<table><thead><tr><th>Tool</th><th>Rule</th><th>Location</th><th>Detail</th></tr></thead><tbody>\n'
+    jq -rs --arg s "$s" '.[] | select(.severity==$s) |
+      "<tr><td>\(.tool|@html)</td><td><code>\(.rule|@html)</code></td>" +
+      "<td class=\"loc\">" + (if .file=="" then "—" else "<code>\(.file|@html)\(if .line>0 then ":\(.line)" else "" end)</code>" end) + "</td>" +
+      "<td>\(.title|@html)" + (if .help=="" then "" else " <a href=\"\(.help|@html)\">ref</a>" end) + "</td></tr>"' "$FINDINGS"
+    printf '</tbody></table>\n'
+  done
+fi
+
+# ── methodology + scope ──
+printf '<h2>Methodology &amp; scope</h2>\n'
+printf '<p>VibeCheck orchestrates open-source scanners and consolidates their output. Passes run over the target directory; dynamic checks, when enabled, issue a single unauthenticated GET and a TLS handshake against the supplied URL — no payloads, no exploitation.</p>\n'
+printf '<div class="scope"><strong>This is an automated scan, not a penetration test.</strong> It detects known and mechanical issues: leaked credentials, vulnerable dependencies, insecure code patterns, misconfiguration, and missing transport controls. It does <strong>not</strong> detect business-logic flaws — broken access control, multi-tenant data leakage, authorisation bypasses, or insecure workflows — which require a human reviewer who understands the application&rsquo;s intent. Scanners also produce false positives; triage before acting.</div>\n'
+printf '<p style="font-size:.85rem;color:var(--muted)">Raw scanner output, SARIF, and machine-readable findings are alongside this file in <code>%s</code>.</p>\n' \
+  "$(printf '%s' "$(basename "$OUTDIR")" | sed 's/&/\&amp;/g;s/</\&lt;/g')"
+
+printf '<footer>Generated by VibeCheck v%s on %s · Threshold <code>%s</code> · Exit code %s</footer>\n' \
+  "$VERSION" "$STAMP" "$FAIL_ON" "$RC"
+printf '</div>\n</body>\n</html>\n'
+} > "$HTML"
+
+# ── PDF (optional) ──
+if [ "$DO_PDF" = 1 ]; then
+  pdf_ok=0
+  CHROME=""
+  for c in "google-chrome" "google-chrome-stable" "chromium" "chromium-browser" "msedge"; do
+    have "$c" && { CHROME="$c"; break; }
+  done
+  if [ -z "$CHROME" ]; then
+    for p in "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+             "/Applications/Chromium.app/Contents/MacOS/Chromium" \
+             "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"; do
+      [ -x "$p" ] && { CHROME="$p"; break; }
+    done
+  fi
+  if [ -n "$CHROME" ]; then
+    # headless Chrome honours the print stylesheet, which the others approximate
+    "$CHROME" --headless --disable-gpu --no-sandbox --no-pdf-header-footer \
+      --print-to-pdf="$PDF" "file://$HTML" >/dev/null 2>&1 && [ -s "$PDF" ] && pdf_ok=1
+  fi
+  if [ "$pdf_ok" = 0 ] && have wkhtmltopdf; then
+    wkhtmltopdf --enable-local-file-access -q "$HTML" "$PDF" >/dev/null 2>&1 && [ -s "$PDF" ] && pdf_ok=1
+  fi
+  if [ "$pdf_ok" = 0 ] && have weasyprint; then
+    weasyprint "$HTML" "$PDF" >/dev/null 2>&1 && [ -s "$PDF" ] && pdf_ok=1
+  fi
+  # A missing PDF converter is a reporting gap, not a failed scan — warn, never
+  # change the exit code.
+  [ "$pdf_ok" = 1 ] || warn "PDF not generated: install Chrome, wkhtmltopdf, or weasyprint"
+fi
+
+# ── summary ──
+head2 "Summary"
+printf '  %sCRITICAL %s  %sHIGH %s  %sMEDIUM %s  %sLOW %s  (total %s)\n' \
+  "$C_R" "$CRIT" "$C_R" "$HIGH" "$C_Y" "$MED" "$C_D" "$LOW" "$TOTAL"
+if [ "$ERRORS" -gt 0 ]; then
+  printf '  %s⨯ %s pass(es) could not complete — those areas are UNKNOWN, not clean%s\n' "$C_R$C_BOLD" "$ERRORS" "$C_0"
+  jq -rs '.[]|select(.status=="error")|"      · \(.pass): \(.detail)"' "$STATUS"
+fi
+say "  report: $C_BOLD$REPORT$C_0"
+say "  html:   $C_BOLD$HTML$C_0"
+[ "$DO_PDF" = 1 ] && [ -s "$PDF" ] && say "  pdf:    $C_BOLD$PDF$C_0"
+say "  sarif:  $C_BOLD$SARIF$C_0"
+
+if [ "$DO_OPEN" = 1 ]; then
+  if have open; then open "$HTML" >/dev/null 2>&1
+  elif have xdg-open; then xdg-open "$HTML" >/dev/null 2>&1
+  else warn "could not open a browser automatically — file://$HTML"; fi
+fi
+
 # Fail closed: an incomplete scan is not a pass. Exit 3 is distinct from 1 so CI
 # can tell "we found problems" from "we could not look".
-if [ "$ERRORS" -gt 0 ] && [ "$FAIL_ON_ERROR" = 1 ]; then
-  bad "INCOMPLETE — $ERRORS pass(es) failed to run (exit 3). Fix the tooling or pass --no-fail-on-error."
-  [ "$gate" = 1 ] && bad "also: findings at/above '$FAIL_ON' threshold ($reason)"
-  exit 3
-fi
-if [ "$gate" = 1 ]; then bad "FAIL — findings at/above '$FAIL_ON' threshold ($reason)"; exit 1; fi
-[ "$ERRORS" -gt 0 ] && warn "passed threshold, but $ERRORS pass(es) were incomplete (--no-fail-on-error was set)"
-ok "PASS — no findings above '$FAIL_ON' threshold"
-exit 0
+case "$VERDICT" in
+  INCOMPLETE) bad "INCOMPLETE — $ERRORS pass(es) failed to run (exit 3). Fix the tooling or pass --no-fail-on-error."
+              [ "$gate" = 1 ] && bad "also: findings at/above '$FAIL_ON' threshold ($reason)";;
+  FAIL)       bad "FAIL — findings at/above '$FAIL_ON' threshold ($reason)";;
+  PASS)       [ "$ERRORS" -gt 0 ] && warn "passed threshold, but $ERRORS pass(es) were incomplete (--no-fail-on-error was set)"
+              ok "PASS — no findings above '$FAIL_ON' threshold";;
+esac
+exit "$RC"
