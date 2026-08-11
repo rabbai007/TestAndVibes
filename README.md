@@ -79,6 +79,7 @@ targets). No config required.
 | `--skip-secrets`/`-sast`/`-deps`/`-iac` | — | Explicitly skip a pass (recorded as *skipped*) |
 | `--pdf` | — | Also render `report.pdf` (Chrome / wkhtmltopdf / weasyprint) |
 | `--open` | — | Open the HTML report in your browser when done |
+| `--diff REF` | — | PR mode: gate only on findings in files changed vs `REF` |
 | `--baseline PATH` | `./.vibecheck-baseline.json` | Accepted-findings file |
 | `--write-baseline` | — | Accept every current finding, then exit |
 | `--no-baseline` | — | Ignore the baseline and gate on everything |
@@ -122,6 +123,24 @@ not hidden. Two things the baseline deliberately cannot do: suppress an
 **ERROR** (you can accept a known risk, but never "we didn't scan this"), or
 survive a change to the finding itself. Identity excludes line numbers, so
 unrelated edits above a finding won't resurrect it.
+
+### Gating pull requests on what they introduce
+
+`--diff` scopes the gate to files the change touched, so a PR fails for what it
+adds rather than what it inherited:
+
+```bash
+./vibecheck.sh --diff origin/main --fail-on high    # in PR CI
+./vibecheck.sh --fail-on high                       # full scan on your default branch
+```
+
+Findings outside the diff are still reported, just not gated. Dynamic checks
+always count — they describe the running application, not a file in the diff.
+
+**Run both.** `--diff` is a PR gate, not a replacement for a full scan; on its
+own it would let pre-existing issues accumulate unexamined. If the ref is
+missing or the target isn't a git repo, VibeCheck exits 3 rather than quietly
+scoping to nothing — in CI, remember `fetch-depth: 0` so the base ref exists.
 
 ## Configuration
 

@@ -5,7 +5,14 @@ All notable changes to **VibeCheck** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.3.0 in progress
+## [Unreleased]
+
+_Nothing yet._
+
+## [0.3.0] — 2026-08-11
+
+Adoption release. 0.2.0 made the tool trustworthy; this makes it usable on a
+codebase that already exists — without weakening the fail-closed guarantee.
 
 ### Added
 
@@ -36,8 +43,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     which passes ran and which errored, and a closing scope block states this is
     an automated scan rather than a penetration test.
 
+- **Diff-scoped gating** — `--diff REF` gates only on findings in files changed
+  against a git ref, so a pull request fails for what it introduces rather than
+  what it inherited. Findings outside the diff are still reported. Dynamic
+  findings always count, since they describe the running application rather than
+  a file in the diff. A missing ref or non-git target is an **ERROR (exit 3)**,
+  not a silent scope-to-nothing. Pairs with the baseline: use `--diff` on pull
+  requests and a full scan on your default branch.
+
 ### Fixed
 
+- **The gitleaks path never scanned the working tree.** Only git history was
+  scanned on a repository, so an uncommitted secret — exactly what a pre-commit
+  check should catch — was invisible. Both history and the working tree are now
+  scanned, and results deduplicated (`gitleaks git` reports repo-relative paths
+  while `gitleaks dir` reports absolute ones, so the same secret was otherwise
+  counted twice).
+- **Migrated off the deprecated `gitleaks detect`/`--no-git`** to the `git` and
+  `dir` subcommands, with a capability probe so older installs still work.
 - `ci/github-actions.yml` referenced `aquasecurity/setup-trivy@v0.2.3`, which does
   not exist — copying the template produced an immediate CI failure. Now v0.3.1.
 - `.gitignore` pattern `vibecheck.yml` was unanchored and matched at any depth,
@@ -46,7 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added (CI)
 
 - `.github/workflows/vibecheck.yml` — the repository is now gated by its own tool,
-  with every action pinned to a commit SHA.
+  with every action pinned to a commit SHA. Pull requests run in `--diff` mode;
+  pushes to `main` run a full scan.
 
 ## [0.2.0] — 2026-08-11
 

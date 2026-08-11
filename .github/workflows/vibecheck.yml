@@ -60,7 +60,19 @@ jobs:
       # --skip-deps is explicit and recorded in the report: this repo is a bash
       # script with no dependency manifest, so there is nothing to resolve. It is
       # a stated decision rather than a silent gap.
-      - name: Run VibeCheck on itself
+      #
+      # Pull requests gate on what they introduce (--diff); pushes to main run a
+      # full scan so pre-existing findings never accumulate unexamined. The
+      # checkout above uses fetch-depth: 0, so the base ref exists locally — with
+      # a shallow clone the ref would be missing and VibeCheck would exit 3
+      # rather than silently gate on nothing.
+      - name: Run VibeCheck on itself (PR — changed files only)
+        if: github.event_name == 'pull_request'
+        run: ./vibecheck.sh --fail-on high --semgrep-config p/ci --skip-deps
+                            --diff "origin/${{ github.base_ref }}"
+
+      - name: Run VibeCheck on itself (full scan)
+        if: github.event_name != 'pull_request'
         run: ./vibecheck.sh --fail-on high --semgrep-config p/ci --skip-deps
 
       # Uploaded even when the gate fails, so findings reach the Security tab.

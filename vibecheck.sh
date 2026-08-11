@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
 
 # ── defaults (overridable by vibecheck.yml, then CLI flags) ──
@@ -38,6 +38,7 @@ SECRETS_STRICT=0        # 1 = unverified secrets count as high, not medium
 DO_SECRETS=1; DO_SAST=1; DO_DEPS=1; DO_IAC=1
 DO_PDF=0                # 1 = also render report.pdf (needs Chrome/wkhtmltopdf/weasyprint)
 DO_OPEN=0               # 1 = open the HTML report in the default browser
+DIFF_REF=""             # gate only on findings in files changed vs this git ref
 BASELINE=""             # path to an accepted-findings baseline
 USE_BASELINE=1          # 0 = ignore any baseline file that exists
 WRITE_BASELINE=0        # 1 = merge current findings into the baseline and exit
@@ -80,6 +81,9 @@ OPTIONS
   --skip-iac           Skip the IaC pass
   --pdf                Also render DIR/report.pdf (Chrome, wkhtmltopdf, or weasyprint)
   --open               Open the HTML report in your default browser when done
+  --diff REF           PR mode: gate only on findings in files changed vs REF
+                       (e.g. --diff origin/main). Findings elsewhere are still
+                       reported. Run a full scan on your default branch too.
   --baseline PATH      Accepted-findings file (default: ./.vibecheck-baseline.json)
   --write-baseline     Accept every current finding into the baseline, then exit
   --no-baseline        Ignore any baseline file and gate on everything
@@ -170,6 +174,7 @@ while [ $# -gt 0 ]; do
     --skip-iac) DO_IAC=0; shift;;
     --pdf) DO_PDF=1; shift;;
     --open) DO_OPEN=1; shift;;
+    --diff) DIFF_REF="${2:?--diff needs a git ref}"; shift 2;;
     --baseline) BASELINE="${2:?--baseline needs a path}"; shift 2;;
     --write-baseline) WRITE_BASELINE=1; shift;;
     --no-baseline) USE_BASELINE=0; shift;;
@@ -378,24 +383,60 @@ elif have trufflehog; then
     if [ $((nv+nu)) -gt 0 ]; then set_status secrets findings "$nv verified, $nu unverified"; else set_status secrets ok "0 secrets"; fi
   fi
 elif have gitleaks; then
-  gl="$OUTDIR/gitleaks.json"
-  # 0.1.0 treated ANY non-zero gitleaks exit as "secrets found" — including
-  # "not a git repo". gitleaks: 0 = clean, 1 = leaks, other = real error.
-  if [ -d "$TARGET/.git" ]; then gitleaks detect --source "$TARGET" --no-banner --report-format json -r "$gl" >/dev/null 2>&1
-  else gitleaks detect --source "$TARGET" --no-git --no-banner --report-format json -r "$gl" >/dev/null 2>&1; fi
-  gl_rc=$?
-  if [ "$gl_rc" -gt 1 ]; then
-    pass_error secrets "gitleaks exited $gl_rc (scan did not complete)"
-  elif [ ! -f "$gl" ] || ! jq -e . "$gl" >/dev/null 2>&1; then
+  gl="$OUTDIR/gitleaks.json"; glh="$OUTDIR/.gitleaks-history.json"
+  rm -f "$gl" "$glh"
+  # gitleaks exit codes: 0 = clean, 1 = leaks found, >1 = the scan itself failed.
+  # (0.1.0 treated ANY non-zero exit as "secrets found", including "not a git repo".)
+  #
+  # `detect` is deprecated in gitleaks 8.19+ in favour of the `git` and `dir`
+  # subcommands, and `--no-git` goes with it. Probe for the modern CLI and fall
+  # back, so both old and new installs work.
+  gl_modern=0
+  gitleaks dir --help >/dev/null 2>&1 && gl_modern=1
+  gl_fail=0; gl_files=""
+  gl_run() { # report-file  args...
+    local out="$1"; shift
+    gitleaks "$@" --no-banner --report-format json -r "$out" >/dev/null 2>&1
+    local rc=$?
+    [ "$rc" -gt 1 ] && { gl_fail=$rc; return 1; }
+    [ -f "$out" ] && gl_files="$gl_files $out"
+    return 0
+  }
+  # Scan history AND the working tree, matching the trufflehog path. Previously
+  # only history was scanned on a git repo, so an uncommitted secret — the exact
+  # thing a pre-commit check should catch — was invisible.
+  if [ "$gl_modern" = 1 ]; then
+    [ -d "$TARGET/.git" ] && gl_run "$glh" git "$TARGET"
+    gl_run "$gl" dir "$TARGET"
+  else
+    if [ -d "$TARGET/.git" ]; then gl_run "$glh" detect --source "$TARGET"
+                                   gl_run "$gl" detect --source "$TARGET" --no-git
+    else gl_run "$gl" detect --source "$TARGET" --no-git; fi
+  fi
+
+  if [ "$gl_fail" -gt 1 ]; then
+    pass_error secrets "gitleaks exited $gl_fail (scan did not complete)"
+  elif [ -z "${gl_files// /}" ]; then
     pass_error secrets "gitleaks produced no parseable report"
   else
-    n=0
-    while IFS=$'\t' read -r ruleid file lineno desc; do
-      [ -z "${ruleid:-}" ] && continue
-      n=$((n+1)); add_finding gitleaks high "gitleaks.$ruleid" "$(rel "$file")" "$lineno" "${desc:-Secret detected}" ""
-    done < <(jq -r '.[]? | [(.RuleID//"unknown"), (.File//""), ((.StartLine//0)|tostring), ((.Description//"")|gsub("\n";" "))] | @tsv' "$gl" 2>/dev/null)
-    [ "$n" -gt 0 ] && { bad "gitleaks: $n potential secret(s)"; set_status secrets findings "$n"; } \
-                   || { ok "gitleaks: no secrets"; set_status secrets ok "0 secrets"; }
+    for f in $gl_files; do
+      jq -e . "$f" >/dev/null 2>&1 || { pass_error secrets "gitleaks wrote unparseable JSON to $f"; gl_fail=99; break; }
+    done
+    if [ "$gl_fail" != 99 ]; then
+      n=0
+      while IFS=$'\t' read -r ruleid file lineno desc; do
+        [ -z "${ruleid:-}" ] && continue
+        n=$((n+1)); add_finding gitleaks high "gitleaks.$ruleid" "$(rel "$file")" "$lineno" "${desc:-Secret detected}" ""
+      # `gitleaks git` reports repo-relative paths while `gitleaks dir` reports
+      # absolute ones, so normalise BEFORE dedup or the same secret is counted
+      # twice — once from history, once from the working tree.
+      done < <(jq -r -s --arg t "$TARGET/" 'add // [] | .[]?
+                  | [(.RuleID//"unknown"), ((.File//"")|ltrimstr($t)), ((.StartLine//0)|tostring),
+                     ((.Description//"")|gsub("[\n\t]";" "))] | @tsv' \
+                  $gl_files 2>/dev/null | sort -u)
+      [ "$n" -gt 0 ] && { bad "gitleaks: $n potential secret(s)"; set_status secrets findings "$n"; } \
+                     || { ok "gitleaks: no secrets"; set_status secrets ok "0 secrets"; }
+    fi
   fi
 else
   pass_error secrets "no secret scanner installed (trufflehog or gitleaks) — cannot verify absence of secrets"
@@ -875,9 +916,54 @@ else
   cp "$FINDINGS" "$ACTIVE"
 fi
 
+# ── diff scope (PR mode) ──
+# Gate only on findings in files this change touched. Pre-existing findings
+# elsewhere are still reported, just not gated — that is the point: a PR should
+# fail for what it introduces, not for what it inherited.
+DIFF_N=0
+if [ -n "$DIFF_REF" ]; then
+  head2 "Diff scope"
+  if [ ! -d "$TARGET/.git" ] && ! git -C "$TARGET" rev-parse --git-dir >/dev/null 2>&1; then
+    pass_error diff "--diff $DIFF_REF requires a git repository — scope could not be determined"
+  elif ! git -C "$TARGET" rev-parse --verify --quiet "$DIFF_REF" >/dev/null 2>&1; then
+    # Fail closed: silently scoping to nothing would turn --diff into "gate on
+    # nothing", which is exactly the fail-open behaviour this tool refuses.
+    pass_error diff "git ref '$DIFF_REF' not found — cannot determine what changed (fetch it, or drop --diff)"
+  else
+    CHANGED="$OUTDIR/.changed-files"
+    prefix="$(git -C "$TARGET" rev-parse --show-prefix 2>/dev/null)"
+    { git -C "$TARGET" diff --name-only "$DIFF_REF...HEAD" 2>/dev/null
+      git -C "$TARGET" diff --name-only HEAD 2>/dev/null; } \
+      | sed "s|^$prefix||" | sed '/^$/d' | sort -u > "$CHANGED"
+    n_changed=$(wc -l < "$CHANGED" | tr -d ' ')
+    say "  ${C_D}$n_changed file(s) changed vs $DIFF_REF${C_0}"
+    if [ "$n_changed" -eq 0 ]; then
+      ok "no files changed — nothing to gate on"
+    fi
+    OUTSCOPE="$OUTDIR/.outscope.jsonl"
+    # Dynamic findings describe the running application, not a file in the diff,
+    # so they always stay in scope.
+    jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
+      'select(.tool=="dynamic" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
+    jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
+      'select(.tool!="dynamic" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
+    DIFF_N=$(jq -s 'length' "$OUTSCOPE")
+    mv "$OUTDIR/.inscope.jsonl" "$ACTIVE"
+    [ "$DIFF_N" -gt 0 ] && warn "$DIFF_N pre-existing finding(s) outside the diff — reported, not gated" \
+                        || ok "no pre-existing findings outside the diff"
+    set_status diff ok "$n_changed file(s) changed vs $DIFF_REF; $DIFF_N finding(s) out of scope"
+  fi
+fi
+
 # ═══════════════════════════════════════════════════════════════════
 # outputs: report.md · findings.json · SARIF
 # ═══════════════════════════════════════════════════════════════════
+# Recompute AFTER every pass, including the baseline and diff blocks above.
+# Reading a value captured earlier would drop errors raised by those blocks and
+# let an incomplete scan exit 0 — the fail-open behaviour this tool exists to
+# prevent.
+ERRORS=$(jq -s '[.[]|select(.status=="error")]|length' "$STATUS")
+
 CRIT=$(sev_count critical); HIGH=$(sev_count high); MED=$(sev_count medium); LOW=$(sev_count low)
 TOTAL=$((CRIT+HIGH+MED+LOW))
 
@@ -927,6 +1013,16 @@ jq -s '{active: ., accepted: $acc[0]}' --slurpfile acc <(jq -s '.' "$ACCEPTED") 
         | "| \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)\(if .line>0 then ":\(.line)" else "" end)`" end) | \(.title|gsub("\\|";"\\\\|")) \(if .help=="" then "" else "([ref](\(.help)))" end) |"' "$ACTIVE"
       echo
     done
+  fi
+  if [ "$DIFF_N" -gt 0 ]; then
+    echo "## Outside the diff (not gated)"
+    echo
+    echo "Pre-existing findings in files not changed vs \`$DIFF_REF\`. Reported for awareness; they do not affect the exit code in \`--diff\` mode."
+    echo
+    echo "| Severity | Tool | Rule | Location | Detail |"
+    echo "|---|---|---|---|---|"
+    jq -rs '.[] | "| \(.severity) | \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)`" end) | \(.title|gsub("\\|";"\\\\|")) |"' "$OUTDIR/.outscope.jsonl"
+    echo
   fi
   if [ "$BASE_N" -gt 0 ]; then
     echo "## Accepted (baseline)"
@@ -1160,6 +1256,20 @@ else
   done
 fi
 
+# ── outside the diff — visible, but not gated in PR mode ──
+if [ "$DIFF_N" -gt 0 ]; then
+  printf '<h2>Outside the diff</h2>\n'
+  printf '<p>%s pre-existing finding(s) in files not changed vs <code>%s</code>. Reported for awareness; they do not affect the verdict in diff mode. Run a full scan on your default branch to gate on these.</p>\n' \
+    "$DIFF_N" "$(printf '%s' "$DIFF_REF" | sed 's/&/\&amp;/g;s/</\&lt;/g')"
+  printf '<table><thead><tr><th>Severity</th><th>Tool</th><th>Rule</th><th>Location</th><th>Detail</th></tr></thead><tbody>\n'
+  jq -rs '.[] |
+    "<tr><td><span class=\"pill s-\(.severity)\">\(.severity)</span></td><td>\(.tool|@html)</td>" +
+    "<td><code>\(.rule|@html)</code></td>" +
+    "<td class=\"loc\">" + (if .file=="" then "—" else "<code>\(.file|@html)</code>" end) + "</td>" +
+    "<td>\(.title|@html)</td></tr>"' "$OUTDIR/.outscope.jsonl"
+  printf '</tbody></table>\n'
+fi
+
 # ── accepted (baseline) — visible, but excluded from the gate ──
 if [ "$BASE_N" -gt 0 ]; then
   printf '<h2>Accepted findings</h2>\n'
@@ -1226,6 +1336,7 @@ if [ "$ERRORS" -gt 0 ]; then
   jq -rs '.[]|select(.status=="error")|"      · \(.pass): \(.detail)"' "$STATUS"
 fi
 [ "$BASE_N" -gt 0 ] && printf '  %s+ %s accepted via baseline (excluded from the gate)%s\n' "$C_D" "$BASE_N" "$C_0"
+[ "$DIFF_N" -gt 0 ] && printf '  %s+ %s pre-existing outside the diff (reported, not gated)%s\n' "$C_D" "$DIFF_N" "$C_0"
 say "  report: $C_BOLD$REPORT$C_0"
 say "  html:   $C_BOLD$HTML$C_0"
 [ "$DO_PDF" = 1 ] && [ -s "$PDF" ] && say "  pdf:    $C_BOLD$PDF$C_0"
