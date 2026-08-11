@@ -1,6 +1,12 @@
 # .github/workflows/vibecheck.yml — copy into your repo.
-# Hardened option: pin actions to a commit SHA (not @vN); version tags shown
-# here for readability.
+#
+# Version tags are used below for readability. Pin every action to a commit SHA
+# before you rely on this: VibeCheck itself reports mutable action tags as a
+# MEDIUM finding, and scanning this file will flag the `@vN` refs here. See
+# this repo's own .github/workflows/vibecheck.yml for the pinned form.
+#
+# NOTE: `./TestAndVibes/vibecheck.sh` below assumes VibeCheck is vendored into a
+# subdirectory of your repo. Adjust the path if it lives at the root.
 name: VibeCheck Security
 on: [push, pull_request]
 
@@ -17,7 +23,7 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pipx install semgrep
-      - uses: aquasecurity/setup-trivy@v0.2.3    # trivy on PATH — no curl|sh
+      - uses: aquasecurity/setup-trivy@v0.3.1    # trivy on PATH — no curl|sh
       - name: Install jq (required by VibeCheck)
         run: sudo apt-get update -qq && sudo apt-get install -y -qq jq
       - name: Install gitleaks (pinned release, download-to-file)
