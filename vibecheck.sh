@@ -967,8 +967,12 @@ ERRORS=$(jq -s '[.[]|select(.status=="error")]|length' "$STATUS")
 CRIT=$(sev_count critical); HIGH=$(sev_count high); MED=$(sev_count medium); LOW=$(sev_count low)
 TOTAL=$((CRIT+HIGH+MED+LOW))
 
-jq -s '{active: ., accepted: $acc[0]}' --slurpfile acc <(jq -s '.' "$ACCEPTED") "$ACTIVE" \
-  > "$OUTDIR/findings.json"
+# out_of_scope is included so the machine-readable output is complete: the raw
+# JSONL files are dot-prefixed internals and CI artifact uploads skip them.
+jq -s '{active: ., accepted: $acc[0], out_of_scope: $oos[0]}' \
+  --slurpfile acc <(jq -s '.' "$ACCEPTED") \
+  --slurpfile oos <(jq -s '.' "$OUTDIR/.outscope.jsonl" 2>/dev/null || echo '[]') \
+  "$ACTIVE" > "$OUTDIR/findings.json"
 
 {
   echo "# VibeCheck security report"
