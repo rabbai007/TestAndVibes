@@ -8,7 +8,7 @@ vibecheck:
     TRIVY_VERSION: "0.69.3"
     GITLEAKS_VERSION: "8.21.2"
   before_script:
-    - apt-get update -qq && apt-get install -y -qq curl git python3-pip openssl ca-certificates tar
+    - apt-get update -qq && apt-get install -y -qq curl git python3-pip openssl ca-certificates tar jq
     - pip install --quiet semgrep
     # download-to-file + verify-by-pinned-version (no piping a remote script to a shell)
     - curl -sSfL -o /tmp/trivy.tar.gz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
@@ -16,10 +16,15 @@ vibecheck:
     - curl -sSfL -o /tmp/gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
     - tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
   script:
+    # Exit codes: 0 clean · 1 findings over threshold · 2 usage error
+    #             3 a pass could not complete (fail-closed — an area was NOT scanned)
     - ./TestAndVibes/vibecheck.sh --fail-on high
   artifacts:
     when: always
     paths: [vibecheck-report/]
+    reports:
+      # GitLab Ultimate ingests SARIF as a SAST report; harmless on other tiers.
+      sast: vibecheck-report/vibecheck.sarif
   rules:
     - if: $CI_MERGE_REQUEST_IID
     - if: $CI_COMMIT_BRANCH
