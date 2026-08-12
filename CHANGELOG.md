@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.3.1] — 2026-08-11
+
+### Fixed
+
+- **A baseline entry could silently suppress new occurrences.** Identity is
+  `tool|rule|file|title`, so when a scanner emits an identical message for every
+  hit of a rule in a file — semgrep does this routinely — all hits collapse into
+  one entry. Accepting it then also accepted any *future* hit of that rule in
+  that file, with no signal. Entries now record how many findings they covered
+  when accepted (`occurrences`), and VibeCheck warns, naming the new locations,
+  when that count grows. Found while baselining this repository's own findings:
+  five findings collapsed into a single entry.
+
+### Added
+
+- `.vibecheck-baseline.json` — this repository accepts the mutable action tags in
+  `ci/github-actions.yml`, which is a copy-paste template that deliberately uses
+  readable version tags. The reason is recorded in the entry; the live workflow
+  is SHA-pinned and carries none of these findings.
+
 ## [0.3.0] — 2026-08-11
 
 Adoption release. 0.2.0 made the tool trustworthy; this makes it usable on a

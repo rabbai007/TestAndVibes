@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "generated": "2026-08-11",
+  "note": "VibeCheck accepted findings. Entries suppress a finding from the exit-code gate; they are still listed in the report. Delete an entry to re-gate it.",
+  "entries": [
+    {
+      "fingerprint": "1a7b5fcda18b",
+      "tool": "semgrep",
+      "rule": "yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag",
+      "file": "ci/github-actions.yml",
+      "title": "GitHub Actions step uses a mutable tag or branch reference. Tags and branch names can be silently repointed by the action owner, enabling supply-chain attacks — as seen in the trivy-action and kics-github-action compromises. Pin the reference to a full 40-character commit SHA instead, e.g. `uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608`.",
+      "occurrences": 5,
+      "added": "2026-08-11",
+      "reason": "Accepted: ci/github-actions.yml is a copy-paste TEMPLATE, not a live workflow. It uses readable version tags (@v4) so the snippet is legible to someone reading the docs, and its header instructs the reader to pin to commit SHAs before relying on it. This repository's own live workflow, .github/workflows/vibecheck.yml, is fully SHA-pinned and carries none of these findings. Scope note: this entry covers ALL occurrences of this rule in this file (5 when accepted), because the scanner emits an identical message for each. Re-review if the template stops being documentation-only."
+    }
+  ]
+}
