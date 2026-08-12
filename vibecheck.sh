@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.3.0"
+VERSION="0.3.1"
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
 
 # ── defaults (overridable by vibecheck.yml, then CLI flags) ──
@@ -870,8 +870,8 @@ if [ "$WRITE_BASELINE" = 1 ]; then
     { version: 1,
       generated: $today,
       note: "VibeCheck accepted findings. Entries suppress a finding from the exit-code gate; they are still listed in the report. Delete an entry to re-gate it.",
-      entries: ( map({ fingerprint, tool, rule, file, title })
-                 | unique_by(.fingerprint)
+      entries: ( group_by(.fingerprint)
+                 | map( (.[0] | {fingerprint, tool, rule, file, title}) + {occurrences: length} )
                  | map( . as $n
                         | ($bykey[$n.fingerprint] // null) as $o
                         | $n + { added: ($o.added // $today),
@@ -908,6 +908,22 @@ if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ] && [ -f "$BASELINE" ]; then
     [ -n "$d" ] && [ "$d" -gt "$BASELINE_STALE_DAYS" ] && BASE_STALE=$((BASE_STALE+1))
   done < <(jq -r '.entries[]? | [.fingerprint, (.added//"")] | @tsv' "$BASELINE" 2>/dev/null)
   [ "$BASE_STALE" -gt 0 ] && warn "$BASE_STALE baseline entr(ies) older than $BASELINE_STALE_DAYS days — re-review whether they are still acceptable"
+  # One fingerprint can cover several occurrences: many scanners emit an
+  # identical message for every hit of a rule in a file, and the line number is
+  # deliberately not part of the identity. Without this check, a NEW occurrence
+  # of an already-accepted rule in an already-accepted file would be suppressed
+  # silently. Compare against the count recorded when the entry was accepted.
+  BASE_GREW=0
+  while IFS=$'\t' read -r fpr was; do
+    [ -z "${fpr:-}" ] && continue
+    [ -z "${was:-}" ] || [ "$was" = "null" ] && continue   # pre-0.3.1 entry, no count recorded
+    now=$(jq -s --arg f "$fpr" '[.[]|select(.fingerprint==$f)]|length' "$ACCEPTED")
+    if [ "$now" -gt "$was" ]; then
+      BASE_GREW=$((BASE_GREW+1))
+      warn "baseline entry $fpr now suppresses $now finding(s), was $was when accepted — a new occurrence is being hidden"
+      jq -r --arg f "$fpr" 'select(.fingerprint==$f) | "      · \(.file):\(.line)"' "$ACCEPTED"
+    fi
+  done < <(jq -r '.entries[]? | [.fingerprint, ((.occurrences // "null")|tostring)] | @tsv' "$BASELINE" 2>/dev/null)
   # An unused entry usually means the finding was fixed: worth pruning.
   bl_total=$(jq '.entries|length' "$BASELINE")
   unused=$((bl_total - BASE_N))

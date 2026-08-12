@@ -124,6 +124,25 @@ not hidden. Two things the baseline deliberately cannot do: suppress an
 survive a change to the finding itself. Identity excludes line numbers, so
 unrelated edits above a finding won't resurrect it.
 
+**One entry can cover several occurrences.** Identity is
+`tool | rule | file | title` — so when a scanner emits the *same message* for
+every hit of a rule in a file (semgrep does this routinely), all of those hits
+share one fingerprint and one entry accepts them together. That is usually what
+you want, but it means a **new** occurrence of an already-accepted rule in an
+already-accepted file would otherwise be suppressed silently.
+
+To close that, each entry records how many findings it covered when accepted,
+and VibeCheck warns when that count grows:
+
+```
+! baseline entry 1a7b5fcda18b now suppresses 6 finding(s), was 5 when accepted
+      · ci/github-actions.yml:55
+```
+
+Treat that as a prompt to look: either the new occurrence is covered by the same
+decision (re-run `--write-baseline` to update the count) or it isn't (fix it, or
+split the entry by making the finding distinct).
+
 ### Gating pull requests on what they introduce
 
 `--diff` scopes the gate to files the change touched, so a PR fails for what it
