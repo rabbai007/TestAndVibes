@@ -1,5 +1,7 @@
 # VibeCheck 🔍
 
+[![VibeCheck Security](https://github.com/rabbai007/TestAndVibes/actions/workflows/vibecheck.yml/badge.svg?branch=main)](https://github.com/rabbai007/TestAndVibes/actions/workflows/vibecheck.yml)
+
 **Portable, non-destructive security audit for web apps — one command, any stack.**
 
 VibeCheck wraps the best open-source security scanners behind a single script,
