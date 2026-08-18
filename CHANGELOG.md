@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.5.2] — 2026-08-18
+
+### Fixed
+
+- **The HTML report was missing three sections that `report.md` had:** the
+  adversarial review findings (0.5.0), the tooling manifest and the explicit
+  "not examined" list (0.4.0). This mattered more than a formatting gap — the
+  recommended workflow is `--review --pdf --open`, so the HTML report is the
+  artifact a human actually reads, and review findings were invisible in exactly
+  the place they were meant to land. Found by diffing the section lists of the two
+  reports rather than assuming they matched.
+- When `--review` is **not** run, the HTML report now states that those classes
+  went unexamined, instead of leaving a reader to infer clean from silence.
+
+### Changed
+
+- The README now recommends running the reasoning pass **locally before a
+  release** (`./vibecheck.sh --review --pdf --open`) rather than on a nightly
+  timer. It needs no stored credential if you have the `claude` CLI, produces a
+  report you sit down and read, and suits a pass whose output is probabilistic and
+  whose runtime is measured in minutes. The nightly workflow is documented as the
+  optional alternative for teams wanting cadence and an audit trail.
+
 ## [0.5.1] — 2026-08-18
 
 ### Fixed

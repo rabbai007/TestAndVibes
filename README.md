@@ -171,20 +171,42 @@ fingerprint — measured at 3 of 4 stable across independent runs, not all 4, so
 expect some baseline churn on this pass. And it costs money and minutes per run;
 it suits a nightly or pre-release job better than every push.
 
-### Running it in CI
+### When to run it — locally, before you release
 
-Keep the two halves on different cadences — they have different costs and
-different failure modes:
+**Recommended: run the review by hand before tagging a release**, not on a timer.
+
+```bash
+./vibecheck.sh --review --pdf --open
+```
+
+That gives you the four pattern passes, the reasoning pass, and a formatted report
+open in your browser — a deliberate pre-release read rather than a nightly digest
+nobody opens.
+
+Locally you need **no credential of your own to manage**: if you already have the
+`claude` CLI authenticated, `--review` uses it. Nothing to store, nothing to leak,
+no runner minutes, and no surprise bill.
+
+This suits the pass's character. It costs money and minutes, and its output is
+probabilistic — findings you want to *read and think about*, not skim in a digest.
+Ten minutes before a release beats a nightly you've learned to ignore.
+
+**The nightly workflow is optional**, for teams who want the cadence and an audit
+trail:
 
 | Workflow | When | What | Gates? |
 |---|---|---|---|
 | [`ci/github-actions.yml`](ci/github-actions.yml) | every PR + push | four pattern passes | **yes** |
-| [`ci/github-actions-review.yml`](ci/github-actions-review.yml) | nightly | the reasoning pass | no — report-only |
+| [`ci/github-actions-review.yml`](ci/github-actions-review.yml) | nightly *(opt-in)* | the reasoning pass | no — report-only |
 
-Set an `ANTHROPIC_API_KEY` secret **before** enabling the nightly schedule.
-VibeCheck fails closed, so `--review` without a provider exits 3 — turning on the
-cron first gives you a red build that means "not configured" rather than "found
-something", and a scheduled job that cries wolf gets muted.
+It needs an `ANTHROPIC_API_KEY` secret, because a CI runner has no credentials of
+its own and nobody at the keyboard to log in. Add the secret **before** enabling
+the schedule: VibeCheck fails closed, so `--review` without a provider exits 3, and
+turning on the cron first gives you a red build that means "not configured" rather
+than "found something". A scheduled job that cries wolf gets muted.
+
+If you'd rather not store a key at all, the alternatives are a self-hosted model
+via `--review-cmd`, or just staying with the local pre-release run above.
 
 ## What this scan cannot see
 
