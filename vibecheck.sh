@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -38,6 +38,13 @@ SELF_INSTALL=0
 SEMGREP_CONFIG="auto"
 SECRETS_STRICT=0        # 1 = unverified secrets count as high, not medium
 DO_SECRETS=1; DO_SAST=1; DO_DEPS=1; DO_IAC=1
+DO_REVIEW=0             # 1 = run the adversarial review pass (needs a model provider)
+REVIEW_CMD="${VIBECHECK_REVIEW_CMD:-}"   # override: reads a prompt on stdin, writes JSON to stdout
+REVIEW_MODEL="claude-opus-5"
+REVIEW_EFFORT="high"
+REVIEW_BUDGET=200000    # max bytes of source sent for review
+REVIEW_SKEPTICS=2       # independent refutation attempts per finding
+FAIL_ON_REVIEW=0        # 1 = review findings count toward the exit code
 DO_PDF=0                # 1 = also render report.pdf (needs Chrome/wkhtmltopdf/weasyprint)
 DO_OPEN=0               # 1 = open the HTML report in the default browser
 DIFF_REF=""             # gate only on findings in files changed vs this git ref
@@ -83,6 +90,17 @@ OPTIONS
   --skip-sast          Skip the SAST pass
   --skip-deps          Skip the dependency pass
   --skip-iac           Skip the IaC pass
+  --review             Adversarial review pass: an LLM reasons about trust
+                       boundaries, lifecycle and logic — the classes no scanner
+                       can reach. REPORT-ONLY by default. Needs ANTHROPIC_API_KEY,
+                       the `claude` CLI, or --review-cmd.
+  --review-model M     Model for the review (default: claude-opus-5)
+  --review-effort E    low|medium|high|xhigh|max (default: high)
+  --review-budget N    Max bytes of source to send (default: 200000)
+  --review-skeptics N  Independent refutation attempts per finding (default: 2)
+  --review-cmd CMD     Provider override: reads a prompt on stdin, writes the
+                       model's text to stdout
+  --fail-on-review     Let surviving review findings affect the exit code
   --pdf                Also render DIR/report.pdf (Chrome, wkhtmltopdf, or weasyprint)
   --open               Open the HTML report in your default browser when done
   --diff REF           PR mode: gate only on findings in files changed vs REF
@@ -236,6 +254,13 @@ while [ $# -gt 0 ]; do
     --skip-sast) DO_SAST=0; shift;;
     --skip-deps) DO_DEPS=0; shift;;
     --skip-iac) DO_IAC=0; shift;;
+    --review) DO_REVIEW=1; shift;;
+    --review-model) REVIEW_MODEL="${2:?}"; shift 2;;
+    --review-effort) REVIEW_EFFORT="${2:?}"; shift 2;;
+    --review-budget) REVIEW_BUDGET="${2:?}"; shift 2;;
+    --review-skeptics) REVIEW_SKEPTICS="${2:?}"; shift 2;;
+    --review-cmd) REVIEW_CMD="${2:?}"; shift 2;;
+    --fail-on-review) FAIL_ON_REVIEW=1; shift;;
     --pdf) DO_PDF=1; shift;;
     --open) DO_OPEN=1; shift;;
     --diff) DIFF_REF="${2:?--diff needs a git ref}"; shift 2;;
@@ -313,8 +338,11 @@ fingerprint() { printf '%s|%s|%s|%s' "$1" "$2" "$3" "$4" | sha12; }
 # `sources` is deliberately OUTSIDE the fingerprint: which scanners happened to
 # corroborate a finding must not change its identity, or installing another tool
 # would invalidate every accepted baseline entry.
+# $9 overrides the computed fingerprint. The review pass needs this: its titles
+# are model prose and get reworded every run, so identity must be anchored to the
+# code instead, or every accepted review finding resurrects on the next scan.
 add_finding() {
-  local fp; fp="$(fingerprint "$1" "$3" "$4" "$6")"
+  local fp; fp="${9:-$(fingerprint "$1" "$3" "$4" "$6")}"
   jq -cn --arg tool "$1" --arg sev "$2" --arg rule "$3" --arg file "$4" \
          --arg line "${5:-0}" --arg title "$6" --arg help "${7:-}" --arg fp "$fp" \
          --arg src "${8:-$1}" \
@@ -448,7 +476,11 @@ det Chart.yaml helm
 
 # find nested markers the 0.1.0 top-level globs missed
 PRUNE=(); for e in "${EXCLUDES[@]}"; do PRUNE+=(-name "$e" -prune -o); done
-findx() { find "$TARGET" "${PRUNE[@]}" -type f "$@" -print 2>/dev/null; }
+# The caller's expression MUST be parenthesised. find's -o binds looser than the
+# implicit -a, so `-type f -name a -o -name b -print` attaches -print to the last
+# term only: with several -o alternatives, every branch but the last silently
+# printed nothing. That quietly broke *.csproj, *.gradle and *.yaml detection.
+findx() { find "$TARGET" "${PRUNE[@]}" -type f \( "$@" \) -print 2>/dev/null; }
 
 [ -n "$(findx -name '*.tf' | head -1)" ]        && { STACK="$STACK terraform"; ok "terraform (*.tf, recursive)"; }
 [ -n "$(findx -name '*.csproj' -o -name '*.fsproj' | head -1)" ] && { STACK="$STACK dotnet"; ok "dotnet (*.csproj)"; }
@@ -1023,6 +1055,221 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# 6. adversarial review (opt-in, report-only by default)
+# ═══════════════════════════════════════════════════════════════════
+# Everything above matches patterns. This pass reasons: it is given the code and
+# asked who controls each input, where the trust boundaries are, and which
+# required control is missing. That is the half a scanner structurally cannot do —
+# the absence of a control has no pattern to match, and a lifecycle bug spanning
+# three files has no single line to flag.
+#
+# REPORT-ONLY unless --fail-on-review. Model output is probabilistic, and a false
+# positive that reddens a build destroys trust in the tool faster than any false
+# negative, so these findings have to earn the gate.
+REVIEW_N=0; REVIEW_REFUTED=0
+if [ "$DO_REVIEW" = 1 ]; then
+  head2 "6. Adversarial review (reasoning)"
+
+  # provider ladder: explicit command wins (any provider, self-hosted included),
+  # then the documented HTTP API, then a local claude CLI.
+  RV_MODE=""
+  if [ -n "$REVIEW_CMD" ]; then RV_MODE="cmd"
+  elif [ -n "${ANTHROPIC_API_KEY:-}" ] && have curl; then RV_MODE="api"
+  elif have claude; then RV_MODE="cli"
+  fi
+
+  rv_ask() {   # prompt on stdin, model text on stdout
+    local prompt; prompt="$(cat)"
+    case "$RV_MODE" in
+      cmd) printf '%s' "$prompt" | sh -c "$REVIEW_CMD" 2>/dev/null;;
+      cli) printf '%s' "$prompt" | claude -p 2>/dev/null;;
+      api)
+        local body resp
+        # jq builds the body so the code under review is escaped correctly.
+        # Opus 5 runs adaptive thinking by default and rejects budget_tokens and
+        # temperature; effort belongs inside output_config. Refusal fallbacks are
+        # opted into because reviewing security code trips classifiers now and then.
+        body="$(jq -n --arg m "$REVIEW_MODEL" --arg e "$REVIEW_EFFORT" --arg p "$prompt" \
+          '{model:$m, max_tokens:16000,
+            thinking:{type:"adaptive"},
+            output_config:{effort:$e},
+            fallbacks:[{model:"claude-opus-4-8"}],
+            messages:[{role:"user", content:$p}]}')"
+        resp="$(curl -sS https://api.anthropic.com/v1/messages \
+          -H "Content-Type: application/json" \
+          -H "x-api-key: $ANTHROPIC_API_KEY" \
+          -H "anthropic-version: 2023-06-01" \
+          -H "anthropic-beta: server-side-fallback-2026-06-01" \
+          --max-time 900 -d "$body" 2>/dev/null)"
+        # A refusal is HTTP 200 with stop_reason "refusal"; check it before reading
+        # content, or an empty answer reads as a clean review.
+        if [ "$(printf '%s' "$resp" | jq -r '.stop_reason // ""' 2>/dev/null)" = "refusal" ]; then
+          printf '%s' "$resp" | jq -r '"REFUSAL: " + (.stop_details.category // "unspecified")' 2>/dev/null
+          return 0
+        fi
+        printf '%s' "$resp" | jq -r '[.content[]? | select(.type=="text") | .text] | join("")' 2>/dev/null
+        ;;
+    esac
+  }
+
+  if [ -z "$RV_MODE" ]; then
+    # --review was requested and could not run. Staying quiet would read as
+    # "reviewed, found nothing".
+    pass_error review "--review requested but no provider available (set ANTHROPIC_API_KEY, install the claude CLI, or pass --review-cmd) - NOT reviewed"
+  else
+    say "  ${C_D}provider: $RV_MODE  model: $REVIEW_MODEL  effort: $REVIEW_EFFORT${C_0}"
+
+    # Context assembly is the hard part: a logic bug spans files, so per-file
+    # review misses exactly what this pass exists to find. Order by how likely a
+    # file is to carry a trust decision, then fill to the byte budget.
+    RV_CTX="$OUTDIR/.review-context.txt"; : > "$RV_CTX"
+    RV_LIST="$OUTDIR/.review-files"; : > "$RV_LIST"
+    rv_srcs() { findx -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.jsx' \
+                      -o -name '*.py' -o -name '*.go' -o -name '*.rb' -o -name '*.php' \
+                      -o -name '*.java' -o -name '*.cs' -o -name '*.rs' -o -name '*.sh'; }
+    { [ -n "$DIFF_REF" ] && [ -f "$OUTDIR/.changed-files" ] && sed "s|^|$TARGET/|" "$OUTDIR/.changed-files"
+      rv_srcs | grep -iE '/(server|app|index|main|api|auth|middleware|route|handler|controller|session|token|permission|tenant)[^/]*$'
+      rv_srcs
+    } 2>/dev/null | awk '!seen[$0]++' > "$RV_LIST.all"
+    bytes=0; nfiles=0
+    while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      sz=$(wc -c < "$f" 2>/dev/null | tr -d ' '); [ -n "$sz" ] || continue
+      [ "$sz" -gt 120000 ] && continue                  # one huge file would eat the budget
+      [ $((bytes + sz)) -gt "$REVIEW_BUDGET" ] && continue
+      bytes=$((bytes + sz)); nfiles=$((nfiles + 1))
+      printf '%s\n' "$(rel "$f")" >> "$RV_LIST"
+      { printf '\n===== FILE: %s =====\n' "$(rel "$f")"; cat "$f"; } >> "$RV_CTX"
+    done < "$RV_LIST.all"
+    say "  ${C_D}context: $nfiles file(s), $bytes bytes (budget $REVIEW_BUDGET)${C_0}"
+
+    if [ "$nfiles" -eq 0 ]; then
+      pass_error review "no reviewable source files found - NOT reviewed"
+    else
+      # The prompt is driven by hardening/CHECKLIST.md: that file already
+      # enumerates what a human reviewer should ask, so reusing it keeps the
+      # automated and manual layers aligned instead of drifting apart.
+      CHECKLIST="$SELF_DIR/hardening/CHECKLIST.md"
+      RV_OUT="$OUTDIR/.review-raw.txt"
+      {
+        cat <<'PROMPT_HEAD'
+You are performing an adversarial security review of a codebase. You are the
+second half of a two-part audit: automated pattern scanners have already run and
+found what they can. Do not repeat their work.
+
+Report ONLY issues that require reasoning across the code - the classes a pattern
+matcher cannot reach:
+  - who controls each input, and where the trust boundary actually sits
+  - authorisation and multi-tenant isolation (can caller A reach tenant B's data?)
+  - object lifecycle and state (per-request where it must be shared, or shared
+    where it must be per-request?)
+  - concurrency, races, check-then-act windows
+  - a required control that is simply ABSENT (no rate limit, no ownership check)
+  - semantics that are each fine but wrong in combination (a cache TTL that
+    outlives a revocation, say)
+
+Do NOT report: missing SRI, dependency CVEs, hardcoded secrets, generic input
+validation, style, or anything a regex would catch. Those are already covered.
+
+Be precise and conservative. A confident wrong finding is worse than a missed one:
+it costs a reviewer more to disprove than it saved. If unsure, mark confidence
+"low" or leave it out.
+
+Use these questions as your checklist:
+PROMPT_HEAD
+        if [ -f "$CHECKLIST" ]; then sed -n '1,200p' "$CHECKLIST"
+        else echo "(project checklist unavailable - use the classes listed above)"; fi
+        cat <<'PROMPT_TAIL'
+
+Respond with ONLY a JSON array, no prose before or after. Each element:
+{
+  "severity": "critical" | "high" | "medium" | "low" | "info",
+  "class": one of: broken-access-control, tenant-isolation, object-lifecycle,
+           race-condition, missing-control, auth-session, trust-boundary,
+           resource-exhaustion, data-exposure, logic-error,
+  "file": "path exactly as shown in its FILE header",
+  "line": <integer, best estimate>,
+  "anchor": "<the single most relevant line of code, verbatim>",
+  "title": "<one sentence>",
+  "why": "<the concrete failure: who does what, and what breaks>",
+  "confidence": "high" | "medium" | "low"
+}
+Return [] if you find nothing of this kind. Here is the code:
+PROMPT_TAIL
+        cat "$RV_CTX"
+      } | rv_ask > "$RV_OUT" 2>/dev/null
+
+      if grep -q '^REFUSAL:' "$RV_OUT" 2>/dev/null; then
+        pass_error review "the model declined the review request ($(head -1 "$RV_OUT")) - NOT reviewed"
+      elif [ ! -s "$RV_OUT" ]; then
+        pass_error review "review provider returned nothing - NOT reviewed"
+      else
+        # Models sometimes fence the JSON despite instructions; extract rather
+        # than fail the pass over formatting.
+        RV_JSON="$OUTDIR/.review.json"
+        jq -R -s 'try (capture("(?<j>\\[[\\s\\S]*\\])").j | fromjson) catch []' "$RV_OUT" > "$RV_JSON" 2>/dev/null || echo '[]' > "$RV_JSON"
+        if ! jq -e 'type=="array"' "$RV_JSON" >/dev/null 2>&1; then
+          pass_error review "could not parse the review response as JSON - NOT reviewed (raw output in $(basename "$RV_OUT"))"
+        else
+          raw_n=$(jq 'length' "$RV_JSON")
+          say "  ${C_D}$raw_n candidate finding(s) before refutation${C_0}"
+
+          # Refutation: make the model argue against its own finding. Independent
+          # skeptics, each asked to REFUTE; a majority refuting drops it. This is
+          # what makes model output safe to put in front of a reviewer.
+          while IFS=$'\x1f' read -r sev cls file line anchor title why conf; do
+            [ -z "${title:-}" ] && continue
+            refuted=0; i=0
+            while [ "$i" -lt "$REVIEW_SKEPTICS" ]; do
+              i=$((i+1))
+              verdict="$( { cat <<PROMPT_R
+You are refuting a claimed security finding. Default to REFUTED unless the claim
+is clearly correct - a wrong finding costs more than a missed one.
+
+Claim: $title
+Class: $cls
+File: $file (around line $line)
+Reasoning given: $why
+
+Relevant code:
+$(awk -v f="$file" '/^===== FILE: /{p=(index($0, "FILE: " f " ")>0)} p' "$RV_CTX" | head -400)
+
+Answer with ONLY one word: REFUTED if the claim is wrong, does not apply, or
+cannot be substantiated from this code; CONFIRMED if it is genuinely exploitable
+or genuinely a defect.
+PROMPT_R
+              } | rv_ask 2>/dev/null | tr '[:lower:]' '[:upper:]' | grep -oE 'REFUTED|CONFIRMED' | head -1 )"
+              [ "$verdict" = "REFUTED" ] && refuted=$((refuted+1))
+            done
+            if [ "$refuted" -gt $((REVIEW_SKEPTICS / 2)) ]; then
+              REVIEW_REFUTED=$((REVIEW_REFUTED+1)); continue
+            fi
+            # Identity anchors to the CODE, not the model's wording: the same bug
+            # reworded next run must keep its fingerprint or the baseline is
+            # useless for this pass.
+            fp="$(fingerprint review "$cls" "$file" "$(printf '%s' "$anchor" | tr -d '[:space:]')")"
+            case "$sev" in critical|high|medium|low) rsev="$sev";; *) rsev=low;; esac
+            add_finding review "$rsev" "review.$cls" "$file" "${line:-0}" \
+              "$title - $why" "" "review" "$fp"
+            REVIEW_N=$((REVIEW_N+1))
+          done < <(jq -r '.[] | [(.severity//"low"), (.class//"logic-error"), (.file//""),
+                                 ((.line//0)|tostring), (.anchor//""), (.title//""),
+                                 (.why//""), (.confidence//"medium")]
+                          | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$RV_JSON" 2>/dev/null)
+
+          [ "$REVIEW_N" -gt 0 ] && warn "review: $REVIEW_N finding(s) survived refutation" \
+                                || ok "review: no findings survived refutation"
+          [ "$REVIEW_REFUTED" -gt 0 ] && say "  ${C_D}$REVIEW_REFUTED candidate(s) refuted and dropped${C_0}"
+          [ "$FAIL_ON_REVIEW" = 1 ] || say "  ${C_D}report-only (pass --fail-on-review to let these affect the exit code)${C_0}"
+          if [ "$REVIEW_N" -gt 0 ]; then set_status review findings "$REVIEW_N surviving, $REVIEW_REFUTED refuted"
+          else set_status review ok "0 findings ($REVIEW_REFUTED refuted)"; fi
+        fi
+      fi
+    fi
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # baseline: split findings into active (gated) and accepted (suppressed)
 # ═══════════════════════════════════════════════════════════════════
 ERRORS=$(jq -s '[.[]|select(.status=="error")]|length' "$STATUS")
@@ -1153,7 +1400,7 @@ fi
 # A3: "no pass examined anything" is not a clean result. Disabling every scanner
 # — by flag or by config — used to yield 0 findings and exit 0, which is
 # indistinguishable from a repo with nothing wrong. An empty scan is unknown.
-EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","iac","dynamic"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
+EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","iac","dynamic","review"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
 if [ "${EXECUTED:-0}" -eq 0 ]; then
   pass_error coverage "no scan pass examined anything (all were skipped, disabled, or failed) — this result is unknown, not clean"
 fi
@@ -1164,8 +1411,21 @@ fi
 # prevent.
 ERRORS=$(jq -s '[.[]|select(.status=="error")]|length' "$STATUS")
 
-CRIT=$(sev_count critical); HIGH=$(sev_count high); MED=$(sev_count medium); LOW=$(sev_count low)
+# Review findings are report-only by default: counted and displayed, but kept out
+# of the numbers the gate reads. Gating on probabilistic output without the
+# operator asking would make one false positive poison trust in every other pass.
+if [ "$FAIL_ON_REVIEW" = 1 ]; then GATED="$ACTIVE"
+else
+  GATED="$OUTDIR/.gated.jsonl"
+  jq -c 'select(.tool != "review")' "$ACTIVE" > "$GATED"
+fi
+# Distinct from sev_count (which the report uses for display): the gate counts
+# only what is allowed to fail the build.
+gate_count() { jq -s --arg s "$1" '[.[]|select(.severity==$s)]|length' "$GATED"; }
+
+CRIT=$(gate_count critical); HIGH=$(gate_count high); MED=$(gate_count medium); LOW=$(gate_count low)
 TOTAL=$((CRIT+HIGH+MED+LOW))
+REVIEW_SHOWN=$(jq -s '[.[]|select(.tool=="review")]|length' "$ACTIVE")
 
 # out_of_scope is included so the machine-readable output is complete: the raw
 # JSONL files are dot-prefixed internals and CI artifact uploads skip them.
@@ -1221,14 +1481,14 @@ jq -s '{active: ., accepted: $acc[0], out_of_scope: $oos[0],
     echo "## Findings"
     echo
     for s in critical high medium low; do
-      n=$(sev_count "$s")
+      n=$(gate_count "$s")
       [ "$n" -eq 0 ] && continue
       echo "### $(printf '%s' "$s" | tr '[:lower:]' '[:upper:]') ($n)"
       echo
       echo "| Tool | Rule | Location | Detail |"
       echo "|---|---|---|---|"
       jq -rs --arg s "$s" '.[] | select(.severity==$s)
-        | "| \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)\(if .line>0 then ":\(.line)" else "" end)`" end) | \(.title|gsub("\\|";"\\\\|")) \(if .help=="" then "" else "([ref](\(.help)))" end) |"' "$ACTIVE"
+        | "| \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)\(if .line>0 then ":\(.line)" else "" end)`" end) | \(.title|gsub("\\|";"\\\\|")) \(if .help=="" then "" else "([ref](\(.help)))" end) |"' "$GATED"
       echo
     done
   fi
@@ -1250,6 +1510,17 @@ jq -s '{active: ., accepted: $acc[0], out_of_scope: $oos[0],
     echo "| Severity | Tool | Rule | Location | Detail |"
     echo "|---|---|---|---|---|"
     jq -rs '.[] | "| \(.severity) | \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)`" end) | \(.title|gsub("\\|";"\\\\|")) |"' "$ACCEPTED"
+    echo
+  fi
+  if [ "${REVIEW_SHOWN:-0}" -gt 0 ]; then
+    echo "## Adversarial review$([ "$FAIL_ON_REVIEW" = 1 ] && echo "" || echo " (report-only)")"
+    echo
+    echo "Reasoning-based findings — the classes pattern scanning cannot reach. Each survived $REVIEW_SKEPTICS independent refutation attempt(s); $REVIEW_REFUTED candidate(s) were refuted and dropped."
+    [ "$FAIL_ON_REVIEW" = 1 ] || echo -e "\nThese do **not** affect the exit code unless \`--fail-on-review\` is passed. Model output is probabilistic — treat each as a lead to verify, not a verdict."
+    echo
+    echo "| Severity | Class | Location | Finding |"
+    echo "|---|---|---|---|"
+    jq -rs '.[] | select(.tool=="review") | "| \(.severity) | `\(.rule|sub("^review.";""))` | \(if .file=="" then "—" else "`\(.file):\(.line)`" end) | \(.title|gsub("\\|";"\\\\|")) |"' "$ACTIVE"
     echo
   fi
   echo "## Tooling"
@@ -1305,7 +1576,7 @@ jq -s --arg ver "$VERSION" --arg uri "$TOOL_URL" '
         )}]
       })
     }]
-  }' "$ACTIVE" > "$SARIF" 2>/dev/null || {
+  }' "$GATED" > "$SARIF" 2>/dev/null || {
     err "failed to generate SARIF"; }
 
 # ── gate (computed before the report so the verdict can be rendered in it) ──
@@ -1476,14 +1747,14 @@ if [ "$TOTAL" -eq 0 ]; then
   printf '<p class="empty">No findings recorded at or above the reporting floor.</p>\n'
 else
   for s in critical high medium low; do
-    n=$(sev_count "$s"); [ "$n" -eq 0 ] && continue
+    n=$(gate_count "$s"); [ "$n" -eq 0 ] && continue
     printf '<h3><span class="pill s-%s">%s %s</span><span style="color:var(--muted);font-weight:400">(%s)</span></h3>\n' \
       "$s" "$(sev_icon "$s")" "$s" "$n"
     printf '<table><thead><tr><th>Tool</th><th>Rule</th><th>Location</th><th>Detail</th></tr></thead><tbody>\n'
     jq -rs --arg s "$s" '.[] | select(.severity==$s) |
       "<tr><td>\(.tool|@html)</td><td><code>\(.rule|@html)</code></td>" +
       "<td class=\"loc\">" + (if .file=="" then "—" else "<code>\(.file|@html)\(if .line>0 then ":\(.line)" else "" end)</code>" end) + "</td>" +
-      "<td>\(.title|@html)" + (if .help=="" then "" else " <a href=\"\(.help|@html)\">ref</a>" end) + "</td></tr>"' "$ACTIVE"
+      "<td>\(.title|@html)" + (if .help=="" then "" else " <a href=\"\(.help|@html)\">ref</a>" end) + "</td></tr>"' "$GATED"
     printf '</tbody></table>\n'
   done
 fi
@@ -1569,6 +1840,9 @@ if [ "$ERRORS" -gt 0 ]; then
 fi
 [ "$BASE_N" -gt 0 ] && printf '  %s+ %s accepted via baseline (excluded from the gate)%s\n' "$C_D" "$BASE_N" "$C_0"
 [ "$DIFF_N" -gt 0 ] && printf '  %s+ %s pre-existing outside the diff (reported, not gated)%s\n' "$C_D" "$DIFF_N" "$C_0"
+if [ "${REVIEW_SHOWN:-0}" -gt 0 ] && [ "$FAIL_ON_REVIEW" = 0 ]; then
+  printf '  %s+ %s adversarial review finding(s) (report-only)%s\n' "$C_D" "$REVIEW_SHOWN" "$C_0"
+fi
 say "  report: $C_BOLD$REPORT$C_0"
 say "  html:   $C_BOLD$HTML$C_0"
 [ "$DO_PDF" = 1 ] && [ -s "$PDF" ] && say "  pdf:    $C_BOLD$PDF$C_0"

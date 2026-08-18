@@ -9,8 +9,9 @@ auto-detects your stack, and produces a consolidated report plus a CI-friendly
 exit code. It's built for the era of AI-assisted ("vibe") coding, where code
 ships fast and security regressions slip in quietly.
 
-It runs four **static** passes on your source, and an optional set of **safe,
-read-only dynamic** checks against a URL you control:
+It runs four **static** passes on your source, an optional set of **safe,
+read-only dynamic** checks against a URL you control, and an optional
+**adversarial review** that reasons about the code:
 
 | Pass | What it checks | Tool(s) |
 |------|----------------|---------|
@@ -19,6 +20,7 @@ read-only dynamic** checks against a URL you control:
 | 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) | trivy + osv-scanner + npm audit + grype |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
+| 🧭 Review *(opt-in)* | Access control, tenant isolation, lifecycle, races, missing controls | an LLM (`--review`) |
 
 > **Not a replacement for a professional penetration test.** This is automated
 > baseline hardening + regression prevention. For production systems handling
@@ -79,6 +81,13 @@ targets). No config required.
 | `--semgrep-config X` | `auto` | Semgrep ruleset; `p/ci` avoids the network |
 | `--secrets-strict` | — | Rate unverified secrets high instead of medium |
 | `--skip-secrets`/`-sast`/`-deps`/`-iac` | — | Explicitly skip a pass (recorded as *skipped*) |
+| `--review` | — | Adversarial reasoning pass (**report-only** by default) |
+| `--fail-on-review` | — | Let surviving review findings affect the exit code |
+| `--review-model` | `claude-opus-5` | Model for the review pass |
+| `--review-effort` | `high` | `low\|medium\|high\|xhigh\|max` |
+| `--review-budget` | `200000` | Max bytes of source sent for review |
+| `--review-skeptics` | `2` | Independent refutation attempts per finding |
+| `--review-cmd CMD` | — | Provider override: prompt on stdin, text on stdout |
 | `--pdf` | — | Also render `report.pdf` (Chrome / wkhtmltopdf / weasyprint) |
 | `--open` | — | Open the HTML report in your browser when done |
 | `--diff REF` | — | PR mode: gate only on findings in files changed vs `REF` (implies `--base`) |
@@ -124,6 +133,43 @@ table, which is what lets a CVE from trivy and a GHSA from npm audit be
 recognised as the same vulnerability rather than counted twice. Which scanners
 corroborated a finding is deliberately *not* part of its fingerprint, so
 installing another tool never invalidates your baseline.
+
+## The adversarial review pass
+
+Everything else in VibeCheck matches patterns. `--review` reasons instead: it is
+given the code and asked who controls each input, where the trust boundary sits,
+and which required control is missing.
+
+```bash
+./vibecheck.sh --review                    # report-only
+./vibecheck.sh --review --fail-on-review   # let it gate
+```
+
+On a three-file fixture — a session helper exposing `orgId`, a route that never
+checks it, and a data layer documented as unscoped — the pattern passes report
+**0 findings, exit 0, clean.** The review pass reports the critical cross-tenant
+refund: any authenticated user can refund another tenant's invoice. No single line
+is wrong; the bug is the *relationship* between three files, which is why no rule
+can express it.
+
+**It is report-only by default, deliberately.** Model output is probabilistic,
+and one false positive that reddens a build costs more trust than a missed
+finding ever does. Findings have to earn the gate.
+
+Every candidate is put to independent **refutation** — skeptics asked to argue
+*against* it, defaulting to refuted. A majority refuting drops it. Findings that
+survive are reported with their reasoning; refuted ones are counted, not shown.
+
+**Providers**, in precedence order: `--review-cmd` (anything — prompt on stdin,
+text on stdout, so self-hosted models work), `ANTHROPIC_API_KEY` (the HTTP API),
+or a local `claude` CLI. If `--review` is requested and none is available, that is
+an **ERROR (exit 3)** — never a quiet "reviewed, found nothing".
+
+**Two honest limits.** Identity is anchored to the code (class + file + the
+referenced line) rather than the model's wording, so a reworded finding keeps its
+fingerprint — measured at 3 of 4 stable across independent runs, not all 4, so
+expect some baseline churn on this pass. And it costs money and minutes per run;
+it suits a nightly or pre-release job better than every push.
 
 ## What this scan cannot see
 
