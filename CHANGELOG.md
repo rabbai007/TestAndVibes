@@ -9,6 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.4.0] — 2026-08-18
+
+Coverage release. 0.3.x could report "0 CVEs" while consulting only one advisory
+database, and reported clean on code an adversarial review found three flaws in.
+
+### Fixed
+
+- **A delimiter bug silently corrupted findings.** Internal scanner output was
+  parsed with `IFS=$'\t'`, and tab is an IFS *whitespace* character — so bash
+  collapses consecutive and leading empty fields and shifts every later value
+  left. A dependency finding with an empty severity score had its id replaced by
+  a file path. All 11 parse loops now use ASCII unit separator (non-whitespace,
+  so empty fields survive), with embedded newlines sanitised explicitly since
+  `@tsv` no longer does it.
+- **npm audit never ran when trivy was installed.** It was a fallback, not a
+  source, so the npm/GitHub advisory database was never consulted on any machine
+  with trivy present.
+- **osv-scanner was advertised but never invoked.** It was dropped in the 0.2.0
+  rewrite while the README kept listing it — the same documented-but-unimplemented
+  class 0.2.0 set out to fix.
+
+### Changed
+
+- **Dependency sources are additive and merged.** trivy, osv-scanner, npm audit
+  and grype all run; results are deduplicated on (vulnerability, package name).
+  OSV's alias table canonicalises CVE↔GHSA so one vulnerability reported by two
+  sources under two identifiers merges instead of double-counting. Package names
+  are compared without the version, because npm audit omits it.
+  - Findings record their corroborating `sources`, deliberately **outside** the
+    fingerprint — installing another scanner must not invalidate a baseline.
+  - Dependency findings now use a stable `deps` tool identity rather than the
+    name of whichever scanner reported them first. **This changes dependency
+    fingerprints once**; re-run `--write-baseline` to refresh accepted entries.
+
+### Added
+
+- **A supplementary semgrep rule pack** ([`rules/`](rules/)) for sinks the public
+  registry does not reach: request data interpolated into a raw node `http`
+  response (registry rules cover framework sinks like express `res.send`, not
+  template literals in `res.end`), unbounded request-body accumulation, and
+  unguarded `JSON.parse` of external input. Each rule was added because a real
+  finding was missed, and each is verified against both a vulnerable and a
+  correctly-written fixture so it stays quiet on the latter.
+- **A tooling manifest** in `report.md` and `findings.json`: which tool, which
+  version, which ruleset. A clean result is not auditable without it.
+- **An explicit statement of what was not examined**, in every report and
+  machine-readable under `coverage.not_detectable`.
+
 ## [0.3.2] — 2026-08-12
 
 **Security fix. Configuration inside the scanned tree could disable the gate.**
