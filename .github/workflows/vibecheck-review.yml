@@ -1,0 +1,113 @@
+# Nightly adversarial review — the reasoning pass.
+#
+# Deliberately SEPARATE from vibecheck.yml. The pattern passes are fast,
+# deterministic and free, so they gate every pull request. This pass calls a model:
+# it costs money, takes minutes, and its output is probabilistic. Running it per
+# push would be expensive and would put non-deterministic results in front of
+# every commit.
+#
+# ┌─────────────────────┬──────────────────────────────────────────────┐
+# │ vibecheck.yml       │ every PR + push to main · patterns · gates    │
+# │ this workflow       │ nightly on main · reasoning · report-only     │
+# └─────────────────────┴──────────────────────────────────────────────┘
+#
+# SETUP — two steps, in this order:
+#   1. Add an ANTHROPIC_API_KEY repository secret
+#        Settings → Secrets and variables → Actions → New repository secret
+#   2. Uncomment the `schedule:` block below
+#
+# The cron is commented out on purpose. VibeCheck fails closed, so --review
+# without a provider exits 3 — enabling the schedule before the secret exists
+# would produce a nightly red build that means "not configured", not "found a
+# problem". A scheduled job that cries wolf gets muted, and a muted security job
+# is worse than no job.
+name: VibeCheck Adversarial Review
+
+on:
+  # schedule:
+  #   - cron: "17 3 * * *"      # 03:17 UTC daily — off-peak, avoids the :00 rush
+  workflow_dispatch:
+    inputs:
+      effort:
+        description: "Reasoning effort (low|medium|high|xhigh|max)"
+        required: false
+        default: "high"
+      skeptics:
+        description: "Independent refutation attempts per finding"
+        required: false
+        default: "2"
+
+permissions:
+  contents: read
+
+concurrency:
+  # One review at a time; a queued nightly behind a manual run wastes tokens.
+  group: vibecheck-review
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45          # reasoning passes are slow; do not hang a runner all day
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+
+      - name: Install jq
+        run: jq --version || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+
+      # Fail early and clearly rather than letting the scan reach pass 6 and
+      # report ERROR — the cause is configuration, not the code under review.
+      - name: Check the provider is configured
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error title=Review provider not configured::ANTHROPIC_API_KEY secret is not set. Add it under Settings → Secrets and variables → Actions, then re-run."
+            exit 1
+          fi
+          echo "provider: ANTHROPIC_API_KEY present"
+
+      # Only the review pass runs here. The four pattern passes already ran on
+      # every push to main, and repeating them would add minutes for no new
+      # information. --skip-* is explicit, so the report records the decision
+      # rather than showing an unexplained gap.
+      #
+      # Report-only: no --fail-on-review. A model finding should open a
+      # conversation, not fail a nightly build on probabilistic output. Read the
+      # artifact and promote anything real into a fix or the baseline.
+      - name: Adversarial review of main
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          EFFORT: ${{ inputs.effort || 'high' }}
+          SKEPTICS: ${{ inputs.skeptics || '2' }}
+        run: |
+          ./vibecheck.sh --review \
+            --review-effort "$EFFORT" \
+            --review-skeptics "$SKEPTICS" \
+            --skip-secrets --skip-sast --skip-deps --skip-iac \
+            --fail-on never
+
+      - name: Summarise into the run page
+        if: always()
+        run: |
+          {
+            echo "## Adversarial review — $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            if [ -f vibecheck-report/findings.json ]; then
+              n=$(jq '[.active[]|select(.tool=="review")]|length' vibecheck-report/findings.json)
+              echo "**$n finding(s) survived refutation.**"
+              echo
+              jq -r '.active[] | select(.tool=="review")
+                     | "- **\(.severity)** `\(.rule|sub("^review.";""))` — \(.file):\(.line)\n  \(.title)"' \
+                 vibecheck-report/findings.json
+            else
+              echo "No report produced — see the step log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        if: always()
+        with:
+          name: vibecheck-review-report
+          path: vibecheck-report/
+          retention-days: 30

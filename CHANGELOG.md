@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.5.1] — 2026-08-18
+
+### Fixed
+
+- **`--install` did not install osv-scanner**, despite the v0.4.0 release notes
+  saying it did. The claim is now true. This is the documented-but-unimplemented
+  class this project keeps having to fix — caught by re-reading a published note
+  against the code.
+
+### Added
+
+- **A nightly review workflow** — `.github/workflows/vibecheck-review.yml` for
+  this repo and [`ci/github-actions-review.yml`](ci/github-actions-review.yml) as
+  a template. The reasoning pass runs on its own cadence: pattern passes are fast,
+  deterministic and free so they gate every pull request, while the review costs
+  money and minutes and produces probabilistic output, so it runs nightly and
+  report-only.
+  - The live workflow ships with its `schedule:` **commented out** on purpose.
+    `--review` fails closed without a provider, so enabling the cron before the
+    `ANTHROPIC_API_KEY` secret exists would produce a nightly red build meaning
+    "not configured" rather than "found something".
+  - A dedicated pre-flight step reports a missing secret as a configuration
+    error, instead of letting the run reach pass 6 and report ERROR for what is
+    not a problem with the code under review.
+  - Findings are written to the run summary and uploaded as an artifact.
+
 ## [0.5.0] — 2026-08-18
 
 The reasoning half. Everything before this release matched patterns; `--review`
