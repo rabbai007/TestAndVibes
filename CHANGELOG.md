@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.5.0] — 2026-08-18
+
+The reasoning half. Everything before this release matched patterns; `--review`
+reasons about the code, which is the only way to reach the classes a scanner
+structurally cannot.
+
+### Added
+
+- **Adversarial review pass (`--review`)** — an LLM is given the code and asked
+  who controls each input, where the trust boundary sits, and which required
+  control is absent. Verified on a three-file fixture where the pattern passes
+  report 0 findings and exit 0: the review pass reports the critical cross-tenant
+  refund, a bug that exists only in the relationship between a session helper, a
+  route, and an unscoped data layer.
+  - **Report-only by default.** Model output is probabilistic; one false positive
+    that reddens a build costs more trust than a missed finding. `--fail-on-review`
+    opts in to gating. Review findings are excluded from the gate counts and from
+    SARIF unless that flag is passed.
+  - **Refutation.** Every candidate faces `--review-skeptics` independent
+    challengers asked to argue *against* it, defaulting to refuted; a majority
+    refuting drops it. Refuted candidates are counted, not reported.
+  - **Code-anchored identity.** Fingerprints derive from class + file + the
+    referenced line, not the model's prose, which is reworded every run.
+    Measured at 3 of 4 stable across independent runs — better than title-based
+    identity, but expect some churn on this pass.
+  - **Prompt driven by `hardening/CHECKLIST.md`** so the automated and manual
+    layers ask the same questions instead of drifting apart.
+  - **Providers:** `--review-cmd` (any provider, prompt on stdin), the Anthropic
+    HTTP API via `ANTHROPIC_API_KEY`, or a local `claude` CLI. Requesting
+    `--review` with no provider available is an **ERROR (exit 3)**.
+  - Context assembly prioritises files the diff touched, then likely
+    trust-bearing entry points, up to `--review-budget` bytes — a logic bug spans
+    files, so per-file review would miss what this pass exists to find.
+
+### Fixed
+
+- **`findx` dropped all but the last match expression.** `find`'s `-o` binds
+  looser than the implicit `-a`, so `-type f -name a -o -name b -print` attached
+  `-print` to the final term only. Every caller with multiple alternatives
+  silently matched just one: `*.csproj` (.NET), `*.gradle` (Gradle), and `*.yaml`
+  (Kubernetes manifests) were never detected. The expression is now parenthesised.
+- **A review-only run reported "no pass examined anything."** The coverage guard
+  added in 0.3.2 did not count `review` as a pass, so a run with the scanners
+  skipped exited 3 despite having reviewed the code.
+
 ## [0.4.0] — 2026-08-18
 
 Coverage release. 0.3.x could report "0 CVEs" while consulting only one advisory
