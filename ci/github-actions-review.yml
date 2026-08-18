@@ -1,0 +1,63 @@
+# .github/workflows/vibecheck-review.yml — copy into your repo.
+#
+# The nightly reasoning pass, kept separate from the per-PR pattern gate.
+# Version tags are used below for readability; pin to commit SHAs before you rely
+# on this (VibeCheck reports mutable action tags as a finding — see this repo's
+# own .github/workflows/vibecheck-review.yml for the pinned form).
+#
+# SETUP, in this order:
+#   1. Add an ANTHROPIC_API_KEY repository secret.
+#   2. Then enable the schedule below.
+#
+# Enabling the cron before the secret exists gives you a nightly red build that
+# means "not configured" rather than "found something" — VibeCheck fails closed,
+# so --review without a provider exits 3. A scheduled job that cries wolf gets
+# muted, and a muted security job is worse than none.
+name: VibeCheck Adversarial Review
+
+on:
+  schedule:
+    - cron: "17 3 * * *"        # 03:17 UTC — off-peak; avoid :00, everyone uses it
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vibecheck-review
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: jq --version || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+
+      - name: Check the provider is configured
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error title=Review provider not configured::Set the ANTHROPIC_API_KEY secret."
+            exit 1
+          fi
+
+      # Only the review pass: the pattern passes already ran on push, and
+      # repeating them costs minutes for no new information. Report-only — a model
+      # finding should start a conversation, not fail a nightly build.
+      # Adjust the path if VibeCheck is vendored into a subdirectory.
+      - name: Adversarial review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          ./vibecheck.sh --review --review-effort high --review-skeptics 2 \
+            --skip-secrets --skip-sast --skip-deps --skip-iac --fail-on never
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vibecheck-review-report
+          path: vibecheck-report/
+          retention-days: 30

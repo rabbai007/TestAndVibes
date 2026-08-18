@@ -171,6 +171,21 @@ fingerprint — measured at 3 of 4 stable across independent runs, not all 4, so
 expect some baseline churn on this pass. And it costs money and minutes per run;
 it suits a nightly or pre-release job better than every push.
 
+### Running it in CI
+
+Keep the two halves on different cadences — they have different costs and
+different failure modes:
+
+| Workflow | When | What | Gates? |
+|---|---|---|---|
+| [`ci/github-actions.yml`](ci/github-actions.yml) | every PR + push | four pattern passes | **yes** |
+| [`ci/github-actions-review.yml`](ci/github-actions-review.yml) | nightly | the reasoning pass | no — report-only |
+
+Set an `ANTHROPIC_API_KEY` secret **before** enabling the nightly schedule.
+VibeCheck fails closed, so `--review` without a provider exits 3 — turning on the
+cron first gives you a red build that means "not configured" rather than "found
+something", and a scheduled job that cries wolf gets muted.
+
 ## What this scan cannot see
 
 Every report ends with the classes of flaw pattern scanning cannot detect at all —

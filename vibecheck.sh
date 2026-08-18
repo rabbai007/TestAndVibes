@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.5.0"
+VERSION="0.5.1"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -286,7 +286,7 @@ esac
 if [ "$SELF_INSTALL" = 1 ]; then
   head2 "Installing scanners"
   if have brew; then
-    brew install jq trivy grype trufflehog gitleaks 2>/dev/null || true
+    brew install jq trivy grype trufflehog gitleaks osv-scanner 2>/dev/null || true
   else
     say "  Homebrew not found. Install manually:"
     say "    jq        : https://jqlang.github.io/jq/download/   (REQUIRED)"
@@ -294,6 +294,7 @@ if [ "$SELF_INSTALL" = 1 ]; then
     say "    grype     : https://github.com/anchore/grype#installation"
     say "    trufflehog: https://github.com/trufflesecurity/trufflehog#installation"
     say "    gitleaks  : https://github.com/gitleaks/gitleaks#installing"
+    say "    osv-scanner: https://google.github.io/osv-scanner/installation/"
   fi
   if have pipx; then pipx install semgrep 2>/dev/null || true
   elif have pip3; then pip3 install --user semgrep 2>/dev/null || true
