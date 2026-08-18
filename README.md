@@ -81,7 +81,9 @@ targets). No config required.
 | `--skip-secrets`/`-sast`/`-deps`/`-iac` | — | Explicitly skip a pass (recorded as *skipped*) |
 | `--pdf` | — | Also render `report.pdf` (Chrome / wkhtmltopdf / weasyprint) |
 | `--open` | — | Open the HTML report in your browser when done |
-| `--diff REF` | — | PR mode: gate only on findings in files changed vs `REF` |
+| `--diff REF` | — | PR mode: gate only on findings in files changed vs `REF` (implies `--base`) |
+| `--base REF` | — | Read config/ignore/baseline from `REF`, not the working tree |
+| `--trust-repo-config` | — | Honour in-tree config even with `--base` (**unsafe** on untrusted code) |
 | `--baseline PATH` | `./.vibecheck-baseline.json` | Accepted-findings file |
 | `--write-baseline` | — | Accept every current finding, then exit |
 | `--no-baseline` | — | Ignore the baseline and gate on everything |
@@ -144,6 +146,29 @@ and VibeCheck warns when that count grows:
 Treat that as a prompt to look: either the new occurrence is covered by the same
 decision (re-run `--write-baseline` to update the count) or it isn't (fix it, or
 split the entry by making the finding distinct).
+
+### Configuration is not trusted from the code being scanned
+
+`vibecheck.yml`, `.vibecheckignore` and `.vibecheck-baseline.json` decide what
+gets scanned and what fails the build. On a pull request those files are written
+by the change under test — so read from the working tree, they let a change
+suppress its own findings.
+
+`--base REF` (implied by `--diff`) reads all three from a trusted ref instead:
+
+```bash
+./vibecheck.sh --diff origin/main --fail-on high   # config comes from origin/main
+```
+
+Two further guards apply even without a base ref:
+
+- A config file cannot set **`fail_on: never`** unless `--fail-on never` is also
+  passed on the command line. A total gate bypass has to be typed by a human.
+- If **no pass examined anything**, that is an ERROR, not a clean exit 0 —
+  however the scan came to be empty.
+
+`--trust-repo-config` restores the old behaviour. Only use it on code you
+control.
 
 ### Gating pull requests on what they introduce
 

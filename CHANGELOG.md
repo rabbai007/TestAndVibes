@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.3.2] — 2026-08-12
+
+**Security fix. Configuration inside the scanned tree could disable the gate.**
+
+### Fixed
+
+- **In-tree configuration was trusted.** `vibecheck.yml`, `.vibecheckignore` and
+  `.vibecheck-baseline.json` were read from the directory being scanned. In CI
+  that directory *is* the pull request, so a change could suppress its own
+  findings. All four of these turned a repo containing command injection and
+  `eval()` on user input into a passing build:
+  - `vibecheck.yml` with `fail_on: never`
+  - `vibecheck.yml` disabling every scanner — reported as *skipped*, so
+    fail-closed never fired and the run exited 0 with zero findings
+  - `.vibecheckignore` naming the vulnerable file
+  - a self-authored `.vibecheck-baseline.json` accepting its own findings
+
+  Fixes, in layers:
+  - **`--base REF`** (implied by `--diff`) reads all three files from a trusted
+    git ref instead of the working tree, so a change cannot rewrite its own gate.
+    `--trust-repo-config` restores the old behaviour where that is wanted.
+  - A config file may no longer set **`fail_on: never`** unless the operator also
+    passes `--fail-on never` on the command line. A total gate bypass now has to
+    be typed by a human.
+  - **If no pass examined anything**, the result is an ERROR rather than a clean
+    exit 0. An empty scan is unknown, not clean — however it came to be empty.
+  - The report no longer **misattributes** a config-driven skip to a `--skip-*`
+    flag the operator never passed; it names the file that disabled the pass.
+
+### Notes
+
+- Found by comparing VibeCheck against an adversarial LLM review on the same
+  codebase. The scanner and the review overlapped on nothing: the review found
+  logic and lifecycle flaws no pattern engine can see, and this trust-boundary
+  bug in VibeCheck itself is the same class — reading a config file is not a
+  suspicious pattern, it only becomes a vulnerability once you ask who controls
+  the file.
+
 ## [0.3.1] — 2026-08-11
 
 ### Fixed
