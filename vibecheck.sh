@@ -21,7 +21,9 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.3.2"
+VERSION="0.4.0"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
 
 # ── defaults (overridable by vibecheck.yml, then CLI flags) ──
@@ -307,13 +309,18 @@ sha12() {
 fingerprint() { printf '%s|%s|%s|%s' "$1" "$2" "$3" "$4" | sha12; }
 
 # ── findings + status stores (single source of truth for every output) ──
-# add_finding  tool severity rule file line title [helpUri]
+# add_finding  tool severity rule file line title [helpUri] [sources]
+# `sources` is deliberately OUTSIDE the fingerprint: which scanners happened to
+# corroborate a finding must not change its identity, or installing another tool
+# would invalidate every accepted baseline entry.
 add_finding() {
   local fp; fp="$(fingerprint "$1" "$3" "$4" "$6")"
   jq -cn --arg tool "$1" --arg sev "$2" --arg rule "$3" --arg file "$4" \
          --arg line "${5:-0}" --arg title "$6" --arg help "${7:-}" --arg fp "$fp" \
+         --arg src "${8:-$1}" \
     '{tool:$tool, severity:$sev, rule:$rule, file:$file,
-      line:(($line|tonumber?)//0), title:$title, help:$help, fingerprint:$fp}' >> "$FINDINGS"
+      line:(($line|tonumber?)//0), title:$title, help:$help,
+      sources:($src|split(",")), fingerprint:$fp}' >> "$FINDINGS"
 }
 # set_status  pass  ok|findings|skipped|error  detail
 set_status() {
@@ -382,6 +389,24 @@ TH_EXCLUDE="$OUTDIR/.th-exclude"
 : > "$TH_EXCLUDE"
 for e in "${EXCLUDES[@]}"; do printf '%s\n' "$e" >> "$TH_EXCLUDE"; done
 
+# ── B4: tooling manifest ──
+# A clean result is only auditable if you know what produced it. Which scanner
+# ran, at which version, with which ruleset — a registry ruleset change or a
+# missing tool silently alters what "clean" means.
+TOOLING="$OUTDIR/.tooling.jsonl"; : > "$TOOLING"
+tool_ver() { # display-name  pass  version-command...
+  local name="$1" pass="$2"; shift 2
+  local v="not installed"
+  # scan ALL output for the first version-looking token: tools differ wildly
+  # (grype prints a multi-line block whose first line has no digits at all)
+  if have "$1"; then
+    v="$("$@" 2>/dev/null | tr -d '\r' | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)*' | head -1)"
+    [ -n "$v" ] || v="present (version unknown)"
+  fi
+  jq -cn --arg n "$name" --arg p "$pass" --arg v "$v" \
+    '{tool:$n, pass:$p, version:$v, installed:($v != "not installed")}' >> "$TOOLING"
+}
+
 STAMP="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo now)"
 say "${C_BOLD}VibeCheck v$VERSION${C_0}  —  $TARGET"
 [ -n "$BASE_SRC" ] && say "  ${C_D}config/ignore/baseline read from: $BASE_SRC (working-tree copies not trusted)${C_0}"
@@ -391,6 +416,19 @@ fi
 [ -n "$TRUSTED_NOTE" ] && pass_error config "$TRUSTED_NOTE"
 [ -n "$CONFIG_USED" ] && say "  ${C_D}config: $CONFIG_USED${C_0}"
 [ -n "$IGNORE_FILE" ] && say "  ${C_D}ignore: $IGNORE_LABEL${C_0}"
+
+# record the toolchain actually available for this run
+tool_ver trufflehog secrets trufflehog --version
+tool_ver gitleaks   secrets gitleaks version
+tool_ver semgrep    sast    semgrep --version
+tool_ver trivy      deps,iac trivy --version
+tool_ver osv-scanner deps   osv-scanner --version
+tool_ver grype      deps    grype version
+tool_ver npm        deps    npm --version
+tool_ver jq         core    jq --version
+jq -cn --arg r "$SEMGREP_CONFIG" '{tool:"semgrep-ruleset", pass:"sast", version:$r, installed:true}' >> "$TOOLING"
+jq -cn --arg e "$([ -f "$SELF_DIR/rules/vibecheck-extra.yml" ] && echo present || echo missing)" \
+  '{tool:"vibecheck-extra-rules", pass:"sast", version:$e, installed:($e=="present")}' >> "$TOOLING"
 
 # ── stack detection ──
 head2 "Stack detection"
@@ -446,7 +484,7 @@ elif have trufflehog; then
     pass_error secrets "trufflehog produced unparseable output — see $th_json"
   else
     nv=0; nu=0
-    while IFS=$'\t' read -r verified detector file lineno raw; do
+    while IFS=$'\x1f' read -r verified detector file lineno raw; do
       [ -z "${detector:-}" ] && continue
       f="$(rel "${file:-}")"
       if [ "$verified" = "true" ]; then
@@ -461,7 +499,7 @@ elif have trufflehog; then
                      | [ (.Verified|tostring), .DetectorName,
                          (.SourceMetadata.Data.Filesystem.file // .SourceMetadata.Data.Git.file // ""),
                          ((.SourceMetadata.Data.Filesystem.line // .SourceMetadata.Data.Git.line // 0)|tostring)
-                       ] | @tsv' "$th_json" 2>/dev/null | sort -u)
+                       ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$th_json" 2>/dev/null | sort -u)
 
     [ "$nv" -gt 0 ] && bad "trufflehog: $nv VERIFIED secret(s) — rotate these now" || ok "trufflehog: 0 verified secrets"
     [ "$nu" -gt 0 ] && warn "trufflehog: $nu unverified candidate(s) ($UNSEV) — triage" || ok "trufflehog: 0 unverified candidates"
@@ -509,7 +547,7 @@ elif have gitleaks; then
     done
     if [ "$gl_fail" != 99 ]; then
       n=0
-      while IFS=$'\t' read -r ruleid file lineno desc; do
+      while IFS=$'\x1f' read -r ruleid file lineno desc; do
         [ -z "${ruleid:-}" ] && continue
         n=$((n+1)); add_finding gitleaks high "gitleaks.$ruleid" "$(rel "$file")" "$lineno" "${desc:-Secret detected}" ""
       # `gitleaks git` reports repo-relative paths while `gitleaks dir` reports
@@ -517,7 +555,7 @@ elif have gitleaks; then
       # twice — once from history, once from the working tree.
       done < <(jq -r -s --arg t "$TARGET/" 'add // [] | .[]?
                   | [(.RuleID//"unknown"), ((.File//"")|ltrimstr($t)), ((.StartLine//0)|tostring),
-                     ((.Description//"")|gsub("[\n\t]";" "))] | @tsv' \
+                     ((.Description//"")|gsub("[\n\t]";" "))] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' \
                   $gl_files 2>/dev/null | sort -u)
       [ "$n" -gt 0 ] && { bad "gitleaks: $n potential secret(s)"; set_status secrets findings "$n"; } \
                      || { ok "gitleaks: no secrets"; set_status secrets ok "0 secrets"; }
@@ -536,6 +574,13 @@ if [ "$DO_SAST" = 0 ]; then
 elif have semgrep; then
   sg="$OUTDIR/semgrep.json"; rm -f "$sg"
   sg_args=(scan "--config=$SEMGREP_CONFIG" --json "--output=$sg" --quiet --disable-version-check)
+  # Supplementary pack: sinks the public registry does not reach. Registry rules
+  # cover framework sinks (express res.send) but not raw node http with a
+  # template literal, which is what hand-rolled servers actually use. Added
+  # because an adversarial review found exactly those while `auto` said clean.
+  EXTRA_RULES="$SELF_DIR/rules/vibecheck-extra.yml"
+  if [ -f "$EXTRA_RULES" ]; then sg_args+=("--config=$EXTRA_RULES"); RULESET_EXTRA=1; else
+    warn "supplementary rule pack not found at $EXTRA_RULES — registry rules only"; fi
   for e in "${EXCLUDES[@]}"; do sg_args+=("--exclude=$e"); done
   semgrep "${sg_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.semgrep.err"; sg_rc=$?
   # semgrep: 0 = no findings, 1 = findings, >1 = error. A crashed/offline
@@ -546,7 +591,7 @@ elif have semgrep; then
     # semgrep records rule-level errors (e.g. registry unreachable) in .errors
     sg_errs=$(jq '[.errors[]?|select((.level//"")=="error")]|length' "$sg" 2>/dev/null || echo 0)
     e=0; w=0; i=0
-    while IFS=$'\t' read -r sev rule file lineno msg url; do
+    while IFS=$'\x1f' read -r sev rule file lineno msg url; do
       [ -z "${rule:-}" ] && continue
       case "$sev" in
         ERROR)   vs=high;   e=$((e+1));;
@@ -558,7 +603,7 @@ elif have semgrep; then
                                     (.path//""), ((.start.line//0)|tostring),
                                     ((.extra.message//"finding")|gsub("[\n\t]";" ")),
                                     (.extra.metadata.shortlink // (.extra.metadata.references//[])[0] // "")
-                                  ] | @tsv' "$sg" 2>/dev/null)
+                                  ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$sg" 2>/dev/null)
     [ "$e" -gt 0 ] && bad "semgrep: $e error-level finding(s)"    || ok "semgrep: 0 error-level findings"
     [ "$w" -gt 0 ] && warn "semgrep: $w warning-level finding(s)"
     [ "$i" -gt 0 ] && say  "  ${C_D}semgrep: $i info-level finding(s)${C_0}"
@@ -616,14 +661,20 @@ if [ "$DO_DEPS" = 0 ]; then
 elif [ "$DEP_STACK" = 0 ]; then
   skip "dependency scan" "no dependency manifests found"; set_status deps skipped "no manifests"
 else
-  dep_add() { # tool severity id target pkg title url
-    add_finding "$1" "$2" "$3" "$4" 0 "$5" "${6:-}"
-  }
-  scanned=0
-  # "a scanner was present but failed" must not fall through to a weaker tool
-  # and re-report the same problem twice.
-  dep_tool_present=0
-  { have trivy || have grype; } && dep_tool_present=1
+  # Dependency sources are ADDITIVE, not fallbacks. trivy, osv-scanner and npm
+  # audit draw on different advisory databases, so running only the first one
+  # that happens to be installed leaves real CVEs unreported. 0.3.x ran npm audit
+  # only when trivy was absent, which meant the npm/GitHub advisory data was
+  # never consulted on any machine with trivy installed.
+  DEP_TSV="$OUTDIR/.deps.tsv"; : > "$DEP_TSV"
+  ALIAS_MAP="$OUTDIR/.alias-map.tsv"; : > "$ALIAS_MAP"
+  DEP_SRC_OK=""      # sources that completed
+  # rank orders which source's record is kept when several report one vuln;
+  # lower wins. Fixed order, so the surviving record does not depend on timing.
+  dep_row() { printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' "$@" >> "$DEP_TSV"; }
+  cvss_sev() { awk -v x="${1:-0}" 'BEGIN{ if (x>=9.0) print "critical"; else if (x>=7.0) print "high"; else if (x>=4.0) print "medium"; else print "low" }'; }
+
+  # ── source: trivy ──
   if have trivy; then
     tv="$OUTDIR/trivy-deps.json"; rm -f "$tv"
     tv_args=(fs --scanners vuln --severity MEDIUM,HIGH,CRITICAL --quiet --format json --output "$tv")
@@ -632,8 +683,6 @@ else
     if [ ! -f "$tv" ] || ! jq -e . "$tv" >/dev/null 2>&1; then
       deps_error "trivy exited $tv_rc and produced no parseable JSON — $(head -c 200 "$OUTDIR/.trivy.err" 2>/dev/null | tr '\n' ' ')"
     elif ! jq -e 'has("Results")' "$tv" >/dev/null 2>&1; then
-      # THE 0.1.0 false-clean: no Results key means trivy found nothing it could
-      # parse — not that the dependencies are clean.
       if [ -n "${LOCK_MISSING// /}" ]; then
         deps_error "no scannable lockfile for:${LOCK_MISSING} — commit a lockfile (npm i --package-lock-only) or --skip-deps. Dependencies NOT scanned."
       else
@@ -642,70 +691,68 @@ else
     elif pe="$(trivy_parse_errors "$OUTDIR/.trivy.err")" && [ -n "$pe" ]; then
       deps_error "trivy could not parse one or more manifests (results incomplete): $(printf '%s' "$pe" | tr '\n' ' ' | head -c 200)"
     else
-      c=0; h=0; m=0
-      while IFS=$'\t' read -r sev cve target pkg title url; do
+      while IFS=$'\x1f' read -r sev cve target pkg title url; do
         [ -z "${cve:-}" ] && continue
-        case "$sev" in
-          CRITICAL) c=$((c+1)); vs=critical;;
-          HIGH)     h=$((h+1)); vs=high;;
-          *)        m=$((m+1)); vs=medium;;
-        esac
-        dep_add trivy "$vs" "$cve" "$(rel "$target")" "$pkg: $title" "$url"
+        case "$sev" in CRITICAL) vs=critical;; HIGH) vs=high;; MEDIUM) vs=medium;; *) vs=low;; esac
+        dep_row 1 "$vs" "$cve" "$(rel "$target")" "$pkg" "$title" "$url" trivy
       done < <(jq -r '.Results[]? | .Target as $t | (.Vulnerabilities//[])[]
                       | [ .Severity, .VulnerabilityID, $t,
                           (.PkgName + "@" + (.InstalledVersion//"?")),
                           ((.Title // .Description // "known vulnerability")|gsub("[\n\t]";" ")|.[0:160]),
-                          (.PrimaryURL//"")
-                        ] | @tsv' "$tv" 2>/dev/null |
-                  sort -u -t$'\t' -k2,2 -k4,4)   # dedup: same CVE + same pkg version
-      [ "$c" -gt 0 ] && bad  "trivy: $c CRITICAL dependency CVE(s)"
-      [ "$h" -gt 0 ] && warn "trivy: $h HIGH dependency CVE(s)"
-      [ "$m" -gt 0 ] && say  "  ${C_D}trivy: $m MEDIUM dependency CVE(s)${C_0}"
-      [ $((c+h+m)) -eq 0 ] && ok "trivy: 0 MEDIUM+ dependency CVEs"
-      DEP_ANY=$((c+h+m)); scanned=1
-    fi
-  elif have grype; then
-    # grype was advertised in 0.1.0's README and installed by --install, but
-    # never actually invoked. It is now the real fallback.
-    gr="$OUTDIR/grype.json"; rm -f "$gr"
-    grype "dir:$TARGET" -o json --file "$gr" >/dev/null 2>&1; gr_rc=$?
-    if [ ! -f "$gr" ] || ! jq -e . "$gr" >/dev/null 2>&1; then
-      deps_error "grype exited $gr_rc and produced no parseable JSON"
-    else
-      n=0
-      while IFS=$'\t' read -r sev cve pkg url; do
-        [ -z "${cve:-}" ] && continue
-        case "$sev" in
-          Critical) vs=critical;; High) vs=high;; Medium) vs=medium;; *) vs=low;;
-        esac
-        n=$((n+1)); dep_add grype "$vs" "$cve" "dependencies" "$pkg" "$url"
-      done < <(jq -r '.matches[]? | [ (.vulnerability.severity//"Unknown"),
-                        (.vulnerability.id//""), (.artifact.name+"@"+(.artifact.version//"?")),
-                        (.vulnerability.dataSource//"") ] | @tsv' "$gr" 2>/dev/null | sort -u)
-      [ "$n" -gt 0 ] && warn "grype: $n vulnerability match(es)" || ok "grype: 0 vulnerabilities"
-      DEP_ANY=$n; scanned=1
+                          (.PrimaryURL//"") ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$tv" 2>/dev/null)
+      DEP_SRC_OK="$DEP_SRC_OK trivy"
     fi
   fi
 
-  # npm audit is a supplement, not a substitute — it only covers the node tree.
-  # Only used when no real scanner is installed; if trivy/grype ran and failed,
-  # that failure is already recorded and must not be reported twice.
-  if [ "$scanned" = 0 ] && [ "$dep_tool_present" = 0 ] && has_stack node && have npm; then
+  # ── source: osv-scanner ──
+  # Also the alias bridge: OSV reports GHSA ids alongside their CVE aliases, so
+  # its output is what lets a CVE from trivy and a GHSA from npm audit be
+  # recognised as the same vulnerability instead of counted twice.
+  if have osv-scanner; then
+    ov="$OUTDIR/osv.json"; rm -f "$ov"
+    osv-scanner scan source --format json --output "$ov" "$TARGET" >/dev/null 2>"$OUTDIR/.osv.err" || true
+    [ -s "$ov" ] || osv-scanner --format json --output "$ov" -r "$TARGET" >/dev/null 2>>"$OUTDIR/.osv.err" || true
+    if [ -s "$ov" ] && jq -e . "$ov" >/dev/null 2>&1; then
+      # alias -> canonical (prefer a CVE id as canonical)
+      jq -r '.results[]?.packages[]?.groups[]? |
+             ((.aliases//[]) + (.ids//[])) as $all |
+             (($all[] | select(startswith("CVE-"))) // $all[0]) as $canon |
+             $all[] | [., $canon] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$ov" 2>/dev/null | sort -u > "$ALIAS_MAP"
+      while IFS=$'\x1f' read -r score id target pkg title url; do
+        [ -z "${id:-}" ] && continue
+        dep_row 2 "$(cvss_sev "$score")" "$id" "$(rel "$target")" "$pkg" "$title" "$url" osv-scanner
+      done < <(jq -r '.results[]? | (.source.path//"") as $t | .packages[]? |
+                      (.package.name + "@" + (.package.version//"?")) as $p |
+                      (.groups//[]) as $g | .vulnerabilities[]? |
+                      . as $v |
+                      ( ($g[] | select((.ids//[])|index($v.id)) | .max_severity) // "0" ) as $sc |
+                      [ $sc, $v.id, $t, $p,
+                        ((($v.summary // $v.details) // "known vulnerability")|gsub("[\n\t]";" ")|.[0:160]),
+                        ("https://osv.dev/vulnerability/" + $v.id) ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$ov" 2>/dev/null)
+      DEP_SRC_OK="$DEP_SRC_OK osv-scanner"
+    else
+      deps_error "osv-scanner is installed but produced no parseable JSON — $(head -c 160 "$OUTDIR/.osv.err" 2>/dev/null | tr '\n' ' ')"
+    fi
+  fi
+
+  # ── source: npm audit (node only; the npm/GitHub advisory database) ──
+  if has_stack node && have npm; then
     if [ -n "$(findx -name 'package-lock.json' | head -1)" ]; then
-      na="$OUTDIR/npm-audit.json"
+      na="$OUTDIR/npm-audit.json"; rm -f "$na"
       (cd "$TARGET" && npm audit --omit=dev --json > "$na" 2>/dev/null) || true
-      if [ -f "$na" ] && jq -e . "$na" >/dev/null 2>&1; then
-        n=0
-        while IFS=$'\t' read -r sev pkg title url; do
+      if [ -s "$na" ] && jq -e . "$na" >/dev/null 2>&1; then
+        while IFS=$'\x1f' read -r sev pkg title url ghsa; do
           [ -z "${pkg:-}" ] && continue
           case "$sev" in critical) vs=critical;; high) vs=high;; moderate) vs=medium;; *) vs=low;; esac
-          n=$((n+1)); dep_add "npm-audit" "$vs" "npm.$pkg" "package-lock.json" "$pkg: $title" "$url"
+          dep_row 3 "$vs" "${ghsa:-npm-$pkg}" "package-lock.json" "$pkg" "$title" "$url" npm-audit
         done < <(jq -r '.vulnerabilities // {} | to_entries[] | .value
+                        | ((.via//[])|map(select(type=="object"))) as $v
                         | [ (.severity//"low"), (.name//""),
-                            (((.via//[])|map(if type=="object" then .title else . end)|join("; "))|gsub("[\n\t]";" ")|.[0:160]),
-                            (((.via//[])|map(select(type=="object").url)|.[0]) // "") ] | @tsv' "$na" 2>/dev/null | sort -u)
-        [ "$n" -gt 0 ] && warn "npm audit: $n vulnerable package(s)" || ok "npm audit: clean (prod)"
-        DEP_ANY=$n; scanned=1
+                            ((($v|map(.title)|join("; ")) // "vulnerable package")|gsub("[\n\t]";" ")|.[0:160]),
+                            (($v|map(.url)|.[0]) // ""),
+                            ((($v|map(.url)|.[0]) // "") | capture("(?<g>GHSA-[0-9a-z-]+)").g // "")
+                          ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$na" 2>/dev/null)
+        DEP_SRC_OK="$DEP_SRC_OK npm-audit"
       else
         deps_error "npm audit produced no parseable JSON"
       fi
@@ -714,15 +761,59 @@ else
     fi
   fi
 
+  # ── source: grype ──
+  if have grype; then
+    gr="$OUTDIR/grype.json"; rm -f "$gr"
+    grype "dir:$TARGET" -o json --file "$gr" >/dev/null 2>&1; gr_rc=$?
+    if [ -s "$gr" ] && jq -e . "$gr" >/dev/null 2>&1; then
+      while IFS=$'\x1f' read -r sev id pkg url; do
+        [ -z "${id:-}" ] && continue
+        case "$sev" in Critical) vs=critical;; High) vs=high;; Medium) vs=medium;; *) vs=low;; esac
+        dep_row 4 "$vs" "$id" "dependencies" "$pkg" "known vulnerability" "$url" grype
+      done < <(jq -r '.matches[]? | [ (.vulnerability.severity//"Unknown"), (.vulnerability.id//""),
+                        (.artifact.name+"@"+(.artifact.version//"?")), (.vulnerability.dataSource//"") ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$gr" 2>/dev/null)
+      DEP_SRC_OK="$DEP_SRC_OK grype"
+    else
+      deps_error "grype exited $gr_rc and produced no parseable JSON"
+    fi
+  fi
+
+  # ── merge: canonicalise ids via the OSV alias map, then dedup on (id, package) ──
+  if [ -n "${DEP_SRC_OK// /}" ]; then
+    c=0; h=0; m=0; l=0; DEP_ANY=0
+    while IFS=$'\x1f' read -r sev id target pkg title url srcs; do
+      [ -z "${id:-}" ] && continue
+      case "$sev" in critical) c=$((c+1));; high) h=$((h+1));; medium) m=$((m+1));; *) l=$((l+1));; esac
+      add_finding deps "$sev" "$id" "$target" 0 "$pkg: $title" "$url" "$srcs"
+      DEP_ANY=$((DEP_ANY+1))
+    done < <(sort -t$'\x1f' -k1,1n "$DEP_TSV" | awk -v mapf="$ALIAS_MAP" '
+        BEGIN{ FS=OFS="\037"
+               while ((getline line < mapf) > 0) { split(line, a, "\037"); canon[a[1]]=a[2] } }
+        { id=$3; if (id in canon && canon[id] != "") id=canon[id]
+          if (id == "") next                      # never emit a finding with no id
+          pkgname=$5; sub(/@[^@]*$/, "", pkgname) # lodash@4.17.4 -> lodash, so a
+          key=id FS pkgname                       # source omitting the version merges
+          if (!(key in seen)) { seen[key]=1; n++; order[n]=key
+                                rec[key]=$2 FS id FS $4 FS $5 FS $6 FS $7; src[key]=$8 }
+          else if (index(src[key], $8) == 0) src[key]=src[key] "," $8 }
+        END{ for (i=1; i<=n; i++) { k=order[i]; print rec[k], src[k] } }')
+    [ "$c" -gt 0 ] && bad  "dependencies: $c CRITICAL CVE(s)"
+    [ "$h" -gt 0 ] && warn "dependencies: $h HIGH CVE(s)"
+    [ $((m+l)) -gt 0 ] && say "  ${C_D}dependencies: $m MEDIUM, $l LOW CVE(s)${C_0}"
+    [ "$DEP_ANY" -eq 0 ] && ok "dependencies: 0 CVEs from$DEP_SRC_OK"
+    say "  ${C_D}sources:$DEP_SRC_OK${C_0}"
+    scanned=1
+  fi
+
   if [ "$scanned" = 1 ]; then
     if [ -n "${LOCK_MISSING// /}" ]; then
       deps_error "scanned, but these stacks have no lockfile and were NOT covered:${LOCK_MISSING}"
-    elif [ "$DEP_ANY" -gt 0 ]; then set_status deps findings "$DEP_ANY CVE(s)"
-    else set_status deps ok "0 CVEs"; fi
+    elif [ "$DEP_ANY" -gt 0 ]; then set_status deps findings "$DEP_ANY CVE(s) from$DEP_SRC_OK"
+    else set_status deps ok "0 CVEs from$DEP_SRC_OK"; fi
   elif [ "$DEPS_ERRORED" = 1 ]; then
     :   # already reported
   else
-    deps_error "no dependency scanner available (trivy, grype, or npm) — dependencies NOT scanned"
+    deps_error "no dependency scanner available (trivy, osv-scanner, npm, or grype) — dependencies NOT scanned"
   fi
 fi
 
@@ -752,7 +843,7 @@ else
     pass_error iac "trivy config could not parse one or more IaC files (unparsed files are NOT scanned): $(printf '%s' "$pe" | tr '\n' ' ' | head -c 240)"
   else
     c=0; h=0; m=0
-    while IFS=$'\t' read -r sev id target lineno title url; do
+    while IFS=$'\x1f' read -r sev id target lineno title url; do
       [ -z "${id:-}" ] && continue
       case "$sev" in
         CRITICAL) c=$((c+1)); vs=critical;;
@@ -764,7 +855,7 @@ else
                     | [ .Severity, (.ID//"misconfig"), $t,
                         ((.CauseMetadata.StartLine//0)|tostring),
                         (((.Title//"misconfiguration") + " — " + (.Message//""))|gsub("[\n\t]";" ")|.[0:180]),
-                        (.PrimaryURL//"") ] | @tsv' "$ti" 2>/dev/null | sort -u)
+                        (.PrimaryURL//"") ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$ti" 2>/dev/null | sort -u)
     [ "$c" -gt 0 ] && bad  "trivy config: $c CRITICAL misconfig(s)"
     [ "$h" -gt 0 ] && warn "trivy config: $h HIGH misconfig(s)"
     [ "$m" -gt 0 ] && say  "  ${C_D}trivy config: $m MEDIUM misconfig(s)${C_0}"
@@ -987,11 +1078,11 @@ if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ] && [ -f "$BASELINE" ]; then
   [ "$BASE_N" -gt 0 ] && warn "$BASE_N finding(s) accepted by baseline — excluded from the gate, still listed in the report" \
                       || ok "no findings matched the baseline"
   # Staleness: prompt re-review without breaking the build on a timer.
-  while IFS=$'\t' read -r fpr added; do
+  while IFS=$'\x1f' read -r fpr added; do
     [ -z "${added:-}" ] && continue
     d="$(days_since "$added")"
     [ -n "$d" ] && [ "$d" -gt "$BASELINE_STALE_DAYS" ] && BASE_STALE=$((BASE_STALE+1))
-  done < <(jq -r '.entries[]? | [.fingerprint, (.added//"")] | @tsv' "$BASELINE" 2>/dev/null)
+  done < <(jq -r '.entries[]? | [.fingerprint, (.added//"")] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$BASELINE" 2>/dev/null)
   [ "$BASE_STALE" -gt 0 ] && warn "$BASE_STALE baseline entr(ies) older than $BASELINE_STALE_DAYS days — re-review whether they are still acceptable"
   # One fingerprint can cover several occurrences: many scanners emit an
   # identical message for every hit of a rule in a file, and the line number is
@@ -999,7 +1090,7 @@ if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ] && [ -f "$BASELINE" ]; then
   # of an already-accepted rule in an already-accepted file would be suppressed
   # silently. Compare against the count recorded when the entry was accepted.
   BASE_GREW=0
-  while IFS=$'\t' read -r fpr was; do
+  while IFS=$'\x1f' read -r fpr was; do
     [ -z "${fpr:-}" ] && continue
     [ -z "${was:-}" ] || [ "$was" = "null" ] && continue   # pre-0.3.1 entry, no count recorded
     now=$(jq -s --arg f "$fpr" '[.[]|select(.fingerprint==$f)]|length' "$ACCEPTED")
@@ -1008,7 +1099,7 @@ if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ] && [ -f "$BASELINE" ]; then
       warn "baseline entry $fpr now suppresses $now finding(s), was $was when accepted — a new occurrence is being hidden"
       jq -r --arg f "$fpr" 'select(.fingerprint==$f) | "      · \(.file):\(.line)"' "$ACCEPTED"
     fi
-  done < <(jq -r '.entries[]? | [.fingerprint, ((.occurrences // "null")|tostring)] | @tsv' "$BASELINE" 2>/dev/null)
+  done < <(jq -r '.entries[]? | [.fingerprint, ((.occurrences // "null")|tostring)] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$BASELINE" 2>/dev/null)
   # An unused entry usually means the finding was fixed: worth pruning.
   bl_total=$(jq '.entries|length' "$BASELINE")
   unused=$((bl_total - BASE_N))
@@ -1078,9 +1169,23 @@ TOTAL=$((CRIT+HIGH+MED+LOW))
 
 # out_of_scope is included so the machine-readable output is complete: the raw
 # JSONL files are dot-prefixed internals and CI artifact uploads skip them.
-jq -s '{active: ., accepted: $acc[0], out_of_scope: $oos[0]}' \
+# D1: the machine-readable output states what was examined AND what was not.
+# A consumer must be able to tell "clean" from "never looked" without parsing prose.
+jq -s '{active: ., accepted: $acc[0], out_of_scope: $oos[0],
+        coverage: { passes: $st, tooling: $tl,
+          not_detectable: [
+            "business-logic authorisation (IDOR, broken access control)",
+            "multi-tenant isolation and cross-tenant data leakage",
+            "object lifecycle and state bugs spanning multiple files",
+            "concurrency and race conditions (TOCTOU)",
+            "authentication and session-invalidation semantics",
+            "absence of a required control (no pattern exists to match)"
+          ],
+          note: "Pattern and inventory scanning only. The classes above require a reviewer that reasons about intent; see hardening/CHECKLIST.md." } }' \
   --slurpfile acc <(jq -s '.' "$ACCEPTED") \
   --slurpfile oos <(jq -s '.' "$OUTDIR/.outscope.jsonl" 2>/dev/null || echo '[]') \
+  --argjson st "$(jq -s '.' "$STATUS")" \
+  --argjson tl "$(jq -s '.' "$TOOLING")" \
   "$ACTIVE" > "$OUTDIR/findings.json"
 
 {
@@ -1147,6 +1252,20 @@ jq -s '{active: ., accepted: $acc[0], out_of_scope: $oos[0]}' \
     jq -rs '.[] | "| \(.severity) | \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)`" end) | \(.title|gsub("\\|";"\\\\|")) |"' "$ACCEPTED"
     echo
   fi
+  echo "## Tooling"
+  echo
+  echo "| Tool | Pass | Version |"
+  echo "|---|---|---|"
+  jq -rs '.[] | "| \(.tool) | \(.pass) | \(if .installed then .version else "**not installed**" end) |"' "$TOOLING"
+  echo
+  echo "## Not examined by this scan"
+  echo
+  echo "Pattern and inventory scanning cannot detect these classes at all, regardless of configuration:"
+  echo
+  jq -r '.coverage.not_detectable[] | "- \(.)"' "$OUTDIR/findings.json"
+  echo
+  echo "They require a reviewer that reasons about intent — see \`hardening/CHECKLIST.md\`."
+  echo
   echo "_Raw scanner output in \`$OUTDIR/\`. SARIF: \`$(basename "$SARIF")\`._"
   echo "_Scanners produce false positives — triage before acting._"
 } > "$REPORT"

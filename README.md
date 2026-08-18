@@ -15,8 +15,8 @@ read-only dynamic** checks against a URL you control:
 | Pass | What it checks | Tool(s) |
 |------|----------------|---------|
 | 🔑 Secrets | Committed / working-tree credentials (verified only) | trufflehog, gitleaks |
-| 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) | semgrep |
-| 📦 Dependencies | Known CVEs in your lockfiles | trivy, osv-scanner, npm audit |
+| 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) | semgrep + [`rules/`](rules/) |
+| 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) | trivy + osv-scanner + npm audit + grype |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
 
@@ -106,6 +106,36 @@ A human-readable console summary, plus `vibecheck-report/`:
 
 Every scanner produces false positives. **Triage before acting** — the report
 is a starting point, not a verdict.
+
+## Dependency scanning uses every source, not the first one it finds
+
+trivy, osv-scanner, npm audit and grype draw on **different advisory databases**,
+so whichever one you happen to have installed changes what "0 CVEs" means. All
+available sources now run and their results are merged.
+
+Findings record which sources corroborated them:
+
+```
+medium  CVE-2018-3721  lodash@4.17.4  [osv-scanner, npm-audit, grype]
+```
+
+That one is real: **trivy alone misses it.** OSV also supplies the CVE↔GHSA alias
+table, which is what lets a CVE from trivy and a GHSA from npm audit be
+recognised as the same vulnerability rather than counted twice. Which scanners
+corroborated a finding is deliberately *not* part of its fingerprint, so
+installing another tool never invalidates your baseline.
+
+## What this scan cannot see
+
+Every report ends with the classes of flaw pattern scanning cannot detect at all —
+business-logic authorisation, multi-tenant isolation, object lifecycle bugs
+spanning files, races, session-invalidation semantics, and the absence of a
+required control. The same list is in `findings.json` under `coverage`, so a
+consumer can tell "clean" from "never looked" without parsing prose.
+
+`report.md` also records **which tool at which version with which ruleset**
+produced the result. A registry ruleset change silently alters what clean means;
+this makes that auditable.
 
 ## Adopting on an existing codebase
 

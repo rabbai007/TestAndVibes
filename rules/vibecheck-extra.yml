@@ -1,0 +1,92 @@
+# VibeCheck supplementary rules.
+#
+# These cover sinks the public semgrep registry does not reach. Each was added
+# because a real finding was missed: an adversarial review of an MCP server found
+# all three, while `--config auto` reported the file clean.
+#
+# Scope is deliberately narrow. A supplementary pack that fires constantly gets
+# switched off, and a rule nobody trusts is worse than no rule.
+rules:
+  # Registry rules cover framework sinks (express res.send with concatenation)
+  # but not raw node http, where the response is a template literal. That is the
+  # shape hand-rolled servers actually use.
+  - id: vibecheck-raw-http-reflected-request-data
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation"
+      references:
+        - https://owasp.org/www-community/attacks/xss/
+    message: >-
+      Request-controlled data is interpolated into a raw HTTP response body
+      without escaping. A Host, Referer or User-Agent header is attacker-supplied,
+      so this is reflected XSS even though no framework sink is involved. Escape
+      the value, or serve a static page and pass data as JSON.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.headers
+          - pattern: $REQ.headers[...]
+          - pattern: $REQ.headers.$H
+          - pattern: $REQ.url
+          - pattern: $REQ.rawHeaders
+    pattern-sinks:
+      - pattern-either:
+          - pattern: $RES.end(...)
+          - pattern: $RES.write(...)
+          - pattern: $RES.writeHead(..., ...)
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: encodeURIComponent(...)
+          - pattern: escapeHtml(...)
+          - pattern: $X.escape(...)
+          - pattern: JSON.stringify(...)
+
+  # An unbounded accumulate-then-parse loop lets one request exhaust memory.
+  # Registry coverage assumes a body-parser middleware with a limit option.
+  - id: vibecheck-unbounded-request-body
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-770: Allocation of Resources Without Limits or Throttling"
+    message: >-
+      Request body is accumulated without a size limit. A single client can
+      exhaust process memory. Track the accumulated length and destroy the
+      request past a maximum, or use a body parser with an explicit limit.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $REQ.on("data", function ($C) { ... $BUF += $C; ... })
+          - pattern: |
+              $REQ.on("data", ($C) => { ... $BUF += $C; ... })
+          - pattern: |
+              for await ($C of $REQ) { ... $BUF += $C; ... }
+      # The guard is normally a SIBLING of the accumulation, not its parent, so
+      # pattern-not-inside cannot see it. pattern-not-regex tests the matched
+      # region itself: if the handler mentions a length, a cap, or tears the
+      # request down, treat it as bounded. Blunt on purpose — a supplementary
+      # pack that cries wolf gets switched off, so it errs toward silence.
+      - pattern-not-regex: '\.length|destroy\(|\blimit\b|MAX|maxBytes|byteLength'
+
+  # JSON.parse on any external input throws on malformed data. Unguarded at
+  # startup it is a boot crash; in a handler it is an unhandled rejection.
+  - id: vibecheck-unguarded-json-parse
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: reliability
+      cwe: "CWE-248: Uncaught Exception"
+    message: >-
+      JSON.parse on external input is not wrapped in try/catch. Malformed input
+      throws a SyntaxError — at startup that is a crash loop, in a request
+      handler an unhandled rejection. Wrap it and fail with a clear message.
+    patterns:
+      - pattern-either:
+          - pattern: JSON.parse($X.readFileSync(...))
+          - pattern: JSON.parse(process.env.$E)
+          - pattern: JSON.parse($REQ.body)
+          - pattern: JSON.parse(await $P.text())
+      - pattern-not-inside: |
+          try { ... } catch($E) { ... }
