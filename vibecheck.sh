@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.3.1"
+VERSION="0.3.2"
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
 
 # ── defaults (overridable by vibecheck.yml, then CLI flags) ──
@@ -39,6 +39,8 @@ DO_SECRETS=1; DO_SAST=1; DO_DEPS=1; DO_IAC=1
 DO_PDF=0                # 1 = also render report.pdf (needs Chrome/wkhtmltopdf/weasyprint)
 DO_OPEN=0               # 1 = open the HTML report in the default browser
 DIFF_REF=""             # gate only on findings in files changed vs this git ref
+BASE_REF=""             # trusted git ref to read config/ignore/baseline from
+TRUST_REPO_CONFIG=0     # 1 = honour in-tree config even when a base ref exists
 BASELINE=""             # path to an accepted-findings baseline
 USE_BASELINE=1          # 0 = ignore any baseline file that exists
 WRITE_BASELINE=0        # 1 = merge current findings into the baseline and exit
@@ -84,6 +86,11 @@ OPTIONS
   --diff REF           PR mode: gate only on findings in files changed vs REF
                        (e.g. --diff origin/main). Findings elsewhere are still
                        reported. Run a full scan on your default branch too.
+  --base REF           Read vibecheck.yml, .vibecheckignore and the baseline from
+                       this git ref instead of the working tree, so a change
+                       cannot alter its own gate. Implied by --diff.
+  --trust-repo-config  Honour in-tree config even with --base (unsafe on untrusted
+                       code: the tree being scanned then controls the gate)
   --baseline PATH      Accepted-findings file (default: ./.vibecheck-baseline.json)
   --write-baseline     Accept every current finding into the baseline, then exit
   --no-baseline        Ignore any baseline file and gate on everything
@@ -130,29 +137,84 @@ cfg_get() { # file  dotted.key  -> value on stdout (empty if absent)
   esac
 }
 load_config() {
-  local f="$1" v
+  local f="$1" label="${2:-$1}" v
   [ -f "$f" ] || return 0
-  v="$(cfg_get "$f" fail_on)";              [ -n "$v" ] && FAIL_ON="$v"
+  # A2: a config file may not silently disable the gate. `never` is a total
+  # bypass, so it has to be typed on the command line by a human.
+  v="$(cfg_get "$f" fail_on)"
+  if [ -n "$v" ]; then
+    if [ "$v" = "never" ] && [ "$CLI_FAIL_ON" != "never" ]; then
+      CFG_REJECTED="fail_on: never in $label (requires --fail-on never on the command line)"
+    else
+      FAIL_ON="$v"
+    fi
+  fi
   v="$(cfg_get "$f" out)";                  [ -n "$v" ] && OUTDIR="$v"
   v="$(cfg_get "$f" dynamic.url)";          [ -n "$v" ] && { URL="$v"; DYNAMIC=1; }
-  v="$(cfg_get "$f" scanners.secrets)";     [ "$v" = "false" ] && DO_SECRETS=0
-  v="$(cfg_get "$f" scanners.sast)";        [ "$v" = "false" ] && DO_SAST=0
-  v="$(cfg_get "$f" scanners.dependencies)";[ "$v" = "false" ] && DO_DEPS=0
-  v="$(cfg_get "$f" scanners.iac)";         [ "$v" = "false" ] && DO_IAC=0
+  v="$(cfg_get "$f" scanners.secrets)";     [ "$v" = "false" ] && { DO_SECRETS=0; WHY_SECRETS="$label"; }
+  v="$(cfg_get "$f" scanners.sast)";        [ "$v" = "false" ] && { DO_SAST=0;    WHY_SAST="$label"; }
+  v="$(cfg_get "$f" scanners.dependencies)";[ "$v" = "false" ] && { DO_DEPS=0;    WHY_DEPS="$label"; }
+  v="$(cfg_get "$f" scanners.iac)";         [ "$v" = "false" ] && { DO_IAC=0;     WHY_IAC="$label"; }
   v="$(cfg_get "$f" fail_on_error)";        [ "$v" = "false" ] && FAIL_ON_ERROR=0
-  CONFIG_USED="$f"
+  CONFIG_USED="$label"
 }
 
-# ── args (parsed twice: --config first so flags can override the file) ──
-CONFIG_USED=""
+# ── args (pre-pass: we need --config/--dir/--diff/--base before loading config) ──
+CONFIG_USED=""; CFG_REJECTED=""; CLI_FAIL_ON=""
+WHY_SECRETS="--skip-secrets"; WHY_SAST="--skip-sast"; WHY_DEPS="--skip-deps"; WHY_IAC="--skip-iac"
+BASE_SRC=""            # git ref the config/ignore/baseline were read from
+BASE_TMP=""            # scratch dir holding files extracted from that ref
 _args=("$@")
 for ((i=0; i<${#_args[@]}; i++)); do
-  [ "${_args[$i]}" = "--config" ] && CONFIG="${_args[$((i+1))]:-}"
+  case "${_args[$i]}" in
+    --config) CONFIG="${_args[$((i+1))]:-}";;
+    --dir)    TARGET="${_args[$((i+1))]:-$TARGET}";;
+    --diff)   DIFF_REF="${_args[$((i+1))]:-}";;
+    --base)   BASE_REF="${_args[$((i+1))]:-}";;
+    --fail-on) CLI_FAIL_ON="${_args[$((i+1))]:-}";;
+    --trust-repo-config) TRUST_REPO_CONFIG=1;;
+  esac
 done
+# --diff implies --base: if we are gating a change, the change must not be able
+# to rewrite its own gate.
+[ -z "$BASE_REF" ] && [ -n "$DIFF_REF" ] && BASE_REF="$DIFF_REF"
+
+# THE TRUST BOUNDARY.
+# vibecheck.yml, .vibecheckignore and .vibecheck-baseline.json all decide what
+# gets scanned and what fails the build. Read from the working tree they are
+# attacker-controlled on a pull request: adding `fail_on: never`, or an ignore
+# rule covering the vulnerable file, or a baseline accepting your own finding,
+# turns a red build green. When a base ref is known we read them from THERE —
+# the reviewed, merged state — not from the change under test.
+base_show() { # repo-relative path -> extracted file path on stdout, or empty
+  local rel="$1" out
+  [ -n "$BASE_REF" ] || return 1
+  [ -n "$BASE_TMP" ] || BASE_TMP="$(mktemp -d 2>/dev/null)" || return 1
+  out="$BASE_TMP/$(printf '%s' "$rel" | tr '/' '_')"
+  if git -C "$TARGET" show "$BASE_REF:$rel" > "$out" 2>/dev/null; then
+    printf '%s' "$out"; return 0
+  fi
+  return 1
+}
+TRUSTED_NOTE=""
+if [ -n "$BASE_REF" ] && [ "$TRUST_REPO_CONFIG" = 0 ]; then
+  if git -C "$TARGET" rev-parse --verify --quiet "$BASE_REF" >/dev/null 2>&1; then
+    BASE_SRC="$BASE_REF"
+  else
+    # Do not fall back to the working tree — that is the untrusted path. The
+    # diff pass reports this as an ERROR further down.
+    TRUSTED_NOTE="base ref '$BASE_REF' not found; in-tree config NOT trusted and NOT loaded"
+  fi
+fi
+
 if [ -n "$CONFIG" ]; then
+  # An explicit --config is the operator's own choice, so it is trusted as given.
   [ -f "$CONFIG" ] || { err "config not found: $CONFIG"; exit 2; }
   load_config "$CONFIG"
-elif [ -f "./vibecheck.yml" ]; then
+elif [ -n "$BASE_SRC" ]; then
+  _c="$(base_show vibecheck.yml || true)"
+  [ -n "${_c:-}" ] && load_config "$_c" "vibecheck.yml@$BASE_SRC"
+elif [ -z "$BASE_REF" ] && [ -f "./vibecheck.yml" ]; then
   load_config "./vibecheck.yml"
 fi
 
@@ -175,6 +237,8 @@ while [ $# -gt 0 ]; do
     --pdf) DO_PDF=1; shift;;
     --open) DO_OPEN=1; shift;;
     --diff) DIFF_REF="${2:?--diff needs a git ref}"; shift 2;;
+    --base) BASE_REF="${2:?--base needs a git ref}"; shift 2;;
+    --trust-repo-config) TRUST_REPO_CONFIG=1; shift;;
     --baseline) BASELINE="${2:?--baseline needs a path}"; shift 2;;
     --write-baseline) WRITE_BASELINE=1; shift;;
     --no-baseline) USE_BASELINE=0; shift;;
@@ -264,11 +328,20 @@ rel() { printf '%s' "${1#$TARGET/}"; }
 
 # ── baseline (accepted findings) ──
 # Resolve after TARGET is known so a repo-local baseline is picked up.
+BASELINE_LABEL=""
 if [ "$USE_BASELINE" = 1 ] && [ -z "$BASELINE" ]; then
-  for c in "$TARGET/.vibecheck-baseline.json" "./.vibecheck-baseline.json"; do
-    [ -f "$c" ] && { BASELINE="$c"; break; }
-  done
+  if [ -n "$BASE_SRC" ]; then
+    # A5: entries added by the change under test are not accepted. Reading the
+    # baseline from the trusted ref means a PR cannot accept its own finding.
+    _b="$(base_show .vibecheck-baseline.json || true)"
+    [ -n "${_b:-}" ] && { BASELINE="$_b"; BASELINE_LABEL=".vibecheck-baseline.json@$BASE_SRC"; }
+  elif [ -z "$BASE_REF" ]; then
+    for c in "$TARGET/.vibecheck-baseline.json" "./.vibecheck-baseline.json"; do
+      [ -f "$c" ] && { BASELINE="$c"; BASELINE_LABEL="$c"; break; }
+    done
+  fi
 fi
+[ -n "$BASELINE" ] && [ -z "$BASELINE_LABEL" ] && BASELINE_LABEL="$BASELINE"
 if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ]; then
   if [ ! -f "$BASELINE" ]; then
     [ "$WRITE_BASELINE" = 1 ] || { err "baseline not found: $BASELINE"; exit 2; }
@@ -284,10 +357,17 @@ days_since() {
 }
 
 # ── exclusions (.vibecheckignore, else sane defaults) ──
-IGNORE_FILE=""
-for c in "$TARGET/.vibecheckignore" "./.vibecheckignore"; do
-  [ -f "$c" ] && { IGNORE_FILE="$c"; break; }
-done
+IGNORE_FILE=""; IGNORE_LABEL=""
+if [ -n "$BASE_SRC" ]; then
+  # From the trusted ref only: an ignore rule added by the change under test
+  # could otherwise hide the very file it modified.
+  _i="$(base_show .vibecheckignore || true)"
+  [ -n "${_i:-}" ] && { IGNORE_FILE="$_i"; IGNORE_LABEL=".vibecheckignore@$BASE_SRC"; }
+elif [ -z "$BASE_REF" ]; then
+  for c in "$TARGET/.vibecheckignore" "./.vibecheckignore"; do
+    [ -f "$c" ] && { IGNORE_FILE="$c"; IGNORE_LABEL="$c"; break; }
+  done
+fi
 EXCLUDES=()
 if [ -n "$IGNORE_FILE" ]; then
   while IFS= read -r pat; do
@@ -304,8 +384,13 @@ for e in "${EXCLUDES[@]}"; do printf '%s\n' "$e" >> "$TH_EXCLUDE"; done
 
 STAMP="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo now)"
 say "${C_BOLD}VibeCheck v$VERSION${C_0}  —  $TARGET"
+[ -n "$BASE_SRC" ] && say "  ${C_D}config/ignore/baseline read from: $BASE_SRC (working-tree copies not trusted)${C_0}"
+if [ -n "$CFG_REJECTED" ]; then
+  pass_error config "refused a config directive that would disable the gate — $CFG_REJECTED"
+fi
+[ -n "$TRUSTED_NOTE" ] && pass_error config "$TRUSTED_NOTE"
 [ -n "$CONFIG_USED" ] && say "  ${C_D}config: $CONFIG_USED${C_0}"
-[ -n "$IGNORE_FILE" ] && say "  ${C_D}ignore: $IGNORE_FILE${C_0}"
+[ -n "$IGNORE_FILE" ] && say "  ${C_D}ignore: $IGNORE_LABEL${C_0}"
 
 # ── stack detection ──
 head2 "Stack detection"
@@ -341,7 +426,7 @@ has_stack() { case " $STACK " in *" $1 "*) return 0;; *) return 1;; esac; }
 # ═══════════════════════════════════════════════════════════════════
 head2 "1. Secret scanning"
 if [ "$DO_SECRETS" = 0 ]; then
-  skip "secret scan" "--skip-secrets"; set_status secrets skipped "--skip-secrets"
+  skip "secret scan" "$WHY_SECRETS"; set_status secrets skipped "disabled by $WHY_SECRETS"
 elif have trufflehog; then
   # One pass, both verdicts. 0.1.0 used --only-verified, which silently dropped
   # every secret trufflehog cannot authenticate live (DB passwords, private
@@ -447,7 +532,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════
 head2 "2. Static analysis (SAST)"
 if [ "$DO_SAST" = 0 ]; then
-  skip "SAST" "--skip-sast"; set_status sast skipped "--skip-sast"
+  skip "SAST" "$WHY_SAST"; set_status sast skipped "disabled by $WHY_SAST"
 elif have semgrep; then
   sg="$OUTDIR/semgrep.json"; rm -f "$sg"
   sg_args=(scan "--config=$SEMGREP_CONFIG" --json "--output=$sg" --quiet --disable-version-check)
@@ -527,7 +612,7 @@ DEP_STACK=0
 for s in node python go rust php ruby java dotnet elixir; do has_stack "$s" && DEP_STACK=1; done
 
 if [ "$DO_DEPS" = 0 ]; then
-  skip "dependency scan" "--skip-deps"; set_status deps skipped "--skip-deps"
+  skip "dependency scan" "$WHY_DEPS"; set_status deps skipped "disabled by $WHY_DEPS"
 elif [ "$DEP_STACK" = 0 ]; then
   skip "dependency scan" "no dependency manifests found"; set_status deps skipped "no manifests"
 else
@@ -649,7 +734,7 @@ IAC_STACK=0
 for s in docker docker-compose terraform helm; do has_stack "$s" && IAC_STACK=1; done
 [ -n "$(findx -name '*.yaml' -o -name '*.yml' | head -1)" ] && IAC_STACK=1   # k8s manifests
 if [ "$DO_IAC" = 0 ]; then
-  skip "IaC scan" "--skip-iac"; set_status iac skipped "--skip-iac"
+  skip "IaC scan" "$WHY_IAC"; set_status iac skipped "disabled by $WHY_IAC"
 elif [ "$IAC_STACK" = 0 ]; then
   skip "IaC scan" "no Dockerfile / terraform / k8s / helm files found"; set_status iac skipped "no IaC files"
 elif ! have trivy; then
@@ -898,7 +983,7 @@ if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ] && [ -f "$BASELINE" ]; then
     'select((.fingerprint as $f | $bl[0] | index($f)) == null)' "$FINDINGS" > "$ACTIVE"
   BASE_N=$(jq -s 'length' "$ACCEPTED")
   head2 "Baseline"
-  say "  ${C_D}$BASELINE${C_0}"
+  say "  ${C_D}$BASELINE_LABEL${C_0}"
   [ "$BASE_N" -gt 0 ] && warn "$BASE_N finding(s) accepted by baseline — excluded from the gate, still listed in the report" \
                       || ok "no findings matched the baseline"
   # Staleness: prompt re-review without breaking the build on a timer.
@@ -974,6 +1059,14 @@ fi
 # ═══════════════════════════════════════════════════════════════════
 # outputs: report.md · findings.json · SARIF
 # ═══════════════════════════════════════════════════════════════════
+# A3: "no pass examined anything" is not a clean result. Disabling every scanner
+# — by flag or by config — used to yield 0 findings and exit 0, which is
+# indistinguishable from a repo with nothing wrong. An empty scan is unknown.
+EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","iac","dynamic"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
+if [ "${EXECUTED:-0}" -eq 0 ]; then
+  pass_error coverage "no scan pass examined anything (all were skipped, disabled, or failed) — this result is unknown, not clean"
+fi
+
 # Recompute AFTER every pass, including the baseline and diff blocks above.
 # Reading a value captured earlier would drop errors raised by those blocks and
 # let an incomplete scan exit 0 — the fail-open behaviour this tool exists to
@@ -1377,4 +1470,5 @@ case "$VERDICT" in
   PASS)       [ "$ERRORS" -gt 0 ] && warn "passed threshold, but $ERRORS pass(es) were incomplete (--no-fail-on-error was set)"
               ok "PASS — no findings above '$FAIL_ON' threshold";;
 esac
+[ -n "$BASE_TMP" ] && rm -rf "$BASE_TMP"
 exit "$RC"

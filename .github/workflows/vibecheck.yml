@@ -75,6 +75,9 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           BASE_REF: ${{ github.base_ref }}
+        # --diff implies --base, so vibecheck.yml / .vibecheckignore / the
+        # baseline are read from the base branch. Without that, a pull request
+        # could commit config that suppresses its own findings.
         run: ./vibecheck.sh --fail-on high --semgrep-config p/ci --skip-deps
                             --diff "origin/$BASE_REF"
 
