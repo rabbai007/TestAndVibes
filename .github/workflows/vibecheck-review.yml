@@ -11,6 +11,11 @@
 # │ this workflow       │ nightly on main · reasoning · report-only     │
 # └─────────────────────┴──────────────────────────────────────────────┘
 #
+# NOTE: this workflow is OPTIONAL. The recommended way to run the reasoning pass is
+# locally before a release — `./vibecheck.sh --review --pdf --open` — which needs no
+# stored credential and produces a report you actually sit down and read. This
+# workflow exists for teams that want the cadence and an audit trail instead.
+#
 # SETUP — two steps, in this order:
 #   1. Add an ANTHROPIC_API_KEY repository secret
 #        Settings → Secrets and variables → Actions → New repository secret

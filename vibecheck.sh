@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.5.1"
+VERSION="0.5.2"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -1760,6 +1760,28 @@ else
   done
 fi
 
+# ── adversarial review — reasoning findings, report-only by default ──
+# This section matters most: the recommended workflow is `--review --pdf --open`,
+# so the HTML report is the artifact a human actually reads. Findings that appear
+# only in report.md would be invisible exactly where they are meant to land.
+if [ "${REVIEW_SHOWN:-0}" -gt 0 ]; then
+  printf '<h2>Adversarial review%s</h2>\n' "$([ "$FAIL_ON_REVIEW" = 1 ] && echo "" || echo " <span style=\"font-weight:400;color:var(--muted);font-size:.8rem\">(report-only)</span>")"
+  printf '<p>Reasoning-based findings — the classes pattern scanning cannot reach: authorisation, tenant isolation, object lifecycle, races, and absent controls. Each survived %s independent refutation attempt(s); %s candidate(s) were refuted and dropped.</p>\n' \
+    "$REVIEW_SKEPTICS" "$REVIEW_REFUTED"
+  if [ "$FAIL_ON_REVIEW" = 1 ]; then
+    printf '<div class="note"><strong>These affect the verdict.</strong> <code>--fail-on-review</code> is set.</div>\n'
+  else
+    printf '<div class="note"><strong>These do not affect the verdict.</strong> Model output is probabilistic — treat each as a lead to verify, not a finding to action blindly. Pass <code>--fail-on-review</code> to let them gate.</div>\n'
+  fi
+  printf '<table><thead><tr><th>Severity</th><th>Class</th><th>Location</th><th>Finding</th></tr></thead><tbody>\n'
+  jq -rs '.[] | select(.tool=="review") |
+    "<tr><td><span class=\"pill s-\(.severity)\">\(.severity)</span></td>" +
+    "<td><code>\(.rule|sub("^review.";"")|@html)</code></td>" +
+    "<td class=\"loc\">" + (if .file=="" then "—" else "<code>\(.file|@html):\(.line)</code>" end) + "</td>" +
+    "<td>\(.title|@html)</td></tr>"' "$ACTIVE"
+  printf '</tbody></table>\n'
+fi
+
 # ── outside the diff — visible, but not gated in PR mode ──
 if [ "$DIFF_N" -gt 0 ]; then
   printf '<h2>Outside the diff</h2>\n'
@@ -1790,6 +1812,27 @@ if [ "$BASE_N" -gt 0 ]; then
 fi
 
 # ── methodology + scope ──
+# Tooling + explicit non-coverage belong in the HTML report too, not just
+# report.md: the recommended workflow is `--review --pdf --open`, so this is the
+# artifact a human reads. A clean verdict is not auditable without knowing which
+# tool at which version produced it.
+printf '<h2>Tooling</h2>\n'
+printf '<p>What produced this result. A registry ruleset change silently alters what &ldquo;clean&rdquo; means, so it is recorded here.</p>\n'
+printf '<table><thead><tr><th>Tool</th><th>Pass</th><th>Version</th></tr></thead><tbody>\n'
+jq -rs '.[] | "<tr><td>\(.tool|@html)</td><td>\(.pass|@html)</td><td>" +
+  (if .installed then "<code>\(.version|@html)</code>" else "<em>not installed</em>" end) + "</td></tr>"' "$TOOLING"
+printf '</tbody></table>\n'
+
+printf '<h2>Not examined by this scan</h2>\n'
+printf '<p>Pattern and inventory scanning cannot detect these classes at all, regardless of configuration:</p>\n<ul>\n'
+jq -r '.coverage.not_detectable[] | "<li>\(.)</li>"' "$OUTDIR/findings.json" 2>/dev/null
+printf '</ul>\n'
+if [ "$DO_REVIEW" = 1 ] && [ "${REVIEW_N:-0}" -ge 0 ] && [ -n "${RV_MODE:-}" ]; then
+  printf '<p>The adversarial review pass above targets exactly these classes. It reasons rather than matching, so treat its findings as leads to verify.</p>\n'
+else
+  printf '<p>The <code>--review</code> pass targets exactly these classes and was <strong>not run</strong>. They remain unexamined by this report.</p>\n'
+fi
+
 printf '<h2>Methodology &amp; scope</h2>\n'
 printf '<p>VibeCheck orchestrates open-source scanners and consolidates their output. Passes run over the target directory; dynamic checks, when enabled, issue a single unauthenticated GET and a TLS handshake against the supplied URL — no payloads, no exploitation.</p>\n'
 printf '<div class="scope"><strong>This is an automated scan, not a penetration test.</strong> It detects known and mechanical issues: leaked credentials, vulnerable dependencies, insecure code patterns, misconfiguration, and missing transport controls. It does <strong>not</strong> detect business-logic flaws — broken access control, multi-tenant data leakage, authorisation bypasses, or insecure workflows — which require a human reviewer who understands the application&rsquo;s intent. Scanners also produce false positives; triage before acting.</div>\n'
