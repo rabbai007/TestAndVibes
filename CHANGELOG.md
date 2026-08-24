@@ -20,6 +20,16 @@ Opens AI/LLM security coverage — the first pass at testing the code that talks
   - **`llm-output-executed`** — a completion flowing (taint-tracked) into a shell / SQL / `eval` sink without validation; an allowlist/membership check on the value clears it.
   - **`llm-output-raw-html`** — model output into `innerHTML`/`outerHTML` (XSS via the model), sanitizer-aware (DOMPurify).
   - Provider-anchored (Anthropic / OpenAI shapes), and verified against a vulnerable fixture (all three fire) *and* a safe fixture (zero false positives, including the allowlist-gated exec) so the pack stays quiet on ordinary code.
+- **Dynamic MCP server probe (`--mcp`)** — connects to a running MCP server over
+  stdio (spawn) or streamable-HTTP, completes the JSON-RPC handshake, and
+  enumerates its tools / resources / prompts. It flags **tool-description
+  poisoning**, **unconstrained dangerous arguments** (`command`/`url`/`path`-type
+  string args with no allowed-values constraint), **secrets in metadata**, and —
+  over HTTP — acceptance of an **unauthenticated** session. It **never invokes a
+  tool** (metadata only), so it is non-destructive; an unreachable/uninitialisable
+  server is an ERROR (exit 3), not a clean pass. Verified against poisoned and
+  clean mock servers on both transports, authed vs unauthenticated, and the
+  fail-closed path.
 - **AI/MCP awareness in the reasoning `--review` pass** — three new finding
   classes (`prompt-injection`, `insecure-llm-output`, `mcp-tool-safety`) and an
   explicit, guarded AI/MCP lens in the review prompt: prompt injection via tool
@@ -34,7 +44,7 @@ Opens AI/LLM security coverage — the first pass at testing the code that talks
 
 ### Notes
 
-- These static rules complement the reasoning `--review` pass, which catches logic-level prompt injection a pattern can't. An **MCP server** scans like any codebase, and the `--review` pass now reasons about MCP tool-safety and prompt injection specifically. A *dynamic* MCP protocol probe (connecting to a running server to enumerate and test tools/resources/prompts) is the remaining follow-up.
+- These static rules complement the reasoning `--review` pass, which catches logic-level prompt injection a pattern can't. An **MCP server** scans like any codebase, and the `--review` pass now reasons about MCP tool-safety and prompt injection specifically. The `--mcp` probe adds the dynamic layer, connecting to a running server to enumerate and vet its tools/resources/prompts (read-only). Actively *calling* tools to test runtime behaviour is intentionally out of scope — it would be destructive.
 
 ## [0.5.2] — 2026-08-18
 

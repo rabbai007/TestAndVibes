@@ -45,6 +45,9 @@ REVIEW_EFFORT="high"
 REVIEW_BUDGET=200000    # max bytes of source sent for review
 REVIEW_SKEPTICS=2       # independent refutation attempts per finding
 FAIL_ON_REVIEW=0        # 1 = review findings count toward the exit code
+MCP_TARGET=""           # opt-in MCP server probe: URL (http/https) or a command to spawn (stdio)
+MCP_TIMEOUT=20          # seconds for the MCP handshake/list calls
+MCP_HEADER=""           # optional single HTTP header for an authed MCP endpoint (e.g. "Authorization: Bearer …")
 DO_PDF=0                # 1 = also render report.pdf (needs Chrome/wkhtmltopdf/weasyprint)
 DO_OPEN=0               # 1 = open the HTML report in the default browser
 DIFF_REF=""             # gate only on findings in files changed vs this git ref
@@ -101,6 +104,13 @@ OPTIONS
   --review-cmd CMD     Provider override: reads a prompt on stdin, writes the
                        model's text to stdout
   --fail-on-review     Let surviving review findings affect the exit code
+  --mcp TARGET         Probe a running MCP server (read-only): a URL (http/https)
+                       or a command to spawn for stdio. Enumerates tools/
+                       resources/prompts and flags tool poisoning, unconstrained
+                       dangerous args, secrets in metadata, and (HTTP) missing
+                       transport auth. NEVER invokes a tool.
+  --mcp-timeout N      MCP handshake timeout in seconds (default: 20)
+  --mcp-header H       One HTTP header for an authed MCP endpoint
   --pdf                Also render DIR/report.pdf (Chrome, wkhtmltopdf, or weasyprint)
   --open               Open the HTML report in your default browser when done
   --diff REF           PR mode: gate only on findings in files changed vs REF
@@ -261,6 +271,9 @@ while [ $# -gt 0 ]; do
     --review-skeptics) REVIEW_SKEPTICS="${2:?}"; shift 2;;
     --review-cmd) REVIEW_CMD="${2:?}"; shift 2;;
     --fail-on-review) FAIL_ON_REVIEW=1; shift;;
+    --mcp) MCP_TARGET="${2:?--mcp needs a URL or command}"; shift 2;;
+    --mcp-timeout) MCP_TIMEOUT="${2:?}"; shift 2;;
+    --mcp-header) MCP_HEADER="${2:?}"; shift 2;;
     --pdf) DO_PDF=1; shift;;
     --open) DO_OPEN=1; shift;;
     --diff) DIFF_REF="${2:?--diff needs a git ref}"; shift 2;;
@@ -1285,6 +1298,137 @@ PROMPT_R
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# 7. MCP server probe (opt-in, read-only)
+# ═══════════════════════════════════════════════════════════════════
+# Connects to a running MCP server, completes the JSON-RPC handshake, and
+# enumerates its declared tools / resources / prompts. It NEVER invokes a tool —
+# listing metadata only — so the probe stays non-destructive (calling a tool
+# could delete data, send mail, spend money). What it inspects is the attack
+# surface a server *advertises*: instruction-like text in tool descriptions
+# (tool poisoning / confused deputy), unconstrained dangerous arguments, secrets
+# leaked in metadata, and — over HTTP — whether an unauthenticated caller can
+# open a session at all.
+if [ -n "$MCP_TARGET" ]; then
+  head2 "7. MCP server probe (read-only) — $MCP_TARGET"
+  MRAW="$OUTDIR/.mcp-responses.jsonl"; : > "$MRAW"
+  mcp_ok=0; mcp_http=0; mcp_authed=0
+  [ -n "$MCP_HEADER" ] && mcp_authed=1
+
+  INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"vibecheck","version":"'"$VERSION"'"}}}'
+  case "$MCP_TARGET" in
+    http://*|https://*)
+      mcp_http=1
+      hdr_args=(-H "Content-Type: application/json" -H "Accept: application/json, text/event-stream")
+      [ -n "$MCP_HEADER" ] && hdr_args+=(-H "$MCP_HEADER")
+      # initialize — capture headers (for the session id) and body
+      ih="$OUTDIR/.mcp-init-hdr"; ib="$OUTDIR/.mcp-init-body"
+      curl -sS --max-time "$MCP_TIMEOUT" -D "$ih" -o "$ib" "${hdr_args[@]}" -X POST --data "$INIT" "$MCP_TARGET" >/dev/null 2>&1
+      cu=$?
+      sid="$(tr -d '\r' < "$ih" 2>/dev/null | awk -F': ' 'tolower($1)=="mcp-session-id"{print $2; exit}')"
+      # a response body may be raw JSON or an SSE "data:" frame — normalise
+      mcp_extract() { if jq -e . >/dev/null 2>&1 < "$1"; then cat "$1"; else grep '^data:' "$1" | sed 's/^data: *//' | head -1; fi; }
+      if [ "$cu" -ne 0 ] || ! mcp_extract "$ib" | jq -e '.result.protocolVersion // .result.serverInfo // .result.capabilities' >/dev/null 2>&1; then
+        pass_error mcp "could not initialize an MCP session at $MCP_TARGET (curl $cu) — NOT probed"
+      else
+        mcp_ok=1
+        mcp_http_call() { # method -> appends result object to MRAW
+          local m="$1" body resp
+          body="{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"$m\"}"
+          local sh=(); [ -n "$sid" ] && sh=(-H "Mcp-Session-Id: $sid")
+          resp="$OUTDIR/.mcp-r"; curl -sS --max-time "$MCP_TIMEOUT" -o "$resp" "${hdr_args[@]}" "${sh[@]}" -X POST --data "$body" "$MCP_TARGET" >/dev/null 2>&1
+          mcp_extract "$resp" | jq -c '.' 2>/dev/null >> "$MRAW"
+        }
+        mcp_http_call tools/list; mcp_http_call resources/list; mcp_http_call prompts/list
+      fi
+      ;;
+    *)
+      # stdio: spawn the command, feed newline-delimited JSON-RPC, read stdout.
+      # Portable watchdog (macOS has no `timeout`): background + kill.
+      reqs="$OUTDIR/.mcp-reqs.jsonl"; outp="$OUTDIR/.mcp-out.jsonl"
+      { printf '%s\n' "$INIT"
+        printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"resources/list"}'
+        printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"prompts/list"}'
+      } > "$reqs"
+      ( sh -c "$MCP_TARGET" < "$reqs" > "$outp" 2>/dev/null ) &
+      spid=$!
+      ( sleep "$MCP_TIMEOUT"; kill "$spid" 2>/dev/null ) & wpid=$!
+      disown "$wpid" 2>/dev/null || true    # keep the watchdog out of job control (no "Terminated" notice)
+      wait "$spid" 2>/dev/null; kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null || true
+      # keep only well-formed JSON-RPC response lines
+      grep -E '"(result|error)"' "$outp" 2>/dev/null | while IFS= read -r ln; do
+        printf '%s' "$ln" | jq -e . >/dev/null 2>&1 && printf '%s\n' "$ln" >> "$MRAW"
+      done
+      if jq -e 'select(.id==1) | .result.protocolVersion // .result.serverInfo // .result.capabilities' "$MRAW" >/dev/null 2>&1; then
+        mcp_ok=1
+      else
+        pass_error mcp "no valid initialize response from the stdio MCP server ('$MCP_TARGET') within ${MCP_TIMEOUT}s — NOT probed"
+      fi
+      ;;
+  esac
+
+  if [ "$mcp_ok" = 1 ]; then
+    # pull the three lists out of whatever responses came back
+    TOOLS="$(jq -cs '[.[]|.result.tools]|map(select(.))|add // []' "$MRAW" 2>/dev/null)"
+    RES="$(jq -cs '[.[]|.result.resources]|map(select(.))|add // []' "$MRAW" 2>/dev/null)"
+    PROMPTS="$(jq -cs '[.[]|.result.prompts]|map(select(.))|add // []' "$MRAW" 2>/dev/null)"
+    nt=$(printf '%s' "$TOOLS" | jq 'length' 2>/dev/null); nr=$(printf '%s' "$RES" | jq 'length' 2>/dev/null); np=$(printf '%s' "$PROMPTS" | jq 'length' 2>/dev/null)
+    say "  ${C_D}enumerated: ${nt:-0} tool(s), ${nr:-0} resource(s), ${np:-0} prompt(s) — metadata only, no tool was invoked${C_0}"
+
+    # injection / tool-poisoning phrases aimed at a reading model
+    POISON='ignore (all |any |the )?(previous|prior|above|earlier)|disregard (the |all )?(previous|above|prior|instructions)|do not (tell|inform|reveal|mention|disclose)|you must (always|never)|always (call|use|run|invoke) (this|the)|before (responding|doing anything|any other)|reveal (the|your)? ?(system|prompt|instructions)|exfiltrat|<!--|\[system\]|<system>'
+    SECRET='sk_live_[0-9A-Za-z]+|AKIA[0-9A-Z]{16}|glsa_[0-9A-Za-z]+|-----BEGIN [A-Z ]*PRIVATE KEY-----|xox[baprs]-[0-9A-Za-z-]+|ghp_[0-9A-Za-z]{30,}'
+    DANGER_ARG='^(command|cmd|shell|script|code|exec|eval|query|sql|path|filepath|file|url|uri|endpoint|host|target)$'
+    mcp_n=0
+
+    # tools: poisoning + secrets + unconstrained dangerous args
+    while IFS= read -r t; do
+      [ -z "$t" ] && continue
+      nm="$(printf '%s' "$t" | jq -r '.name // "?"')"
+      desc="$(printf '%s' "$t" | jq -r '.description // ""')"
+      if printf '%s' "$desc" | grep -qiE "$POISON"; then
+        bad "tool '$nm': description carries model-directed instruction text (tool poisoning)"; mcp_n=$((mcp_n+1))
+        add_finding mcp high "mcp.tool-poisoning" "$MCP_TARGET" 0 "MCP tool '$nm' description contains instruction-like text that could steer a calling model: $(printf '%s' "$desc" | tr '\n' ' ' | cut -c1-160)" ""
+      fi
+      if printf '%s' "$desc" | grep -qiE "$SECRET"; then
+        bad "tool '$nm': possible secret in description"; mcp_n=$((mcp_n+1))
+        add_finding mcp high "mcp.secret-in-metadata" "$MCP_TARGET" 0 "MCP tool '$nm' metadata appears to contain a credential" ""
+      fi
+      while IFS= read -r prop; do
+        [ -z "$prop" ] && continue
+        warn "tool '$nm': unconstrained argument '$prop' (potential shell/SQL/SSRF sink)"; mcp_n=$((mcp_n+1))
+        add_finding mcp medium "mcp.unconstrained-arg" "$MCP_TARGET" 0 "MCP tool '$nm' exposes an unconstrained '$prop' argument (string, no enum/allowed values) that could reach a shell/SQL/SSRF sink if the handler doesn't validate it" ""
+      done < <(printf '%s' "$t" | jq -r --arg re "$DANGER_ARG" '.inputSchema.properties // {} | to_entries[] | select((.key|ascii_downcase|test($re)) and (.value.enum|not) and ((.value.type//"string")=="string")) | .key' 2>/dev/null)
+    done < <(printf '%s' "$TOOLS" | jq -c '.[]?' 2>/dev/null)
+
+    # resources + prompts: poisoning + secrets in their descriptions
+    for coll in "$RES" "$PROMPTS"; do
+      while IFS= read -r item; do
+        [ -z "$item" ] && continue
+        nm="$(printf '%s' "$item" | jq -r '.name // .uri // "?"')"
+        desc="$(printf '%s' "$item" | jq -r '.description // ""')"
+        if printf '%s' "$desc" | grep -qiE "$POISON"; then
+          bad "'$nm': description carries model-directed instruction text (injection)"; mcp_n=$((mcp_n+1))
+          add_finding mcp high "mcp.content-injection" "$MCP_TARGET" 0 "MCP resource/prompt '$nm' description contains instruction-like text able to steer a calling model" ""
+        fi
+        printf '%s' "$desc" | grep -qiE "$SECRET" && { bad "'$nm': possible secret in metadata"; mcp_n=$((mcp_n+1)); add_finding mcp high "mcp.secret-in-metadata" "$MCP_TARGET" 0 "MCP resource/prompt '$nm' metadata appears to contain a credential" ""; }
+      done < <(printf '%s' "$coll" | jq -c '.[]?' 2>/dev/null)
+    done
+
+    # HTTP: an unauthenticated caller opened a session
+    if [ "$mcp_http" = 1 ] && [ "$mcp_authed" = 0 ]; then
+      bad "transport: server accepted an UNAUTHENTICATED MCP session over HTTP"; mcp_n=$((mcp_n+1))
+      add_finding mcp high "mcp.no-transport-auth" "$MCP_TARGET" 0 "The MCP endpoint completed initialize with no credentials — anyone who can reach it can enumerate and invoke its tools. Put it behind auth (bearer/OAuth/mTLS or a gateway)." ""
+    fi
+
+    [ "$mcp_n" -eq 0 ] && ok "MCP probe: no red flags in advertised tools/resources/prompts"
+    if [ "$mcp_n" -gt 0 ]; then set_status mcp findings "$mcp_n"; else set_status mcp ok "0 red flags"; fi
+  fi
+fi
+
+
+# ═══════════════════════════════════════════════════════════════════
 # baseline: split findings into active (gated) and accepted (suppressed)
 # ═══════════════════════════════════════════════════════════════════
 ERRORS=$(jq -s '[.[]|select(.status=="error")]|length' "$STATUS")
@@ -1415,7 +1559,7 @@ fi
 # A3: "no pass examined anything" is not a clean result. Disabling every scanner
 # — by flag or by config — used to yield 0 findings and exit 0, which is
 # indistinguishable from a repo with nothing wrong. An empty scan is unknown.
-EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","iac","dynamic","review"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
+EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","iac","dynamic","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
 if [ "${EXECUTED:-0}" -eq 0 ]; then
   pass_error coverage "no scan pass examined anything (all were skipped, disabled, or failed) — this result is unknown, not clean"
 fi
