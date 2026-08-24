@@ -1,0 +1,135 @@
+# VibeCheck AI / prompt-injection rules.
+#
+# Sinks specific to LLM-backed apps and MCP servers, mapping directly to the
+# AGENTS.md "AI / LLM features" rules and hardening/CHECKLIST.md section 7:
+#   1. untrusted input concatenated into a SYSTEM prompt  (prompt injection)
+#   2. LLM output executed as an action (shell / SQL / eval) without validation
+#   3. LLM output rendered as raw HTML  (XSS via the model)
+#
+# Deliberately narrow and provider-anchored (Anthropic / OpenAI shapes) so they
+# stay quiet on ordinary code — a supplementary pack that cries wolf gets
+# switched off. User input reaching the USER message is normal and NOT flagged;
+# only the system/instruction channel and post-generation action/render sinks
+# are. Verified against a vulnerable and a safe fixture.
+rules:
+  # 1) Request-controlled data interpolated into a SYSTEM prompt. The system
+  #    message is instructions, so untrusted text there is the classic escape
+  #    that lets a caller override the model's guardrails. (User-role content is
+  #    the normal place for user input and is intentionally not matched.)
+  - id: vibecheck-untrusted-input-in-system-prompt
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-1427: Improper Neutralization of Input Used for an LLM Prompt"
+      owasp: "LLM01:2025 Prompt Injection"
+      references:
+        - https://genai.owasp.org/llmrisk/llm01-prompt-injection/
+    message: >-
+      Request-controlled data is interpolated into an LLM SYSTEM prompt. The
+      system channel carries instructions, so untrusted text here is prompt
+      injection — the caller can override the model's guardrails. Put user data
+      in a user-role message, and delimit/sentinel-wrap it; never concatenate it
+      into the system prompt.
+    patterns:
+      - pattern-either:
+          - pattern: "system: `...${$REQ}...`"
+          - pattern: "system: $A + $REQ"
+          - pattern: "system: $A + $REQ + $B"
+          - pattern: '{role: "system", content: `...${$REQ}...`}'
+          - pattern: '{role: "system", content: $A + $REQ}'
+      - metavariable-pattern:
+          metavariable: $REQ
+          patterns:
+            - pattern-either:
+                - pattern: $R.body
+                - pattern: $R.body.$F
+                - pattern: $R.query
+                - pattern: $R.query.$F
+                - pattern: $R.params
+                - pattern: $R.params.$F
+                - pattern: $R.headers
+                - pattern: $R.headers.$F
+                - pattern: $R.rawHeaders
+
+  # 2) LLM output used as a dangerous action without validation. Model output is
+  #    attacker-influenceable (via prompt injection upstream), so executing it as
+  #    shell / SQL / eval is code or query execution from an untrusted source.
+  - id: vibecheck-llm-output-executed
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-94: Improper Control of Generation of Code (Code Injection)"
+      owasp: "LLM05:2025 Improper Output Handling"
+      references:
+        - https://genai.owasp.org/llmrisk/llm05-improper-output-handling/
+    message: >-
+      LLM output flows into a shell / SQL / eval sink without validation. Model
+      output is untrusted (a prompt-injected model returns whatever an attacker
+      steered it to); validate, allowlist, or sandbox before it becomes an
+      action. Never exec/query/eval a completion directly.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $C.messages.create(...)
+          - pattern: $C.chat.completions.create(...)
+          - pattern: $C.completions.create(...)
+          - pattern: $C.responses.create(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: $X.exec(...)
+              - pattern: $X.execSync(...)
+              - pattern: $X.spawn(...)
+              - pattern: $X.spawnSync(...)
+              - pattern: eval(...)
+              - pattern: $DB.query(...)
+              - pattern: $DB.raw(...)
+              - pattern: '$DB.$M`...`'
+
+    pattern-sanitizers:
+      # An allowlist/membership check on the value before use clears the taint —
+      # gating model output against a fixed set is the correct safe pattern.
+      - patterns:
+          - pattern: $CMD
+          - pattern-inside: 'if (<... $S.has($CMD) ...>) { ... }'
+      - patterns:
+          - pattern: $CMD
+          - pattern-inside: 'if (<... $A.includes($CMD) ...>) { ... }'
+      - patterns:
+          - pattern: $CMD
+          - pattern-inside: 'if (<... $A.indexOf($CMD) ...>) { ... }'
+      # explicit JSON parsing/validation is also a sanitizing boundary
+      - pattern: JSON.parse(...)
+
+  # 3) LLM output rendered as raw HTML -> XSS via the model. A prompt-injected
+  #    model can return markup/script; rendering it unsanitized is stored/reflected
+  #    XSS sourced from the completion. (React dangerouslySetInnerHTML is left to
+  #    the registry ruleset, which flags it generically.)
+  - id: vibecheck-llm-output-raw-html
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-79: Cross-site Scripting"
+      owasp: "LLM05:2025 Improper Output Handling"
+    message: >-
+      LLM output is rendered as raw HTML. A prompt-injected model can return
+      markup or <script>; sanitize with DOMPurify before rendering, or render as
+      text.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $C.messages.create(...)
+          - pattern: $C.chat.completions.create(...)
+          - pattern: $C.completions.create(...)
+          - pattern: $C.responses.create(...)
+    pattern-sinks:
+      - pattern-either:
+          - pattern: $EL.innerHTML = $SINK
+          - pattern: $EL.outerHTML = $SINK
+    pattern-sanitizers:
+      - pattern-either:
+          - pattern: $P.sanitize(...)
+          - pattern: DOMPurify.sanitize(...)

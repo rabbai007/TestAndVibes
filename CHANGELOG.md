@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.6.0] — 2026-08-24
+
+Opens AI/LLM security coverage — the first pass at testing the code that talks to models, including MCP servers.
+
+### Added
+
+- **AI / prompt-injection rule pack** ([`rules/vibecheck-ai.yml`](rules/vibecheck-ai.yml)) for the SAST pass, three deterministic rules mapping to `AGENTS.md` §AI/LLM and `hardening/CHECKLIST.md` §7:
+  - **`untrusted-input-in-system-prompt`** — request-controlled data interpolated into an LLM *system* prompt (prompt injection). User-role content is deliberately not matched — that's the normal place for user input.
+  - **`llm-output-executed`** — a completion flowing (taint-tracked) into a shell / SQL / `eval` sink without validation; an allowlist/membership check on the value clears it.
+  - **`llm-output-raw-html`** — model output into `innerHTML`/`outerHTML` (XSS via the model), sanitizer-aware (DOMPurify).
+  - Provider-anchored (Anthropic / OpenAI shapes), and verified against a vulnerable fixture (all three fire) *and* a safe fixture (zero false positives, including the allowlist-gated exec) so the pack stays quiet on ordinary code.
+- **Dynamic MCP server probe (`--mcp`)** — connects to a running MCP server over
+  stdio (spawn) or streamable-HTTP, completes the JSON-RPC handshake, and
+  enumerates its tools / resources / prompts. It flags **tool-description
+  poisoning**, **unconstrained dangerous arguments** (`command`/`url`/`path`-type
+  string args with no allowed-values constraint), **secrets in metadata**, and —
+  over HTTP — acceptance of an **unauthenticated** session. It **never invokes a
+  tool** (metadata only), so it is non-destructive; an unreachable/uninitialisable
+  server is an ERROR (exit 3), not a clean pass. Verified against poisoned and
+  clean mock servers on both transports, authed vs unauthenticated, and the
+  fail-closed path.
+- **AI/MCP awareness in the reasoning `--review` pass** — three new finding
+  classes (`prompt-injection`, `insecure-llm-output`, `mcp-tool-safety`) and an
+  explicit, guarded AI/MCP lens in the review prompt: prompt injection via tool
+  arguments / tool results / retrieved content escaping into the model's
+  instruction context, LLM-output-as-action, MCP tool-description poisoning
+  (confused deputy), unvalidated tool args reaching shell/SQL/SSRF, and missing
+  auth on the MCP transport. The lens is skipped on non-AI/non-MCP code so it
+  invents nothing there. Verified: on a minimal MCP server the pass emitted a
+  critical `mcp-tool-safety` finding for a tool argument flowing unvalidated into
+  a shell — a bug the static passes cannot see.
+- The SAST pass now loads **every pack in `rules/`** (not just `vibecheck-extra.yml`), so future packs are picked up without wiring changes. The tooling manifest reports the pack count.
+
+### Notes
+
+- These static rules complement the reasoning `--review` pass, which catches logic-level prompt injection a pattern can't. An **MCP server** scans like any codebase, and the `--review` pass now reasons about MCP tool-safety and prompt injection specifically. The `--mcp` probe adds the dynamic layer, connecting to a running server to enumerate and vet its tools/resources/prompts (read-only). Actively *calling* tools to test runtime behaviour is intentionally out of scope — it would be destructive.
+
 ## [0.5.2] — 2026-08-18
 
 ### Fixed

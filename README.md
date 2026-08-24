@@ -16,7 +16,7 @@ read-only dynamic** checks against a URL you control, and an optional
 | Pass | What it checks | Tool(s) |
 |------|----------------|---------|
 | 🔑 Secrets | Committed / working-tree credentials (verified only) | trufflehog, gitleaks |
-| 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) | semgrep + [`rules/`](rules/) |
+| 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) **+ AI/LLM prompt-injection** | semgrep + [`rules/`](rules/) |
 | 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) | trivy + osv-scanner + npm audit + grype |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
@@ -88,6 +88,9 @@ targets). No config required.
 | `--review-budget` | `200000` | Max bytes of source sent for review |
 | `--review-skeptics` | `2` | Independent refutation attempts per finding |
 | `--review-cmd CMD` | — | Provider override: prompt on stdin, text on stdout |
+| `--mcp TARGET` | — | Probe a running MCP server (read-only): URL or command to spawn |
+| `--mcp-timeout N` | `20` | MCP handshake timeout (seconds) |
+| `--mcp-header H` | — | One HTTP header for an authed MCP endpoint |
 | `--pdf` | — | Also render `report.pdf` (Chrome / wkhtmltopdf / weasyprint) |
 | `--open` | — | Open the HTML report in your browser when done |
 | `--diff REF` | — | PR mode: gate only on findings in files changed vs `REF` (implies `--base`) |
@@ -207,6 +210,23 @@ than "found something". A scheduled job that cries wolf gets muted.
 
 If you'd rather not store a key at all, the alternatives are a self-hosted model
 via `--review-cmd`, or just staying with the local pre-release run above.
+
+## AI / LLM & prompt-injection coverage
+
+The SAST pass ships a static rule pack ([`rules/vibecheck-ai.yml`](rules/vibecheck-ai.yml)) for the sinks that matter in LLM-backed apps and **MCP servers**, mapping to `AGENTS.md` §AI/LLM and `hardening/CHECKLIST.md` §7:
+
+- **Untrusted input in a system prompt** — request data concatenated into the `system` channel (prompt injection). User-role content is normal and is *not* flagged.
+- **LLM output executed** — a completion flowing into shell / SQL / `eval` without validation (an allowlist check clears it).
+- **LLM output as raw HTML** — model text into `innerHTML`/`outerHTML` (XSS via the model).
+
+These are deterministic and provider-anchored (Anthropic / OpenAI shapes), verified against vulnerable *and* safe fixtures so they stay quiet on ordinary code. They complement the reasoning `--review` pass, which now carries dedicated `prompt-injection`, `insecure-llm-output`, and `mcp-tool-safety` finding classes for the logic-level cases a regex can't reach — injection via tool arguments or retrieved content, MCP tool-description poisoning, and unvalidated tool args reaching a shell. An MCP server scans like any codebase at those two layers. On top of them, `--mcp` adds a **dynamic, read-only protocol probe**:
+
+```bash
+./vibecheck.sh --mcp "node build/server.js"      # stdio: spawn and probe
+./vibecheck.sh --mcp https://mcp.example.com/    # streamable-HTTP transport
+```
+
+It completes the JSON-RPC handshake, enumerates the server's **tools, resources, and prompts**, and flags **tool-description poisoning** (instruction text that could steer a calling model), **unconstrained dangerous arguments** (a `command`/`url`/`path` arg with no allowed-values constraint that could reach a shell/SQL/SSRF sink), **secrets in metadata**, and — over HTTP — a server that accepts an **unauthenticated** session. It **never invokes a tool** — listing metadata only — so it stays non-destructive. A missing/unreachable server is an ERROR (exit 3), not a clean pass.
 
 ## What this scan cannot see
 
