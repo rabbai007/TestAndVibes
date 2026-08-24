@@ -216,7 +216,7 @@ The SAST pass ships a static rule pack ([`rules/vibecheck-ai.yml`](rules/vibeche
 - **LLM output executed** — a completion flowing into shell / SQL / `eval` without validation (an allowlist check clears it).
 - **LLM output as raw HTML** — model text into `innerHTML`/`outerHTML` (XSS via the model).
 
-These are deterministic and provider-anchored (Anthropic / OpenAI shapes), verified against vulnerable *and* safe fixtures so they stay quiet on ordinary code. They complement — not replace — the reasoning `--review` pass, which catches logic-level prompt-injection a regex can't. An MCP server scans like any other codebase; protocol-level MCP threats (tool-description poisoning, tool-arg injection) are on the roadmap, not yet covered.
+These are deterministic and provider-anchored (Anthropic / OpenAI shapes), verified against vulnerable *and* safe fixtures so they stay quiet on ordinary code. They complement the reasoning `--review` pass, which now carries dedicated `prompt-injection`, `insecure-llm-output`, and `mcp-tool-safety` finding classes for the logic-level cases a regex can't reach — injection via tool arguments or retrieved content, MCP tool-description poisoning, and unvalidated tool args reaching a shell. An MCP server scans like any codebase; a *dynamic* MCP protocol probe is the remaining roadmap item.
 
 ## What this scan cannot see
 

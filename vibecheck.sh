@@ -1170,6 +1170,17 @@ matcher cannot reach:
   - a required control that is simply ABSENT (no rate limit, no ownership check)
   - semantics that are each fine but wrong in combination (a cache TTL that
     outlives a revocation, say)
+  - AI/LLM & MCP — ONLY if this code calls an LLM or implements an MCP server;
+    otherwise skip this bullet entirely and invent nothing:
+      * untrusted input (incl. tool arguments, tool results, retrieved documents,
+        or resource content) escaping into the model's system/instruction
+        context — prompt injection
+      * LLM output used as an action (shell, SQL, tool call, file path, URL)
+        without validation
+      * MCP tool/resource/prompt descriptions that carry instruction-like text
+        able to steer a calling model — tool poisoning / confused deputy
+      * tool arguments reaching shell/SQL/SSRF sinks, missing auth on the MCP
+        transport, over-broad tool scope, or secrets returned in tool output
 
 Do NOT report: missing SRI, dependency CVEs, hardcoded secrets, generic input
 validation, style, or anything a regex would catch. Those are already covered.
@@ -1190,6 +1201,7 @@ Respond with ONLY a JSON array, no prose before or after. Each element:
   "class": one of: broken-access-control, tenant-isolation, object-lifecycle,
            race-condition, missing-control, auth-session, trust-boundary,
            resource-exhaustion, data-exposure, logic-error,
+           prompt-injection, insecure-llm-output, mcp-tool-safety,
   "file": "path exactly as shown in its FILE header",
   "line": <integer, best estimate>,
   "anchor": "<the single most relevant line of code, verbatim>",
