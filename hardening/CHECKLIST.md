@@ -59,6 +59,14 @@ Legend: `[ ]` to review · focus on **the ones marked ★** — they're the clas
 - [ ] No PII/PHI sent to third-party model APIs without a BAA / DPA and a clear data-flow.
 - [ ] Per-user/per-org rate + cost limits on model calls.
 
+## 8. MCP servers (if you expose one) ★
+- [ ] ★ Every tool argument is validated/allowlisted before it reaches a shell, SQL query, file path, or outbound URL. A tool taking a free-form `command`/`path`/`url` is remote code / SSRF waiting to happen — constrain it (enum, schema, allowlist) or don't expose it.
+- [ ] ★ The transport is authenticated (bearer/OAuth/mTLS, or behind a gateway). An MCP server that accepts an unauthenticated session lets anyone who can reach it enumerate and **call** your tools.
+- [ ] Tool / resource / prompt **descriptions carry no instruction-like text** aimed at the calling model ("always call…", "ignore previous…", hidden directives). That's tool poisoning / confused deputy — the model reads descriptions as guidance.
+- [ ] Tool **results and resource content are treated as untrusted** when fed back to a model — they can carry injected instructions just like user input.
+- [ ] Tools are **least-privilege**: scoped to what the feature needs, not a general `exec`/`fetch`/`read_file` primitive. Destructive tools require explicit confirmation.
+- [ ] No secrets in tool metadata, schemas, or results (they surface in the model's context and logs).
+
 ---
 *Companion to [VibeCheck](../README.md). Manual review by a human who understands
 the app's intent — that's the part no scanner replaces.*

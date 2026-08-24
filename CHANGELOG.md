@@ -23,6 +23,16 @@ _Nothing yet._
   including allowlist-gated `subprocess.run` and user input kept in the user
   message). The raw-HTML rule stays JS/TS-only — LLM-output-to-HTML is rare and
   false-positive-prone server-side in Python.
+- **MCP coverage across the prevent and verify layers**, completing the three-layer
+  model for MCP (detect shipped in 0.6.0 as the AI rules + the `--mcp` probe):
+  - `AGENTS.md` gains an **MCP servers** rule block — validate/allowlist tool
+    arguments before shell/SQL/URL sinks, authenticate the transport, keep
+    instruction text and secrets out of tool descriptions, treat tool results as
+    untrusted, scope tools least-privilege.
+  - `hardening/CHECKLIST.md` gains **§8 MCP servers** with the matching manual
+    checks. Because the `--review` pass ingests the checklist, the reasoning
+    review now asks these MCP questions automatically (verified: the new items
+    appear in the generated review prompt).
 
 ## [0.6.0] — 2026-08-24
 

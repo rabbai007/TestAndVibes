@@ -72,6 +72,18 @@ human). Keep all three.
 - Don't send PII/PHI to third-party model APIs without the right data
   agreement, and rate/cost-limit model calls per user.
 
+### MCP servers
+- Validate and allowlist every tool argument before it reaches a shell, SQL
+  query, file path, or outbound URL. Never expose a tool that takes a free-form
+  `command`/`path`/`url` and passes it to a sink unchecked (RCE / SSRF).
+- Authenticate the transport (bearer/OAuth/mTLS or a gateway). Do not accept
+  unauthenticated MCP sessions — that hands callers your whole toolset.
+- Keep instruction-like text and secrets out of tool/resource/prompt
+  descriptions; a calling model reads them as guidance (tool poisoning).
+- Treat tool results and resource content as untrusted input to the model — they
+  can carry injected instructions. Scope tools least-privilege; gate destructive
+  ones behind explicit confirmation.
+
 ## When you finish a feature
 Before saying it's done, self-review against the rules above and note any you
 could not satisfy. If the change touches auth, tenancy, data access, uploads,
