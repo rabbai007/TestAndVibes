@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.6.1] — 2026-08-24
+
+### Added
+
+- **Python coverage for the AI/prompt-injection rules.** The two core rules —
+  request data into an LLM *system* prompt, and LLM output flowing into a
+  shell/SQL/`eval` sink — now run on Python (Flask/FastAPI/Django request
+  sources; Anthropic/OpenAI Python SDKs), not just JavaScript/TypeScript. The
+  `llm-output-executed` rule is taint-tracked with an allowlist-membership
+  sanitizer, mirroring the JS/TS behaviour. Verified against a Python vulnerable
+  fixture (all three occurrences fire) and a safe fixture (zero false positives,
+  including allowlist-gated `subprocess.run` and user input kept in the user
+  message). The raw-HTML rule stays JS/TS-only — LLM-output-to-HTML is rare and
+  false-positive-prone server-side in Python.
+
 ## [0.6.0] — 2026-08-24
 
 Opens AI/LLM security coverage — the first pass at testing the code that talks to models, including MCP servers.
