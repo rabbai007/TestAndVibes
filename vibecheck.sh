@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.5.2"
+VERSION="0.6.0"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -456,8 +456,8 @@ tool_ver grype      deps    grype version
 tool_ver npm        deps    npm --version
 tool_ver jq         core    jq --version
 jq -cn --arg r "$SEMGREP_CONFIG" '{tool:"semgrep-ruleset", pass:"sast", version:$r, installed:true}' >> "$TOOLING"
-jq -cn --arg e "$([ -f "$SELF_DIR/rules/vibecheck-extra.yml" ] && echo present || echo missing)" \
-  '{tool:"vibecheck-extra-rules", pass:"sast", version:$e, installed:($e=="present")}' >> "$TOOLING"
+jq -cn --arg n "$(ls "$SELF_DIR"/rules/*.yml 2>/dev/null | wc -l | tr -d ' ')" \
+  '{tool:"vibecheck-rule-packs", pass:"sast", version:($n + " pack(s)"), installed:(($n|tonumber) > 0)}' >> "$TOOLING"
 
 # ── stack detection ──
 head2 "Stack detection"
@@ -611,9 +611,11 @@ elif have semgrep; then
   # cover framework sinks (express res.send) but not raw node http with a
   # template literal, which is what hand-rolled servers actually use. Added
   # because an adversarial review found exactly those while `auto` said clean.
-  EXTRA_RULES="$SELF_DIR/rules/vibecheck-extra.yml"
-  if [ -f "$EXTRA_RULES" ]; then sg_args+=("--config=$EXTRA_RULES"); RULESET_EXTRA=1; else
-    warn "supplementary rule pack not found at $EXTRA_RULES — registry rules only"; fi
+  # Load every pack in rules/ (vibecheck-extra.yml, vibecheck-ai.yml, …) so new
+  # packs are picked up without touching this wiring.
+  EXTRA_RULES_DIR="$SELF_DIR/rules"
+  if ls "$EXTRA_RULES_DIR"/*.yml >/dev/null 2>&1; then sg_args+=("--config=$EXTRA_RULES_DIR"); RULESET_EXTRA=1; else
+    warn "supplementary rule packs not found in $EXTRA_RULES_DIR — registry rules only"; fi
   for e in "${EXCLUDES[@]}"; do sg_args+=("--exclude=$e"); done
   semgrep "${sg_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.semgrep.err"; sg_rc=$?
   # semgrep: 0 = no findings, 1 = findings, >1 = error. A crashed/offline

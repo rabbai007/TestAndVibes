@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.6.0] — 2026-08-24
+
+Opens AI/LLM security coverage — the first pass at testing the code that talks to models, including MCP servers.
+
+### Added
+
+- **AI / prompt-injection rule pack** ([`rules/vibecheck-ai.yml`](rules/vibecheck-ai.yml)) for the SAST pass, three deterministic rules mapping to `AGENTS.md` §AI/LLM and `hardening/CHECKLIST.md` §7:
+  - **`untrusted-input-in-system-prompt`** — request-controlled data interpolated into an LLM *system* prompt (prompt injection). User-role content is deliberately not matched — that's the normal place for user input.
+  - **`llm-output-executed`** — a completion flowing (taint-tracked) into a shell / SQL / `eval` sink without validation; an allowlist/membership check on the value clears it.
+  - **`llm-output-raw-html`** — model output into `innerHTML`/`outerHTML` (XSS via the model), sanitizer-aware (DOMPurify).
+  - Provider-anchored (Anthropic / OpenAI shapes), and verified against a vulnerable fixture (all three fire) *and* a safe fixture (zero false positives, including the allowlist-gated exec) so the pack stays quiet on ordinary code.
+- The SAST pass now loads **every pack in `rules/`** (not just `vibecheck-extra.yml`), so future packs are picked up without wiring changes. The tooling manifest reports the pack count.
+
+### Notes
+
+- These static rules complement the reasoning `--review` pass, which catches logic-level prompt injection a pattern can't. An **MCP server** scans like any other codebase; MCP *protocol*-level threats (tool-description poisoning, tool-argument injection, results-as-injection) are not yet covered — planned as a follow-up.
+
 ## [0.5.2] — 2026-08-18
 
 ### Fixed
