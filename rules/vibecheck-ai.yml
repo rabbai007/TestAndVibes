@@ -133,3 +133,83 @@ rules:
       - pattern-either:
           - pattern: $P.sanitize(...)
           - pattern: DOMPurify.sanitize(...)
+
+  # ── Python equivalents (Flask/FastAPI/Django request sources; Anthropic/OpenAI
+  #    Python SDKs). Same two core sinks as the JS/TS rules above. ──
+
+  - id: vibecheck-untrusted-input-in-system-prompt-py
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-1427: Improper Neutralization of Input Used for an LLM Prompt"
+      owasp: "LLM01:2025 Prompt Injection"
+    message: >-
+      Request-controlled data is interpolated into an LLM SYSTEM prompt (prompt
+      injection). Put user data in a user-role message and delimit/sentinel-wrap
+      it; never build the system prompt out of untrusted input.
+    patterns:
+      - pattern-either:
+          # Anthropic system kwarg — anchored inside the create() call, because a
+          # bare `system=…` kwarg is not a standalone Python pattern.
+          - pattern: '$C.messages.create(..., system=f"...{$REQ}...", ...)'
+          - pattern: '$C.messages.create(..., system=$A + $REQ, ...)'
+          # system-role message (OpenAI and Anthropic message lists)
+          - pattern: '{"role": "system", "content": f"...{$REQ}..."}'
+          - pattern: '{"role": "system", "content": $A + $REQ}'
+      - metavariable-pattern:
+          metavariable: $REQ
+          patterns:
+            - pattern-either:
+                - pattern: request.json
+                - pattern: request.json[...]
+                - pattern: request.get_json(...)
+                - pattern: request.args
+                - pattern: request.args.get(...)
+                - pattern: request.args[...]
+                - pattern: request.form
+                - pattern: request.form.get(...)
+                - pattern: request.form[...]
+                - pattern: request.values[...]
+                - pattern: request.data
+                - pattern: request.GET[...]
+                - pattern: request.POST[...]
+                - pattern: request.query_params[...]
+
+  - id: vibecheck-llm-output-executed-py
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-94: Improper Control of Generation of Code (Code Injection)"
+      owasp: "LLM05:2025 Improper Output Handling"
+    message: >-
+      LLM output flows into a shell / SQL / eval sink without validation. Model
+      output is untrusted; validate, allowlist, or sandbox before it becomes an
+      action.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $C.messages.create(...)
+          - pattern: $C.chat.completions.create(...)
+          - pattern: $C.completions.create(...)
+          - pattern: $C.responses.create(...)
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: os.system(...)
+              - pattern: os.popen(...)
+              - pattern: subprocess.run(...)
+              - pattern: subprocess.call(...)
+              - pattern: subprocess.check_output(...)
+              - pattern: subprocess.Popen(...)
+              - pattern: eval(...)
+              - pattern: exec(...)
+              - pattern: $CUR.execute(...)
+    pattern-sanitizers:
+      - patterns:
+          - pattern: $CMD
+          - pattern-inside: |
+              if $CMD in $ALLOWED:
+                  ...
+      - pattern: json.loads(...)

@@ -219,7 +219,7 @@ The SAST pass ships a static rule pack ([`rules/vibecheck-ai.yml`](rules/vibeche
 - **LLM output executed** — a completion flowing into shell / SQL / `eval` without validation (an allowlist check clears it).
 - **LLM output as raw HTML** — model text into `innerHTML`/`outerHTML` (XSS via the model).
 
-These are deterministic and provider-anchored (Anthropic / OpenAI shapes), verified against vulnerable *and* safe fixtures so they stay quiet on ordinary code. They complement the reasoning `--review` pass, which now carries dedicated `prompt-injection`, `insecure-llm-output`, and `mcp-tool-safety` finding classes for the logic-level cases a regex can't reach — injection via tool arguments or retrieved content, MCP tool-description poisoning, and unvalidated tool args reaching a shell. An MCP server scans like any codebase at those two layers. On top of them, `--mcp` adds a **dynamic, read-only protocol probe**:
+These are deterministic and provider-anchored (Anthropic / OpenAI shapes), cover **JavaScript/TypeScript and Python** (the input-in-system-prompt and LLM-output-executed rules), and are verified against vulnerable *and* safe fixtures so they stay quiet on ordinary code. They complement the reasoning `--review` pass, which now carries dedicated `prompt-injection`, `insecure-llm-output`, and `mcp-tool-safety` finding classes for the logic-level cases a regex can't reach — injection via tool arguments or retrieved content, MCP tool-description poisoning, and unvalidated tool args reaching a shell. An MCP server scans like any codebase at those two layers. On top of them, `--mcp` adds a **dynamic, read-only protocol probe**:
 
 ```bash
 ./vibecheck.sh --mcp "node build/server.js"      # stdio: spawn and probe
