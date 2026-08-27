@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.7.1] — 2026-08-27
+
+Administrative re-release of 0.7.0 on a clean commit. **No functional change** —
+the rules, fixtures, and behaviour are identical to 0.7.0. The 0.7.0 tag was
+retired and is not published; use 0.7.1. See the 0.7.0 entry below for the
+actual feature changes.
+
 ## [0.7.0] — 2026-08-27
 
 ### Added
