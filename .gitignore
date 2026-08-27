@@ -7,3 +7,9 @@ vibecheck-report/
 # silently excluded the workflow from commits.
 /vibecheck.yml
 /.vibecheckignore
+
+# Local, intentionally-vulnerable rule fixtures used to verify the rules/ packs
+# during development. Not committed: they would trip the repo's own self-scan
+# (the AI rules fire on them by design). Verify with an explicit-path scan, e.g.
+#   semgrep scan --config rules/vibecheck-ai.yml --no-git-ignore rule-samples/*
+/rule-samples/

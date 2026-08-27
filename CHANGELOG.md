@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.7.0] — 2026-08-27
+
+### Added
+
+- **The AI / prompt-injection rules now cover Go, Ruby, Java, C# and PHP**, not
+  just JavaScript/TypeScript and Python. The two core rules — request data
+  flowing into an LLM *system* prompt (`LLM01`), and LLM output flowing into a
+  shell/SQL/`eval` sink (`LLM05`) — are defined for all seven language groups,
+  each anchored to the real SDK and framework shapes (Anthropic/OpenAI SDKs,
+  LangChain4j, Semantic Kernel, `openai-php`, `ruby-openai`) and that language's
+  request sources, so they stay quiet on ordinary code. The `llm-output-executed`
+  rules are taint-tracked.
+- **The raw-HTML rule (LLM output rendered as markup, `LLM05`) gains Python,
+  Ruby, C# and PHP.** It is defined only where a server-side "trust this string
+  as HTML" sink is crisp and idiomatic — `HTMLResponse`/`render_template_string`/
+  `mark_safe`/`Markup`, `raw`/`.html_safe`, `Html.Raw`/`HtmlString`/`Response.Write`,
+  `echo`/`print`. Go and Java are deliberately omitted: they render HTML
+  template-side (Go `html/template`, Thymeleaf `th:utext`), out of a `.go`/`.java`
+  file's reach.
+- **FastAPI / Starlette request sources** added to the Python system-prompt rule
+  (`request.query_params`, `request.path_params`, `request.headers`,
+  `request.cookies`), so FastAPI apps and Python MCP servers are covered, not
+  just Flask/Django.
+
+Every rule is verified against a vulnerable + safe fixture per language (23
+intended detections fire, zero false positives on the safe cases, zero parse
+errors). The pack now carries 19 AI rules across 7 language groups.
+
+> Heads-up for existing users: new `ERROR`-severity rules can surface findings in
+> code that previously scanned clean — expected for added coverage, not a
+> regression. Triage or baseline as usual.
+
 ## [0.6.1] — 2026-08-24
 
 ### Added
