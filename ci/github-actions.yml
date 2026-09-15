@@ -18,9 +18,9 @@ jobs:
   vibecheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { fetch-depth: 0 }        # full history for secret scanning
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - run: pipx install semgrep
       - uses: aquasecurity/setup-trivy@v0.3.1    # trivy on PATH — no curl|sh
@@ -47,12 +47,12 @@ jobs:
 
       # Upload even when the gate fails, so findings land in the Security tab.
       - name: Upload SARIF to Code Scanning
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: vibecheck-report/vibecheck.sarif
           category: vibecheck
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with: { name: vibecheck-report, path: vibecheck-report/ }

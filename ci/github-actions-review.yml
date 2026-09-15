@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: jq --version || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
 
       - name: Check the provider is configured
@@ -55,7 +55,7 @@ jobs:
           ./vibecheck.sh --review --review-effort high --review-skeptics 2 \
             --skip-secrets --skip-sast --skip-deps --skip-iac --fail-on never
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: vibecheck-review-report
