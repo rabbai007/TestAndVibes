@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.8.0] — 2026-09-15
+
+The release reframes VibeCheck around a **deep pre-release read** rather than a
+pattern-only gate, and closes the credibility gap in the rule packs.
+
+### Changed
+
+- **The adversarial review pass now runs by default.** A default `./vibecheck.sh`
+  run performs the four pattern passes *and* the reasoning pass. When no model
+  provider is configured the review **skips gracefully** — the rest of the scan
+  still runs and a provider-less CI job is not reddened. An *explicit* `--review`
+  with no provider remains a fail-closed **ERROR (exit 3)**, so an intended review
+  can never be silently absent. The pass stays **report-only** unless
+  `--fail-on-review` is set, so turning it on by default does not newly redden any
+  build.
+- **PDF output is now default-on.** A default run renders `report.pdf` alongside
+  the Markdown/HTML/SARIF outputs, warning (not failing) if no renderer
+  (Chrome / wkhtmltopdf / weasyprint) is present.
+
+### Added
+
+- **`tests/ai-fixtures/` — a real `semgrep --test` harness for every rule.** The
+  rule-pack header long claimed each rule was proven by a vulnerable + safe
+  fixture; that harness now exists. 22 rules across seven languages are verified
+  with `semgrep --test --config rules/ tests/ai-fixtures` and **gated in CI** — a
+  rule cannot ship unless it provably fires on the bad case and stays quiet on the
+  good one.
+- **`--no-review`** and **`--no-pdf`** to opt out of the new defaults.
+- **`--exclude PATH`** (repeatable) to exclude paths from scanning. It is
+  operator-trusted — unlike config/ignore/baseline it is honoured even under
+  `--base`/`--diff`, so CI can exclude the intentionally-vulnerable rule fixtures
+  from the self-scan without a base-ref round-trip.
+
+### CI / templates
+
+- The live self-scan workflow verifies the rule packs (`semgrep --test`) before
+  scanning, and runs the self-scan with `--no-review --no-pdf --exclude tests`.
+- The copy-paste per-PR templates (`ci/github-actions.yml`,
+  `ci/gitlab-ci.snippet.yml`) pass `--no-review --no-pdf`: the per-PR gate is the
+  four pattern passes, with the review pass belonging in the nightly /
+  pre-release job where a provider is configured.
+
 ## [0.7.1] — 2026-08-27
 
 Administrative re-release of 0.7.0 on a clean commit. **No functional change** —

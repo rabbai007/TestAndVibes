@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.7.1"
+VERSION="0.8.0"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -38,7 +38,9 @@ SELF_INSTALL=0
 SEMGREP_CONFIG="auto"
 SECRETS_STRICT=0        # 1 = unverified secrets count as high, not medium
 DO_SECRETS=1; DO_SAST=1; DO_DEPS=1; DO_IAC=1
-DO_REVIEW=0             # 1 = run the adversarial review pass (needs a model provider)
+DO_REVIEW=1             # default ON (deep review scope); degrades to a skip when no provider
+REVIEW_EXPLICIT=0        # 1 = user passed --review (then no-provider fails closed, not skips)
+EXTRA_EXCLUDES=()        # --exclude PATH (repeatable): operator-trusted, added to scan excludes
 REVIEW_CMD="${VIBECHECK_REVIEW_CMD:-}"   # override: reads a prompt on stdin, writes JSON to stdout
 REVIEW_MODEL="claude-opus-5"
 REVIEW_EFFORT="high"
@@ -48,7 +50,7 @@ FAIL_ON_REVIEW=0        # 1 = review findings count toward the exit code
 MCP_TARGET=""           # opt-in MCP server probe: URL (http/https) or a command to spawn (stdio)
 MCP_TIMEOUT=20          # seconds for the MCP handshake/list calls
 MCP_HEADER=""           # optional single HTTP header for an authed MCP endpoint (e.g. "Authorization: Bearer …")
-DO_PDF=0                # 1 = also render report.pdf (needs Chrome/wkhtmltopdf/weasyprint)
+DO_PDF=1                # default ON: render report.pdf (degrades to a warning if no renderer)
 DO_OPEN=0               # 1 = open the HTML report in the default browser
 DIFF_REF=""             # gate only on findings in files changed vs this git ref
 BASE_REF=""             # trusted git ref to read config/ignore/baseline from
@@ -95,8 +97,10 @@ OPTIONS
   --skip-iac           Skip the IaC pass
   --review             Adversarial review pass: an LLM reasons about trust
                        boundaries, lifecycle and logic — the classes no scanner
-                       can reach. REPORT-ONLY by default. Needs ANTHROPIC_API_KEY,
-                       the `claude` CLI, or --review-cmd.
+                       can reach. ON BY DEFAULT and REPORT-ONLY. Needs
+                       ANTHROPIC_API_KEY, the `claude` CLI, or --review-cmd; with
+                       no provider it is skipped (an explicit --review errors).
+  --no-review          Disable the default adversarial review pass
   --review-model M     Model for the review (default: claude-opus-5)
   --review-effort E    low|medium|high|xhigh|max (default: high)
   --review-budget N    Max bytes of source to send (default: 200000)
@@ -111,8 +115,11 @@ OPTIONS
                        transport auth. NEVER invokes a tool.
   --mcp-timeout N      MCP handshake timeout in seconds (default: 20)
   --mcp-header H       One HTTP header for an authed MCP endpoint
-  --pdf                Also render DIR/report.pdf (Chrome, wkhtmltopdf, or weasyprint)
+  --pdf                Render DIR/report.pdf (Chrome, wkhtmltopdf, or weasyprint).
+                       ON BY DEFAULT; warns if no renderer is present.
+  --no-pdf             Disable the default PDF render
   --open               Open the HTML report in your default browser when done
+  --exclude PATH       Exclude a path from scanning (repeatable; operator-trusted)
   --diff REF           PR mode: gate only on findings in files changed vs REF
                        (e.g. --diff origin/main). Findings elsewhere are still
                        reported. Run a full scan on your default branch too.
@@ -264,7 +271,8 @@ while [ $# -gt 0 ]; do
     --skip-sast) DO_SAST=0; shift;;
     --skip-deps) DO_DEPS=0; shift;;
     --skip-iac) DO_IAC=0; shift;;
-    --review) DO_REVIEW=1; shift;;
+    --review) DO_REVIEW=1; REVIEW_EXPLICIT=1; shift;;
+    --no-review) DO_REVIEW=0; shift;;
     --review-model) REVIEW_MODEL="${2:?}"; shift 2;;
     --review-effort) REVIEW_EFFORT="${2:?}"; shift 2;;
     --review-budget) REVIEW_BUDGET="${2:?}"; shift 2;;
@@ -275,6 +283,8 @@ while [ $# -gt 0 ]; do
     --mcp-timeout) MCP_TIMEOUT="${2:?}"; shift 2;;
     --mcp-header) MCP_HEADER="${2:?}"; shift 2;;
     --pdf) DO_PDF=1; shift;;
+    --no-pdf) DO_PDF=0; shift;;
+    --exclude) EXTRA_EXCLUDES+=("${2:?--exclude needs a path}"); shift 2;;
     --open) DO_OPEN=1; shift;;
     --diff) DIFF_REF="${2:?--diff needs a git ref}"; shift 2;;
     --base) BASE_REF="${2:?--base needs a git ref}"; shift 2;;
@@ -426,6 +436,9 @@ if [ -n "$IGNORE_FILE" ]; then
 else
   EXCLUDES=(node_modules dist build vendor .git coverage .venv target)
 fi
+# CLI --exclude paths are operator-controlled (same trust as --skip-*), so they
+# apply even under --base, unlike the in-tree ignore file read from the base ref.
+if [ "${#EXTRA_EXCLUDES[@]}" -gt 0 ]; then EXCLUDES+=("${EXTRA_EXCLUDES[@]}"); fi
 # regex file for trufflehog --exclude-paths
 TH_EXCLUDE="$OUTDIR/.th-exclude"
 : > "$TH_EXCLUDE"
@@ -1129,9 +1142,15 @@ if [ "$DO_REVIEW" = 1 ]; then
   }
 
   if [ -z "$RV_MODE" ]; then
-    # --review was requested and could not run. Staying quiet would read as
-    # "reviewed, found nothing".
-    pass_error review "--review requested but no provider available (set ANTHROPIC_API_KEY, install the claude CLI, or pass --review-cmd) - NOT reviewed"
+    if [ "$REVIEW_EXPLICIT" = 1 ]; then
+      # Explicitly requested -> fail closed. "reviewed, found nothing" would be a lie.
+      pass_error review "--review requested but no provider available (set ANTHROPIC_API_KEY, install the claude CLI, or pass --review-cmd) - NOT reviewed"
+    else
+      # On by default -> degrade gracefully so provider-less runs (most CI) still
+      # work. The report records that the deep review did not run.
+      skip "adversarial review" "no model provider — set ANTHROPIC_API_KEY, install the claude CLI, or pass --review-cmd (or --no-review to silence)"
+      set_status review skipped "no provider (default review skipped)"
+    fi
   else
     say "  ${C_D}provider: $RV_MODE  model: $REVIEW_MODEL  effort: $REVIEW_EFFORT${C_0}"
 

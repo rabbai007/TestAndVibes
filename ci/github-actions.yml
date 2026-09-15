@@ -38,8 +38,12 @@ jobs:
       # Exit 3 means an area was NOT scanned — treat it as a real failure, not
       # noise. If a pass legitimately cannot run here, skip it explicitly
       # (--skip-deps etc.) rather than passing --no-fail-on-error.
+      # --no-review --no-pdf: this per-PR gate is the four pattern passes only.
+      # The review pass is default-on but belongs in the nightly / pre-release
+      # job (github-actions-review.yml) where a provider is configured; the PDF
+      # render has no reader in CI. Drop these flags if you wire up a provider.
       - name: Run VibeCheck
-        run: ./TestAndVibes/vibecheck.sh --fail-on high
+        run: ./TestAndVibes/vibecheck.sh --fail-on high --no-review --no-pdf
 
       # Upload even when the gate fails, so findings land in the Security tab.
       - name: Upload SARIF to Code Scanning

@@ -18,7 +18,9 @@ vibecheck:
   script:
     # Exit codes: 0 clean · 1 findings over threshold · 2 usage error
     #             3 a pass could not complete (fail-closed — an area was NOT scanned)
-    - ./TestAndVibes/vibecheck.sh --fail-on high
+    # --no-review --no-pdf: pattern passes only for the per-pipeline gate. The
+    # review pass (default-on) needs a provider; run it in a scheduled job.
+    - ./TestAndVibes/vibecheck.sh --fail-on high --no-review --no-pdf
   artifacts:
     when: always
     paths: [vibecheck-report/]
