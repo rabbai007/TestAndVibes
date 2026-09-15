@@ -20,7 +20,7 @@ read-only dynamic** checks against a URL you control, and an optional
 | 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) | trivy + osv-scanner + npm audit + grype |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
-| 🧭 Review *(opt-in)* | Access control, tenant isolation, lifecycle, races, missing controls | an LLM (`--review`) |
+| 🧭 Review *(default; needs a provider)* | Access control, tenant isolation, lifecycle, races, missing controls, prompt injection | an LLM |
 
 > **Not a replacement for a professional penetration test.** This is automated
 > baseline hardening + regression prevention. For production systems handling
@@ -81,7 +81,8 @@ targets). No config required.
 | `--semgrep-config X` | `auto` | Semgrep ruleset; `p/ci` avoids the network |
 | `--secrets-strict` | — | Rate unverified secrets high instead of medium |
 | `--skip-secrets`/`-sast`/`-deps`/`-iac` | — | Explicitly skip a pass (recorded as *skipped*) |
-| `--review` | — | Adversarial reasoning pass (**report-only** by default) |
+| `--review` | **on** | Adversarial reasoning pass (report-only). Runs by default when a provider exists; **skips** if none. |
+| `--no-review` | — | Turn the review pass off |
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
 | `--review-model` | `claude-opus-5` | Model for the review pass |
 | `--review-effort` | `high` | `low\|medium\|high\|xhigh\|max` |
@@ -91,7 +92,9 @@ targets). No config required.
 | `--mcp TARGET` | — | Probe a running MCP server (read-only): URL or command to spawn |
 | `--mcp-timeout N` | `20` | MCP handshake timeout (seconds) |
 | `--mcp-header H` | — | One HTTP header for an authed MCP endpoint |
-| `--pdf` | — | Also render `report.pdf` (Chrome / wkhtmltopdf / weasyprint) |
+| `--pdf` | **on** | Render `report.pdf` (Chrome / wkhtmltopdf / weasyprint); warns if none present |
+| `--no-pdf` | — | Skip the PDF render |
+| `--exclude PATH` | — | Exclude a path from scanning (repeatable; operator-trusted, applies under `--base`) |
 | `--open` | — | Open the HTML report in your browser when done |
 | `--diff REF` | — | PR mode: gate only on findings in files changed vs `REF` (implies `--base`) |
 | `--base REF` | — | Read config/ignore/baseline from `REF`, not the working tree |
@@ -165,8 +168,10 @@ survive are reported with their reasoning; refuted ones are counted, not shown.
 
 **Providers**, in precedence order: `--review-cmd` (anything — prompt on stdin,
 text on stdout, so self-hosted models work), `ANTHROPIC_API_KEY` (the HTTP API),
-or a local `claude` CLI. If `--review` is requested and none is available, that is
-an **ERROR (exit 3)** — never a quiet "reviewed, found nothing".
+or a local `claude` CLI. The review runs **by default** when one is present; with
+no provider it **skips gracefully** (the rest of the scan still runs, so a
+provider-less CI job is not reddened). An *explicit* `--review` with no provider
+is an **ERROR (exit 3)** — never a quiet "reviewed, found nothing".
 
 **Two honest limits.** Identity is anchored to the code (class + file + the
 referenced line) rather than the model's wording, so a reworded finding keeps its
@@ -177,14 +182,15 @@ it suits a nightly or pre-release job better than every push.
 ### When to run it — locally, before you release
 
 **Recommended: run the review by hand before tagging a release**, not on a timer.
+The default run already includes it (and the PDF):
 
 ```bash
-./vibecheck.sh --review --pdf --open
+./vibecheck.sh --open
 ```
 
-That gives you the four pattern passes, the reasoning pass, and a formatted report
-open in your browser — a deliberate pre-release read rather than a nightly digest
-nobody opens.
+That gives you the four pattern passes, the reasoning pass, a `report.pdf`, and a
+formatted report open in your browser — a deliberate pre-release read rather than a
+nightly digest nobody opens. (In provider-less CI, add `--no-review --no-pdf`.)
 
 Locally you need **no credential of your own to manage**: if you already have the
 `claude` CLI authenticated, `--review` uses it. Nothing to store, nothing to leak,
@@ -219,7 +225,12 @@ The SAST pass ships a static rule pack ([`rules/vibecheck-ai.yml`](rules/vibeche
 - **LLM output executed** — a completion flowing into shell / SQL / `eval` without validation (an allowlist check clears it).
 - **LLM output as raw HTML** — model text into `innerHTML`/`outerHTML` (XSS via the model).
 
-These are deterministic and provider-anchored (Anthropic / OpenAI shapes), cover **JavaScript/TypeScript and Python** (the input-in-system-prompt and LLM-output-executed rules), and are verified against vulnerable *and* safe fixtures so they stay quiet on ordinary code. They complement the reasoning `--review` pass, which now carries dedicated `prompt-injection`, `insecure-llm-output`, and `mcp-tool-safety` finding classes for the logic-level cases a regex can't reach — injection via tool arguments or retrieved content, MCP tool-description poisoning, and unvalidated tool args reaching a shell. An MCP server scans like any codebase at those two layers. On top of them, `--mcp` adds a **dynamic, read-only protocol probe**:
+Every rule in `rules/` is verified by a vulnerable + safe fixture under
+`tests/ai-fixtures/`, checked with `semgrep --test` (22 rules across 7 languages)
+and gated in CI — the rules do not ship unless they provably fire on the bad case
+and stay quiet on the good one.
+
+These are deterministic and provider-anchored (Anthropic / OpenAI shapes) and cover **JavaScript/TypeScript, Python, Go, Ruby, Java, C#, and PHP**. They complement the reasoning `--review` pass, which now carries dedicated `prompt-injection`, `insecure-llm-output`, and `mcp-tool-safety` finding classes for the logic-level cases a regex can't reach — injection via tool arguments or retrieved content, MCP tool-description poisoning, and unvalidated tool args reaching a shell. An MCP server scans like any codebase at those two layers. On top of them, `--mcp` adds a **dynamic, read-only protocol probe**:
 
 ```bash
 ./vibecheck.sh --mcp "node build/server.js"      # stdio: spawn and probe
