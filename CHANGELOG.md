@@ -9,6 +9,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.9.0] — 2026-09-24
+
+Acts on pentest feedback: broadens the deterministic SAST layer beyond
+prompt-injection into **SSRF**, **application-layer resource-exhaustion**, and
+the **rest of the OWASP-LLM Top 10** that a regex can honestly reach — plus an
+**AI governance** checklist. The rule count goes from 22 to **35**, all gated by
+`semgrep --test` in CI.
+
+### Added
+
+- **SSRF rule pack** (`rules/vibecheck-ssrf.yml`, CWE-918 / OWASP A10). Taint-tracks a
+  request-controlled URL/host into an outbound HTTP client with no host allowlist —
+  the path to the cloud metadata endpoint (169.254.169.254), internal services, and
+  localhost. Covers **JavaScript/TypeScript, Python, Go, Ruby, PHP**; an allowlist
+  membership check clears the finding (modeled for JS/TS + Python). Java/C# SSRF is
+  deliberately left to the review pass + checklist rather than matched imprecisely.
+- **Resource-exhaustion rule pack** (`rules/vibecheck-resource.yml`) — the slice of
+  "DDoS" that is actually visible in source: **user-controlled regex** (ReDoS, CWE-1333,
+  JS/TS + Python), **archive `extractall` with no size/path guard** (zip bomb + zip-slip,
+  CWE-409, Python), and **outbound calls with no timeout** (CWE-400, Python `requests`).
+  Volumetric/network DoS is explicitly out of scope — that is an edge concern (rate
+  limits, WAF, autoscaling), and the docs say so instead of over-claiming.
+- **OWASP-LLM Top-10 completions** (`rules/vibecheck-ai-extra.yml`) — **LLM02** secret/
+  env value interpolated into a prompt (sensitive-info disclosure to the provider) and
+  **LLM10** an OpenAI-shaped chat/completions call with no `max_tokens` cap (unbounded
+  consumption). JS/TS + Python.
+- **`hardening/AI-GOVERNANCE.md`** — a governance checklist for AI features (data-flow
+  inventory, DPA/BAA + training opt-out, model provenance & pinning, evals/red-teaming,
+  human oversight of agent actions, observability/audit, and GDPR/EU-AI-Act scope). These
+  are the questions a scanner cannot answer but a security review or regulator will ask.
+- **Honest OWASP-LLM coverage matrix** in the README, marking each of LLM01–LLM10 as
+  covered by **scan**, **review**, or **checklist/governance** — and stating plainly that
+  LLM03/04/06/07/08/09 get no regex on purpose, because a rule for a class a regex cannot
+  catch produces false confidence.
+
+### Changed
+
+- The adversarial `--review` pass gains a dedicated **`ssrf`** finding class and a prompt
+  bullet for the SSRF cases a pattern can't reach (allowlist via an unseen helper,
+  DNS-rebinding, open redirects, parser/fetcher URL disagreement, and the Java/C# fetch
+  idioms the static pack does not model).
+- `hardening/CHECKLIST.md`: §3 gains ReDoS and archive-extraction items and a strengthened
+  SSRF item; §6 gains outbound-timeout and input-cap items; §7 gains no-secrets-in-prompts
+  (LLM02), excessive-agency gating (LLM06), system-prompt-leakage (LLM07), and an explicit
+  token cap (LLM10), and now links to `AI-GOVERNANCE.md`.
+
 ## [0.8.0] — 2026-09-15
 
 The release reframes VibeCheck around a **deep pre-release read** rather than a
