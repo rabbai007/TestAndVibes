@@ -1,0 +1,208 @@
+# VibeCheck SSRF rules.
+#
+# One class: a request-controlled URL/host reaches an outbound HTTP client
+# without being allowlisted (Server-Side Request Forgery). That is how an
+# attacker turns your server into a proxy for the cloud metadata endpoint
+# (169.254.169.254), internal admin panels, and localhost-only services.
+#
+# Taint mode: source = request input, sink = the outbound call, sanitizer = an
+# allowlist membership check on the value. Modeling the sanitizer keeps the rule
+# quiet on the correct pattern (fetch only hosts on a fixed allowlist) and loud
+# on the dangerous one (fetch whatever the client sent).
+#
+# Languages: JavaScript/TypeScript, Python, Go, Ruby, PHP — the stacks where a
+# hand-rolled outbound fetch of a user URL is both common and crisply matchable.
+# The allowlist sanitizer is modeled for JS/TS and Python (where the membership
+# idiom is unambiguous); Go/Ruby/PHP flag the taint flow and leave the "is it
+# allowlisted?" judgment to the reviewer — a validate-via-helper there will not
+# silence the rule (a known, documented partial, like the AI pack's Go class-1).
+# Java/C# SSRF is left to the adversarial review pass + hardening checklist:
+# their HTTP idioms are too varied to match without crying wolf. Every rule is
+# proven by a fixture in tests/ai-fixtures/, checked with `semgrep --test`.
+rules:
+  - id: vibecheck-ssrf-user-url-fetched
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 Server-Side Request Forgery"
+      references:
+        - https://owasp.org/Top10/A10_2021-Server-Side_Request_Forgery_%28SSRF%29/
+    message: >-
+      A request-controlled URL is fetched server-side without a host allowlist
+      (SSRF). An attacker can point it at the cloud metadata endpoint
+      (169.254.169.254), internal services, or localhost. Allowlist the host
+      against a fixed set before the request; resolve + re-check the IP to block
+      DNS-rebinding, and disable redirects to internal ranges.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.body
+          - pattern: $REQ.body.$F
+          - pattern: $REQ.query
+          - pattern: $REQ.query.$F
+          - pattern: $REQ.params
+          - pattern: $REQ.params.$F
+    pattern-sinks:
+      - pattern-either:
+          - pattern: fetch(...)
+          - pattern: axios(...)
+          - pattern: axios.get(...)
+          - pattern: axios.post(...)
+          - pattern: axios.put(...)
+          - pattern: axios.patch(...)
+          - pattern: axios.delete(...)
+          - pattern: axios.request(...)
+          - pattern: got(...)
+          - pattern: got.get(...)
+          - pattern: got.post(...)
+          - pattern: http.get(...)
+          - pattern: http.request(...)
+          - pattern: https.get(...)
+          - pattern: https.request(...)
+    pattern-sanitizers:
+      # An allowlist membership check on the value before the fetch clears it.
+      - patterns:
+          - pattern: $U
+          - pattern-inside: 'if (<... $A.includes($U) ...>) { ... }'
+      - patterns:
+          - pattern: $U
+          - pattern-inside: 'if (<... $A.has($U) ...>) { ... }'
+      - patterns:
+          - pattern: $U
+          - pattern-inside: 'if (<... $A.indexOf($U) ...>) { ... }'
+
+  - id: vibecheck-ssrf-user-url-fetched-py
+    languages: [python]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 Server-Side Request Forgery"
+    message: >-
+      A request-controlled URL is fetched server-side without a host allowlist
+      (SSRF). An attacker can reach the cloud metadata endpoint
+      (169.254.169.254), internal services, or localhost. Allowlist the host
+      before the request and re-check the resolved IP against internal ranges.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: request.json
+          - pattern: request.json[...]
+          - pattern: request.get_json(...)
+          - pattern: request.args
+          - pattern: request.args.get(...)
+          - pattern: request.args[...]
+          - pattern: request.form
+          - pattern: request.form.get(...)
+          - pattern: request.form[...]
+          - pattern: request.values[...]
+          - pattern: request.data
+          - pattern: request.GET[...]
+          - pattern: request.POST[...]
+          - pattern: request.query_params[...]
+          - pattern: request.query_params.get(...)
+    pattern-sinks:
+      - pattern-either:
+          - pattern: requests.get(...)
+          - pattern: requests.post(...)
+          - pattern: requests.put(...)
+          - pattern: requests.patch(...)
+          - pattern: requests.delete(...)
+          - pattern: requests.head(...)
+          - pattern: requests.request(...)
+          - pattern: httpx.get(...)
+          - pattern: httpx.post(...)
+          - pattern: httpx.stream(...)
+          - pattern: urllib.request.urlopen(...)
+          - pattern: urlopen(...)
+    pattern-sanitizers:
+      - patterns:
+          - pattern: $U
+          - pattern-inside: |
+              if $U in $ALLOWED:
+                  ...
+
+  - id: vibecheck-ssrf-user-url-fetched-go
+    languages: [go]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 Server-Side Request Forgery"
+    message: >-
+      A request-controlled URL is fetched server-side (SSRF). Allowlist the host
+      against a fixed set before the request and re-check the resolved IP against
+      internal ranges (169.254.169.254, 10/8, 127/8). A validate-via-helper is
+      not modeled here — confirm the allowlist is present.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $R.URL.Query().Get(...)
+          - pattern: $R.FormValue(...)
+          - pattern: $R.PostFormValue(...)
+          - pattern: $CTX.Query(...)
+          - pattern: $CTX.Param(...)
+          - pattern: $CTX.QueryParam(...)
+          - pattern: mux.Vars($R)[...]
+          - pattern: chi.URLParam(...)
+    pattern-sinks:
+      - pattern-either:
+          - pattern: http.Get(...)
+          - pattern: http.Post(...)
+          - pattern: http.Head(...)
+          - pattern: http.NewRequest(...)
+          - pattern: http.NewRequestWithContext(...)
+
+  - id: vibecheck-ssrf-user-url-fetched-rb
+    languages: [ruby]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 Server-Side Request Forgery"
+    message: >-
+      A request-controlled URL is fetched server-side (SSRF). Allowlist the host
+      before the request and re-check the resolved IP against internal ranges. A
+      validate-via-helper is not modeled here — confirm the allowlist is present.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: params[...]
+          - pattern: params.fetch(...)
+          - pattern: request.params[...]
+    pattern-sinks:
+      - pattern-either:
+          - pattern: Net::HTTP.get(...)
+          - pattern: Net::HTTP.get_response(...)
+          - pattern: URI.open(...)
+          - pattern: URI.parse(...).open(...)
+          - pattern: HTTParty.get(...)
+          - pattern: HTTParty.post(...)
+          - pattern: Faraday.get(...)
+          - pattern: RestClient.get(...)
+
+  - id: vibecheck-ssrf-user-url-fetched-php
+    languages: [php]
+    severity: ERROR
+    metadata:
+      category: security
+      cwe: "CWE-918: Server-Side Request Forgery (SSRF)"
+      owasp: "A10:2021 Server-Side Request Forgery"
+    message: >-
+      A request-controlled URL is fetched server-side (SSRF). Allowlist the host
+      before the request and re-check the resolved IP against internal ranges. A
+      validate-via-helper is not modeled here — confirm the allowlist is present.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+    pattern-sinks:
+      - pattern-either:
+          - pattern: file_get_contents(...)
+          - pattern: fopen(...)
+          - pattern: curl_init(...)
+          - pattern: curl_setopt($CH, CURLOPT_URL, ...)

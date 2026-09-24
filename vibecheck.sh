@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.8.0"
+VERSION="0.9.0"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -1202,6 +1202,11 @@ matcher cannot reach:
   - a required control that is simply ABSENT (no rate limit, no ownership check)
   - semantics that are each fine but wrong in combination (a cache TTL that
     outlives a revocation, say)
+  - SSRF: a user-influenced value reaching an outbound request (URL, host, or a
+    redirect the server follows) where the allowlist is via a helper the scanner
+    couldn't see, is missing, or is bypassable (DNS-rebinding, an open redirect,
+    a URL parser that disagrees with the fetcher). The Java/C# fetch idioms the
+    SSRF pack does not model live here.
   - AI/LLM & MCP — ONLY if this code calls an LLM or implements an MCP server;
     otherwise skip this bullet entirely and invent nothing:
       * untrusted input (incl. tool arguments, tool results, retrieved documents,
@@ -1232,7 +1237,7 @@ Respond with ONLY a JSON array, no prose before or after. Each element:
   "severity": "critical" | "high" | "medium" | "low" | "info",
   "class": one of: broken-access-control, tenant-isolation, object-lifecycle,
            race-condition, missing-control, auth-session, trust-boundary,
-           resource-exhaustion, data-exposure, logic-error,
+           resource-exhaustion, data-exposure, logic-error, ssrf,
            prompt-injection, insecure-llm-output, mcp-tool-safety,
   "file": "path exactly as shown in its FILE header",
   "line": <integer, best estimate>,

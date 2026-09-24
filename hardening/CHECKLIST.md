@@ -28,7 +28,9 @@ Legend: `[ ]` to review · focus on **the ones marked ★** — they're the clas
 - [ ] No `eval`, `exec`, `child_process` with user input; no unsafe deserialization.
 - [ ] Output encoding / framework auto-escaping on; no `dangerouslySetInnerHTML` / `v-html` / `innerHTML` with unsanitized input (use DOMPurify if you must).
 - [ ] File uploads: validate type + size, store outside webroot, randomize names, never execute.
-- [ ] SSRF: outbound requests from user-supplied URLs are host-allowlisted (block `169.254.169.254`, internal ranges).
+- [ ] SSRF: outbound requests from user-supplied URLs are host-allowlisted (block `169.254.169.254`, internal ranges); resolve + re-check the IP to defeat DNS-rebinding, and disable redirects to internal ranges. (VibeCheck's SSRF pack flags the taint flow.)
+- [ ] No regex compiled from user input (ReDoS); a static pattern applied to user input is bounded in input length or run on a linear-time engine (RE2). (VibeCheck's resource pack flags user-controlled regex.)
+- [ ] Archive/upload extraction validates each member path (no `..`/absolute → zip-slip) and caps cumulative decompressed size (zip bomb). No bare `extractall`.
 
 ## 4. Secrets & data
 - [ ] ★ No secrets in the repo or git history (VibeCheck's secret pass covers this — keep it green).
@@ -52,12 +54,17 @@ Legend: `[ ]` to review · focus on **the ones marked ★** — they're the clas
 - [ ] Cloud storage buckets / databases are **private by default** (the classic "open S3 / public Firestore" breach).
 - [ ] Audit logging on security events (login, role change, data export, admin action).
 - [ ] Backups exist, are encrypted, and restore has been tested.
+- [ ] Every outbound HTTP/DB/socket call has an explicit timeout — no default-infinite waits that let a slow peer tie up a worker (resource exhaustion). Connection pools are bounded.
+- [ ] Request bodies, uploads, and pagination/`limit` values are capped server-side; expensive endpoints are rate-limited.
 
-## 7. AI / LLM features (if any)
-- [ ] User/free-text input is delimited/sentinel-wrapped and **can't escape into the system prompt** (prompt injection).
-- [ ] LLM output that becomes an action (SQL, shell, API call, tool use) is validated/sandboxed — never executed blindly.
+## 7. AI / LLM features (if any) — see also [AI-GOVERNANCE.md](AI-GOVERNANCE.md)
+- [ ] User/free-text input is delimited/sentinel-wrapped and **can't escape into the system prompt** (prompt injection — LLM01).
+- [ ] LLM output that becomes an action (SQL, shell, API call, tool use) is validated/sandboxed — never executed blindly (LLM05).
+- [ ] ★ **No secrets in prompts** — API keys, DB URLs, tokens, other users' data are never interpolated into a prompt sent to a third-party model (LLM02); they land in the provider's logs and can be echoed back by a prompt-injected model.
+- [ ] ★ **Excessive agency is gated** — an agent/tool loop that can spend money, delete data, send messages, or call external APIs requires a human confirmation or a hard policy limit on high-impact actions; tools are least-privilege, not a general `exec`/`fetch` (LLM06).
+- [ ] **System prompt is not leaked** — the system/instruction text and hidden context are never returned in a response, error, or debug endpoint (LLM07). Treat the system prompt as non-secret anyway: it's guidance, not a security control.
+- [ ] Output token cap (`max_tokens`) on every model call **and** per-user/per-org rate + cost limits (LLM10 unbounded consumption).
 - [ ] No PII/PHI sent to third-party model APIs without a BAA / DPA and a clear data-flow.
-- [ ] Per-user/per-org rate + cost limits on model calls.
 
 ## 8. MCP servers (if you expose one) ★
 - [ ] ★ Every tool argument is validated/allowlisted before it reaches a shell, SQL query, file path, or outbound URL. A tool taking a free-form `command`/`path`/`url` is remote code / SSRF waiting to happen — constrain it (enum, schema, allowlist) or don't expose it.

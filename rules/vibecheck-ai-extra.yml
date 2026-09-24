@@ -1,0 +1,109 @@
+# VibeCheck AI rules — OWASP-LLM Top-10 completions.
+#
+# rules/vibecheck-ai.yml covers LLM01 (prompt injection) and LLM05 (improper
+# output handling). This pack adds the two remaining categories that are crisply
+# matchable in source:
+#
+#   LLM02  Sensitive Information Disclosure — a secret/env value interpolated
+#          into a prompt sent to a third-party model (it leaves your trust
+#          boundary and lands in the provider's logs + the model's context).
+#   LLM10  Unbounded Consumption — a chat/completions call with no token cap, so
+#          one request can run to the context limit (cost + latency DoS).
+#
+# LLM03/04/08/09 (supply-chain, data/model poisoning, embedding weaknesses,
+# misinformation) are NOT statically detectable and are deliberately left to the
+# hardening checklist + adversarial review pass — see the coverage matrix in the
+# README. LLM06 (excessive agency) and LLM07 (system-prompt leakage) overlap the
+# LLM05 output-execution rules and are likewise carried by review + checklist
+# rather than a redundant/fuzzy regex. Claiming a regex for a class a regex
+# cannot catch is how a security tool loses trust.
+#
+# Languages: JavaScript/TypeScript, Python. Every rule is proven by a fixture in
+# tests/ai-fixtures/, checked with `semgrep --test`.
+rules:
+  # LLM02 — a process.env value placed in the system prompt or a message content
+  #   is sent verbatim to the provider. If it is a secret (API key, DB URL, token)
+  #   that is data exfiltration to a third party; even a non-secret should be a
+  #   deliberate choice. Model output that echoes it back is then a client leak.
+  - id: vibecheck-secret-in-llm-prompt
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-200: Exposure of Sensitive Information to an Unauthorized Actor"
+      owasp: "LLM02:2025 Sensitive Information Disclosure"
+      references:
+        - https://genai.owasp.org/llmrisk/llm02-sensitive-information-disclosure/
+    message: >-
+      An environment value is interpolated into an LLM prompt. Secrets in a
+      prompt leave your trust boundary — they land in the provider's request
+      logs and the model's context, and a prompt-injected model can echo them
+      back to the caller. Keep secrets out of prompts; pass only the minimum
+      non-sensitive data the task needs.
+    patterns:
+      - pattern-either:
+          - pattern: 'system: `...${process.env.$E}...`'
+          - pattern: 'system: process.env.$E'
+          - pattern: '{role: $R, content: `...${process.env.$E}...`}'
+          - pattern: '{role: $R, content: process.env.$E}'
+
+  - id: vibecheck-secret-in-llm-prompt-py
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-200: Exposure of Sensitive Information to an Unauthorized Actor"
+      owasp: "LLM02:2025 Sensitive Information Disclosure"
+    message: >-
+      An environment value is interpolated into an LLM prompt. Secrets in a
+      prompt leave your trust boundary (provider logs + model context) and a
+      prompt-injected model can echo them back. Keep secrets out of prompts.
+    patterns:
+      - pattern-either:
+          - pattern: '$C.messages.create(..., system=f"...{os.environ[...]}...", ...)'
+          - pattern: '$C.messages.create(..., system=f"...{os.getenv(...)}...", ...)'
+          - pattern: '{"role": $R, "content": f"...{os.environ[...]}..."}'
+          - pattern: '{"role": $R, "content": f"...{os.getenv(...)}..."}'
+
+  # LLM10 — no token cap on a chat/completions call. One request can run to the
+  #   model's context limit, and a script of them is a cost + latency DoS with no
+  #   network flood required. Anthropic's messages.create requires max_tokens so
+  #   it is not matched here; this targets the OpenAI-shaped calls where the cap
+  #   is optional and routinely omitted.
+  - id: vibecheck-llm-call-unbounded
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-770: Allocation of Resources Without Limits or Throttling"
+      owasp: "LLM10:2025 Unbounded Consumption"
+      references:
+        - https://genai.owasp.org/llmrisk/llm10-unbounded-consumption/
+    message: >-
+      LLM call has no token cap (max_tokens / max_completion_tokens). One request
+      can run to the context limit; a loop of them is a cost + latency DoS. Set
+      an explicit output cap and enforce per-user/per-org rate + spend limits.
+    patterns:
+      - pattern-either:
+          - pattern: $C.chat.completions.create({...})
+          - pattern: $C.responses.create({...})
+          - pattern: $C.completions.create({...})
+      - pattern-not-regex: 'max_tokens|max_completion_tokens|max_output_tokens'
+
+  - id: vibecheck-llm-call-unbounded-py
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-770: Allocation of Resources Without Limits or Throttling"
+      owasp: "LLM10:2025 Unbounded Consumption"
+    message: >-
+      LLM call has no token cap (max_tokens / max_completion_tokens). One request
+      can run to the context limit; a loop of them is a cost + latency DoS. Set an
+      explicit output cap and enforce per-user/per-org rate + spend limits.
+    patterns:
+      - pattern-either:
+          - pattern: $C.chat.completions.create(...)
+          - pattern: $C.responses.create(...)
+          - pattern: $C.completions.create(...)
+      - pattern-not-regex: 'max_tokens|max_completion_tokens|max_output_tokens'

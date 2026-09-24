@@ -1,0 +1,122 @@
+# VibeCheck resource-exhaustion rules.
+#
+# Application-layer denial of service — the part of "DDoS" that is actually
+# visible in source. Real volumetric/network DoS is defended at the edge (rate
+# limits, WAF, autoscaling) and is NOT statically detectable; this pack does not
+# pretend otherwise. What it catches is a single request cheaply forcing the
+# server to burn unbounded CPU, memory, or a worker:
+#
+#   1. a request-controlled regular expression (ReDoS / catastrophic backtracking)
+#   2. archive extraction with no size or path guard (zip bomb + zip-slip)
+#   3. an outbound HTTP call with no timeout (a slow/hung peer ties up a worker)
+#
+# See rules/vibecheck-extra.yml for the unbounded-request-body companion. Every
+# rule is proven by a fixture in tests/ai-fixtures/, checked with `semgrep --test`.
+rules:
+  # 1) User-controlled regex. Compiling a pattern an attacker supplies means they
+  #    choose the backtracking behavior — `(a+)+$` against a long non-matching
+  #    string pins a CPU core. The pattern channel, not the subject string, is the
+  #    danger, so the Python sink is re.compile (pattern-only) to stay precise.
+  - id: vibecheck-user-controlled-regex
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-1333: Inefficient Regular Expression Complexity (ReDoS)"
+      owasp: "A06:2021 Vulnerable and Outdated Components"
+      references:
+        - https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS
+    message: >-
+      A request-controlled value is compiled into a regular expression. An
+      attacker chooses a catastrophic-backtracking pattern (e.g. (a+)+$) that
+      pins a CPU core — application-layer DoS. Never build a regex from user
+      input; if you must, use a linear-time engine (RE2) or bound input length
+      and add a timeout.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: $REQ.body
+          - pattern: $REQ.body.$F
+          - pattern: $REQ.query
+          - pattern: $REQ.query.$F
+          - pattern: $REQ.params
+          - pattern: $REQ.params.$F
+    pattern-sinks:
+      - pattern-either:
+          - pattern: new RegExp(...)
+          - pattern: RegExp(...)
+
+  - id: vibecheck-user-controlled-regex-py
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-1333: Inefficient Regular Expression Complexity (ReDoS)"
+    message: >-
+      A request-controlled value is compiled into a regular expression (re.compile).
+      An attacker chooses a catastrophic-backtracking pattern that pins a CPU core
+      — application-layer DoS. Do not build a regex from user input; use google-re2
+      or bound the input and run under a timeout.
+    mode: taint
+    pattern-sources:
+      - pattern-either:
+          - pattern: request.json
+          - pattern: request.json[...]
+          - pattern: request.get_json(...)
+          - pattern: request.args
+          - pattern: request.args.get(...)
+          - pattern: request.args[...]
+          - pattern: request.form
+          - pattern: request.form.get(...)
+          - pattern: request.form[...]
+          - pattern: request.values[...]
+          - pattern: request.data
+          - pattern: request.GET[...]
+          - pattern: request.POST[...]
+          - pattern: request.query_params[...]
+    pattern-sinks:
+      - pattern: re.compile(...)
+
+  # 2) Archive extraction with no guard. extractall() trusts both the member
+  #    paths (zip-slip: ../../etc/cron.d) and the decompressed size (a few KB can
+  #    expand to gigabytes — a zip bomb). Validate each member's path stays inside
+  #    the target dir and cap the total extracted size before writing.
+  - id: vibecheck-archive-extractall-unbounded
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-409: Improper Handling of Highly Compressed Data (Data Amplification)"
+    message: >-
+      Archive is extracted with extractall() — no path or size guard. A crafted
+      member path (../../) escapes the target directory (zip-slip) and a highly
+      compressed member exhausts disk/memory (zip bomb). Iterate members, reject
+      absolute/.. paths, and cap the cumulative decompressed size.
+    patterns:
+      - pattern-either:
+          - pattern: $Z.extractall(...)
+          - pattern: tarfile.open(...).extractall(...)
+
+  # 3) Outbound call with no timeout. requests defaults to no timeout, so a slow
+  #    or hung peer holds the worker open indefinitely — a handful of such
+  #    requests exhausts the pool. Always pass an explicit timeout.
+  - id: vibecheck-outbound-request-no-timeout-py
+    languages: [python]
+    severity: WARNING
+    metadata:
+      category: security
+      cwe: "CWE-400: Uncontrolled Resource Consumption"
+    message: >-
+      Outbound HTTP call has no timeout — requests waits forever by default, so a
+      slow/hung peer ties up the worker and a few such calls exhaust the pool.
+      Pass an explicit timeout=(connect, read).
+    patterns:
+      - pattern-either:
+          - pattern: requests.get(...)
+          - pattern: requests.post(...)
+          - pattern: requests.put(...)
+          - pattern: requests.patch(...)
+          - pattern: requests.delete(...)
+          - pattern: requests.head(...)
+          - pattern: requests.request(...)
+      - pattern-not-regex: 'timeout\s*='
