@@ -43,9 +43,9 @@ jobs:
         run: jq --version || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
 
       - name: Verify the rule packs (semgrep --test)
-        # The AI/extra rule packs are only trustworthy if their fixtures prove
-        # they fire on the vulnerable case and stay quiet on the safe one.
-        # 22 rules across 7 languages, checked against tests/ai-fixtures/.
+        # The AI/SSRF/resource/extra rule packs are only trustworthy if their
+        # fixtures prove they fire on the vulnerable case and stay quiet on the
+        # safe one. 35 rules, checked against tests/ai-fixtures/.
         run: semgrep --test --config rules/ tests/ai-fixtures
 
       - name: Install gitleaks (pinned release, download-to-file)

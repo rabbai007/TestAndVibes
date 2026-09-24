@@ -16,7 +16,7 @@ read-only dynamic** checks against a URL you control, and an optional
 | Pass | What it checks | Tool(s) |
 |------|----------------|---------|
 | 🔑 Secrets | Committed / working-tree credentials (verified only) | trufflehog, gitleaks |
-| 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) **+ AI/LLM prompt-injection** | semgrep + [`rules/`](rules/) |
+| 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) **+ AI/LLM (OWASP-LLM), SSRF, resource-exhaustion** | semgrep + [`rules/`](rules/) |
 | 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) | trivy + osv-scanner + npm audit + grype |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
@@ -219,18 +219,53 @@ via `--review-cmd`, or just staying with the local pre-release run above.
 
 ## AI / LLM & prompt-injection coverage
 
-The SAST pass ships a static rule pack ([`rules/vibecheck-ai.yml`](rules/vibecheck-ai.yml)) for the sinks that matter in LLM-backed apps and **MCP servers**, mapping to `AGENTS.md` §AI/LLM and `hardening/CHECKLIST.md` §7:
+The SAST pass ships static rule packs under [`rules/`](rules/) for the sinks that
+matter in LLM-backed apps and **MCP servers**, mapping to `AGENTS.md` §AI/LLM and
+`hardening/CHECKLIST.md` §7 — [`vibecheck-ai.yml`](rules/vibecheck-ai.yml) and
+[`vibecheck-ai-extra.yml`](rules/vibecheck-ai-extra.yml):
 
 - **Untrusted input in a system prompt** — request data concatenated into the `system` channel (prompt injection). User-role content is normal and is *not* flagged.
 - **LLM output executed** — a completion flowing into shell / SQL / `eval` without validation (an allowlist check clears it).
 - **LLM output as raw HTML** — model text into `innerHTML`/`outerHTML` (XSS via the model).
+- **Secret in an LLM prompt** — a `process.env` / `os.environ` value interpolated into a prompt (LLM02 sensitive-info disclosure — it lands in the provider's logs).
+- **Unbounded LLM call** — an OpenAI-shaped chat/completions call with no `max_tokens` cap (LLM10 unbounded consumption — cost + latency DoS).
+
+### OWASP-LLM Top-10 coverage (honest matrix)
+
+Not every LLM risk is a regex. This is exactly what VibeCheck detects and how —
+**scan** = deterministic SAST rule, **review** = the reasoning `--review` pass,
+**checklist** = a manual item in `hardening/CHECKLIST.md` / `AI-GOVERNANCE.md`:
+
+| OWASP-LLM (2025) | How VibeCheck covers it |
+|------------------|-------------------------|
+| **LLM01** Prompt Injection | **scan** + review + checklist |
+| **LLM02** Sensitive Information Disclosure | **scan** (secret→prompt) + review + governance |
+| **LLM03** Supply Chain | dependency + IaC passes; **checklist** (model/data provenance) |
+| **LLM04** Data & Model Poisoning | **checklist / governance** — not statically detectable |
+| **LLM05** Improper Output Handling | **scan** (exec / SQL / raw-HTML) + review |
+| **LLM06** Excessive Agency | **review** + checklist (human gate on high-impact tools) |
+| **LLM07** System Prompt Leakage | **review** + checklist (don't return the system prompt) |
+| **LLM08** Vector/Embedding Weaknesses | **checklist / governance** — not statically detectable |
+| **LLM09** Misinformation | **checklist / governance** — not statically detectable |
+| **LLM10** Unbounded Consumption | **scan** (no token cap) + checklist (rate/spend limits) |
+
+We intentionally do **not** ship a regex for LLM03/04/06/07/08/09 — a rule for a
+class a regex cannot catch produces false confidence, which on a security gate is
+worse than an honest gap. Those are carried by the review pass and the checklists.
+
+### SSRF & resource-exhaustion
+
+Two non-LLM packs the pentest feedback asked for:
+
+- **SSRF** ([`vibecheck-ssrf.yml`](rules/vibecheck-ssrf.yml)) — a request-controlled URL fetched server-side with no host allowlist (CWE-918), the path to the cloud metadata endpoint and internal services. Taint-tracked in JS/TS, Python, Go, Ruby, PHP; an allowlist check clears it (modeled for JS/TS + Python). Java/C# SSRF is left to the review pass + checklist.
+- **Resource-exhaustion** ([`vibecheck-resource.yml`](rules/vibecheck-resource.yml)) — the application-layer slice of "DDoS" that is actually visible in source: user-controlled regex (ReDoS), archive `extractall` with no size/path guard (zip bomb + zip-slip), and outbound calls with no timeout. Network/volumetric DoS is an edge concern (rate limits, WAF, autoscaling) and VibeCheck does not claim to scan for it.
 
 Every rule in `rules/` is verified by a vulnerable + safe fixture under
-`tests/ai-fixtures/`, checked with `semgrep --test` (22 rules across 7 languages)
-and gated in CI — the rules do not ship unless they provably fire on the bad case
-and stay quiet on the good one.
+`tests/ai-fixtures/`, checked with `semgrep --test` (35 rules) and gated in CI —
+the rules do not ship unless they provably fire on the bad case and stay quiet on
+the good one.
 
-These are deterministic and provider-anchored (Anthropic / OpenAI shapes) and cover **JavaScript/TypeScript, Python, Go, Ruby, Java, C#, and PHP**. They complement the reasoning `--review` pass, which now carries dedicated `prompt-injection`, `insecure-llm-output`, and `mcp-tool-safety` finding classes for the logic-level cases a regex can't reach — injection via tool arguments or retrieved content, MCP tool-description poisoning, and unvalidated tool args reaching a shell. An MCP server scans like any codebase at those two layers. On top of them, `--mcp` adds a **dynamic, read-only protocol probe**:
+The AI/SSRF rules are deterministic and provider-anchored (Anthropic / OpenAI shapes) and cover **JavaScript/TypeScript, Python, Go, Ruby, Java, C#, and PHP** (SSRF: JS/TS, Python, Go, Ruby, PHP). They complement the reasoning `--review` pass, which now carries dedicated `prompt-injection`, `insecure-llm-output`, and `mcp-tool-safety` finding classes for the logic-level cases a regex can't reach — injection via tool arguments or retrieved content, MCP tool-description poisoning, and unvalidated tool args reaching a shell. An MCP server scans like any codebase at those two layers. On top of them, `--mcp` adds a **dynamic, read-only protocol probe**:
 
 ```bash
 ./vibecheck.sh --mcp "node build/server.js"      # stdio: spawn and probe
