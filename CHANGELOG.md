@@ -36,6 +36,17 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
   contained a tool name in backticks, which the shell ran as a command substitution
   every time help was printed (present since the review pass shipped). Escaped; a test
   now asserts `--help` runs nothing.
+- **The review pass silently skipped large files.** A hidden 120 KB per-file cap dropped
+  any bigger file from the review context without a word and still reported "0
+  findings" — on this repository it skipped `vibecheck.sh` itself (129 KB) and reviewed
+  only 17 test fixtures (7 KB). The cap is gone; files are taken in priority order until
+  `--review-budget` is spent, and any file that does not fit is **listed in the console
+  and the report, with the pass marked PARTIAL**. Default budget raised 200 KB -> 400 KB
+  (~100k input tokens; roughly $0.40 per review run at current Opus pricing).
+- **Refutation judged the wrong code in large files.** Each skeptic was shown the first
+  400 lines of the flagged file, so a finding at line 1,400 was weighed against unrelated
+  code and — skeptics default to REFUTED — dropped. Skeptics now see a numbered window
+  around the claimed line (150 before, 250 after).
 - **The adversarial review could report "0 findings" for a review that produced
   nothing usable (fail-open).** A model response containing square brackets that
   was not a valid JSON array — prose such as `the handler at [server.js line 1] looks
@@ -64,7 +75,7 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
 
 ### Added (tests)
 
-- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract (27 with the KEV and `--help` tests): coverage
+- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract (30 with the KEV, `--help` and review-coverage tests): coverage
   guard, review parse/empty/refusal/no-provider paths, refutation, `--fail-on-review`,
   and HTTP API error/retry handling (provider and API faked; no network or key).
 - CI: a `script-tests` job runs `shellcheck -S warning` and the bats suite.

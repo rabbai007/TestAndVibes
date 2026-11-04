@@ -89,7 +89,7 @@ targets). No config required.
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
 | `--review-model` | `claude-opus-5-5` | Model for the review pass |
 | `--review-effort` | `high` | `low\|medium\|high\|xhigh\|max` |
-| `--review-budget` | `200000` | Max bytes of source sent for review |
+| `--review-budget` | `400000` | Max bytes of source sent for review (~100k tokens). Files that do not fit are listed and the review is marked **PARTIAL** — never silently dropped |
 | `--review-skeptics` | `2` | Independent refutation attempts per finding |
 | `--review-cmd CMD` | — | Provider override: prompt on stdin, text on stdout |
 | `--mcp TARGET` | — | Probe a running MCP server (read-only): URL or command to spawn |

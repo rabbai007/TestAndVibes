@@ -338,3 +338,41 @@ SH
   kev_run "${DEPS_BL[@]}" --kev-file "$BATS_TEST_TMPDIR/kev.json"
   [ "$status" -eq 0 ]
 }
+
+# ── review pass: context coverage ──────────────────────────────────────────
+
+@test "review: a file that does not fit the budget is listed and the pass is PARTIAL, not silently dropped" {
+  head -c 600 /dev/zero | tr '\0' 'x' > "$APP/big.js"
+  run "$VC" "${REVIEW_ONLY[@]}" --review --review-budget 200 --review-cmd 'echo "[]"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"did not fit the budget and were NOT reviewed"* ]] || false
+  [[ "$output" == *"big.js (600 bytes)"* ]] || false
+  [[ "$(jq -r '.coverage.passes[] | select(.pass=="review") | .detail' "$OUT/findings.json")" == *"PARTIAL: 1 file(s) NOT reviewed"*"big.js"* ]] || false
+}
+
+@test "review: a file over 120 KB is reviewed when it fits the budget (regression: hidden per-file cap)" {
+  head -c 130000 /dev/zero | tr '\0' '\n' > "$APP/main.sh"
+  run "$VC" "${REVIEW_ONLY[@]}" --review --review-cmd 'echo "[]"'
+  [ "$status" -eq 0 ]
+  grep -qx 'main.sh' "$OUT/.review-files"
+  [[ "$output" != *"PARTIAL"* ]] || false
+}
+
+@test "review: a skeptic sees the code around the claimed line, not the top of the file" {
+  { for i in $(seq 1 999); do echo "// filler $i"; done
+    echo 'const SKEPTIC_MARKER = db.find(req.query.id)'
+    for i in $(seq 1 50); do echo "// tail $i"; done; } > "$APP/deep.js"
+  cat > "$BIN/provider" <<'SH'
+#!/usr/bin/env bash
+in="$(cat)"
+if printf '%s' "$in" | grep -q 'You are refuting'; then
+  printf '%s' "$in" | grep -q 'SKEPTIC_MARKER' && echo CONFIRMED || echo REFUTED
+else
+  echo '[{"severity":"high","class":"broken-access-control","file":"deep.js","line":1000,"anchor":"SKEPTIC_MARKER","title":"IDOR deep in a large file","why":"no ownership check","confidence":"high"}]'
+fi
+SH
+  chmod +x "$BIN/provider"
+  run "$VC" "${REVIEW_ONLY[@]}" --review --review-cmd "$BIN/provider"
+  [ "$status" -eq 0 ]
+  [ "$(jq '[.active[] | select(.tool=="review")] | length' "$OUT/findings.json")" -eq 1 ]
+}

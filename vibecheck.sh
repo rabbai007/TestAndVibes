@@ -44,7 +44,7 @@ EXTRA_EXCLUDES=()        # --exclude PATH (repeatable): operator-trusted, added 
 REVIEW_CMD="${VIBECHECK_REVIEW_CMD:-}"   # override: reads a prompt on stdin, writes JSON to stdout
 REVIEW_MODEL="claude-opus-5-5"
 REVIEW_EFFORT="high"
-REVIEW_BUDGET=200000    # max bytes of source sent for review
+REVIEW_BUDGET=400000    # max bytes of source sent for review (~100k tokens)
 REVIEW_SKEPTICS=2       # independent refutation attempts per finding
 FAIL_ON_REVIEW=0        # 1 = review findings count toward the exit code
 DO_KEV=1                # default ON: match dependency CVEs against CISA KEV (needs network or --kev-file)
@@ -113,7 +113,8 @@ OPTIONS
   --no-review          Disable the default adversarial review pass
   --review-model M     Model for the review (default: claude-opus-5-5)
   --review-effort E    low|medium|high|xhigh|max (default: high)
-  --review-budget N    Max bytes of source to send (default: 200000)
+  --review-budget N    Max bytes of source to send (default: 400000); files that
+                       do not fit are listed and the review is marked PARTIAL
   --review-skeptics N  Independent refutation attempts per finding (default: 2)
   --review-cmd CMD     Provider override: reads a prompt on stdin, writes the
                        model's text to stdout
@@ -1305,6 +1306,17 @@ if [ "$DO_REVIEW" = 1 ]; then
     # file is to carry a trust decision, then fill to the byte budget.
     RV_CTX="$OUTDIR/.review-context.txt"; : > "$RV_CTX"
     RV_LIST="$OUTDIR/.review-files"; : > "$RV_LIST"
+    # The code a skeptic sees: a window around the claimed line in that file
+    # (150 before, 250 after), with line numbers. 0.9.0 sent the first 400
+    # lines, so a skeptic judging a finding deep in a large file saw unrelated
+    # code - and, defaulting to REFUTED, dropped it.
+    rv_window() {  # file line
+      local ln="${2:-0}"; case "$ln" in ''|*[!0-9]*) ln=0;; esac
+      awk -v f="$1" -v ln="$ln" '
+        /^===== FILE: / { p = (index($0, "FILE: " f " ") > 0); n = 0; next }
+        p { n++; lo = (ln > 150 ? ln - 150 : 1); hi = (ln > 0 ? ln + 250 : 400)
+            if (n >= lo && n <= hi) printf "%5d  %s\n", n, $0 }' "$RV_CTX"
+    }
     rv_srcs() { findx -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.jsx' \
                       -o -name '*.py' -o -name '*.go' -o -name '*.rb' -o -name '*.php' \
                       -o -name '*.java' -o -name '*.cs' -o -name '*.rs' -o -name '*.sh'; }
@@ -1312,17 +1324,31 @@ if [ "$DO_REVIEW" = 1 ]; then
       rv_srcs | grep -iE '/(server|app|index|main|api|auth|middleware|route|handler|controller|session|token|permission|tenant)[^/]*$'
       rv_srcs
     } 2>/dev/null | awk '!seen[$0]++' > "$RV_LIST.all"
+    # Files are taken in priority order until the budget is spent. A file that
+    # does not fit is NEVER dropped silently: it is listed, and the pass is
+    # marked PARTIAL. (0.9.0 had a hidden 120 KB per-file cap that skipped the
+    # largest - usually the most important - file and still reported "0 findings".)
+    RV_SKIPPED="$OUTDIR/.review-skipped"; : > "$RV_SKIPPED"
     bytes=0; nfiles=0
     while IFS= read -r f; do
       [ -f "$f" ] || continue
       sz=$(wc -c < "$f" 2>/dev/null | tr -d ' '); [ -n "$sz" ] || continue
-      [ "$sz" -gt 120000 ] && continue                  # one huge file would eat the budget
-      [ $((bytes + sz)) -gt "$REVIEW_BUDGET" ] && continue
+      if [ $((bytes + sz)) -gt "$REVIEW_BUDGET" ]; then
+        printf '%s\t%s\n' "$(rel "$f")" "$sz" >> "$RV_SKIPPED"; continue
+      fi
       bytes=$((bytes + sz)); nfiles=$((nfiles + 1))
       printf '%s\n' "$(rel "$f")" >> "$RV_LIST"
       { printf '\n===== FILE: %s =====\n' "$(rel "$f")"; cat "$f"; } >> "$RV_CTX"
     done < "$RV_LIST.all"
+    RV_SKIP_N=$(wc -l < "$RV_SKIPPED" | tr -d ' ')
     say "  ${C_D}context: $nfiles file(s), $bytes bytes (budget $REVIEW_BUDGET)${C_0}"
+    RV_PARTIAL=""
+    if [ "$RV_SKIP_N" -gt 0 ]; then
+      RV_PARTIAL="; PARTIAL: $RV_SKIP_N file(s) NOT reviewed (over --review-budget $REVIEW_BUDGET): $(cut -f1 "$RV_SKIPPED" | head -5 | tr '\n' ' ' | sed 's/ $//')$([ "$RV_SKIP_N" -gt 5 ] && echo " ...")"
+      warn "review: $RV_SKIP_N file(s) did not fit the budget and were NOT reviewed (raise --review-budget):"
+      awk -F'\t' 'NR<=10 {printf "      · %s (%s bytes)\n", $1, $2}' "$RV_SKIPPED"
+      [ "$RV_SKIP_N" -gt 10 ] && say "      · ... $((RV_SKIP_N - 10)) more (see $(basename "$RV_SKIPPED"))"
+    fi
 
     if [ "$nfiles" -eq 0 ]; then
       pass_error review "no reviewable source files found - NOT reviewed"
@@ -1439,7 +1465,7 @@ File: $file (around line $line)
 Reasoning given: $why
 
 Relevant code:
-$(awk -v f="$file" '/^===== FILE: /{p=(index($0, "FILE: " f " ")>0)} p' "$RV_CTX" | head -400)
+$(rv_window "$file" "$line")
 
 Answer with ONLY one word: REFUTED if the claim is wrong, does not apply, or
 cannot be substantiated from this code; CONFIRMED if it is genuinely exploitable
@@ -1468,8 +1494,8 @@ PROMPT_R
                                 || ok "review: no findings survived refutation"
           [ "$REVIEW_REFUTED" -gt 0 ] && say "  ${C_D}$REVIEW_REFUTED candidate(s) refuted and dropped${C_0}"
           [ "$FAIL_ON_REVIEW" = 1 ] || say "  ${C_D}report-only (pass --fail-on-review to let these affect the exit code)${C_0}"
-          if [ "$REVIEW_N" -gt 0 ]; then set_status review findings "$REVIEW_N surviving, $REVIEW_REFUTED refuted"
-          else set_status review ok "0 findings ($REVIEW_REFUTED refuted)"; fi
+          if [ "$REVIEW_N" -gt 0 ]; then set_status review findings "$REVIEW_N surviving, $REVIEW_REFUTED refuted$RV_PARTIAL"
+          else set_status review ok "0 findings ($REVIEW_REFUTED refuted)$RV_PARTIAL"; fi
         fi
       fi
     fi
