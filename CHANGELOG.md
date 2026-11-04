@@ -88,6 +88,11 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
   untrusted folder; VibeCheck trusts only its empty scratch dir for the session, and
   discards the review (exit 3) if a downgrade is still reported. An individual Google
   account rejected by the enterprise-only Gemini CLI gets a pointer to `gemini-api`.
+- **CLI providers retry transient failures**, with the same policy as the HTTP API:
+  5xx / 429 / 529, "high demand", overloaded, rate limits and timeouts are retried with
+  backoff (`VIBECHECK_REVIEW_RETRIES`, default 3 attempts); auth and usage errors are
+  not. Found in a real run: a `gemini-api` 503 on a busy model failed the whole review.
+  Retry notices now reach the console for both paths (they were swallowed before).
 - **Default HTTP-API review model moves to the current Opus generation** (see `--review-model`
   in `--help` / the README options table) — ~20% cheaper per token. Effort is still sent
   explicitly (`high`), so the new model's lower built-in default (`medium`) does not

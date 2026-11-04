@@ -203,6 +203,7 @@ SH
   [ "$status" -eq 0 ]
   [[ "$output" == *"no findings survived refutation"* ]] || false
   [ "$(cat "$FAKE_CURL_STATE")" -eq 2 ]
+  [[ "$output" == *"review API returned HTTP 529 - retry 1/2"* ]] || false   # visible to the operator
 }
 
 @test "api: retries are bounded and then fail closed" {
@@ -526,4 +527,51 @@ SH
   cli_run --review-provider gemini
   [ "$status" -eq 3 ]
   [[ "$output" == *"gemini exited 55"*"use --review-provider gemini-api with GEMINI_API_KEY"* ]] || false
+}
+
+# ── review pass: CLI transient-failure retries ─────────────────────────────
+
+# A fake gemini-api that fails with the stderr/exit given for its first N calls
+# ($FAKE_FAILS), then answers. Counts calls in $BATS_TEST_TMPDIR/calls.
+flaky_gemini_api() {  # $1 = exit code, $2 = stderr text
+  cat > "$BIN/gemini-api" <<SH
+#!/usr/bin/env bash
+cat >/dev/null
+n=\$(( \$(cat "$BATS_TEST_TMPDIR/calls" 2>/dev/null || echo 0) + 1 )); echo "\$n" > "$BATS_TEST_TMPDIR/calls"
+if [ "\$n" -le "\${FAKE_FAILS:-0}" ]; then echo "$2" >&2; exit $1; fi
+echo '[]'
+SH
+  chmod +x "$BIN/gemini-api"
+}
+retry_run() { VIBECHECK_REVIEW_RETRY_DELAY=0 cli_run --review-provider gemini-api "$@"; }
+
+@test "cli retry: a transient 503 (high demand) is retried and the review completes" {
+  flaky_gemini_api 1 'Error (server_error): gemini-3.8-flash is currently experiencing high demand. HTTP status: 503'
+  FAKE_FAILS=1 retry_run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"failed transiently (exit 1) - retry 1/2"* ]] || false
+  [[ "$output" == *"no findings survived refutation"* ]] || false
+  [ "$(cat "$BATS_TEST_TMPDIR/calls")" -eq 2 ]
+}
+
+@test "cli retry: retries are bounded, then fail closed naming the error and attempts" {
+  flaky_gemini_api 1 'HTTP status: 503 high demand'
+  FAKE_FAILS=99 VIBECHECK_REVIEW_RETRIES=3 retry_run
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"gemini-api exited 1 after 3 attempts: HTTP status: 503"* ]] || false
+  [ "$(cat "$BATS_TEST_TMPDIR/calls")" -eq 3 ]
+}
+
+@test "cli retry: an auth failure is not retried" {
+  flaky_gemini_api 3 'Error (unauthenticated): API key not valid. HTTP status: 401'
+  FAKE_FAILS=99 retry_run
+  [ "$status" -eq 3 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/calls")" -eq 1 ]
+}
+
+@test "cli retry: a non-transient runtime error is not retried" {
+  flaky_gemini_api 1 'Error: model output blocked by safety settings'
+  FAKE_FAILS=99 retry_run
+  [ "$status" -eq 3 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/calls")" -eq 1 ]
 }

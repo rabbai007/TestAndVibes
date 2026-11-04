@@ -250,9 +250,10 @@ no provider it **skips gracefully** (the rest of the scan still runs, so a
 provider-less CI job is not reddened). An *explicit* `--review` with no provider
 is an **ERROR (exit 3)** — never a quiet "reviewed, found nothing".
 
-Over the HTTP API, transient failures (network errors, 408, 429, 5xx including
-529 overloaded) are retried with backoff, honouring `Retry-After` — 3 attempts by
-default, `VIBECHECK_REVIEW_RETRIES=N` to change it. Anything else (a bad key, an
+Transient failures are retried with backoff on every provider — over the HTTP
+API (network errors, 408, 429, 5xx including 529 overloaded; honouring
+`Retry-After`) and on the CLIs (5xx, 429, "high demand", overloaded, rate limits,
+timeouts) — 3 attempts by default, `VIBECHECK_REVIEW_RETRIES=N` to change it. Anything else (a bad key, an
 unknown model) fails at once, and the report names the API's own error. A
 response that cannot be parsed as a findings array is an **ERROR**, never "0
 findings".

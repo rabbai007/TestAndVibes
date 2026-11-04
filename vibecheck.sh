@@ -1256,18 +1256,21 @@ if [ "$DO_REVIEW" = 1 ]; then
   # scratch directory - the prompt already carries all the code it needs.
   RV_JAIL="$(mktemp -d)"; trap 'rm -rf "$RV_JAIL"' EXIT
   RV_CLI_ERR="$OUTDIR/.review-cli-stderr"; : > "$RV_CLI_ERR"
-  rv_cli() {  # prompt on stdin -> model text on stdout; records stderr + exit code
+  # One provider call: prompt on stdin, model text on stdout. Sets RV_RC; stderr
+  # goes to RV_CLI_ERR_ONE (this attempt only). Must run in the current shell
+  # (redirects, not a pipeline) so RV_RC survives.
+  rv_cli_once() {
     local rc=0 a=()
     case "$RV_MODE" in
       claude)
         a=(-p --tools "" --strict-mcp-config --no-session-persistence --effort "$REVIEW_EFFORT")
         [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
-        (cd "$RV_JAIL" && claude "${a[@]}") 2>>"$RV_CLI_ERR" || rc=$?;;
+        (cd "$RV_JAIL" && claude "${a[@]}") 2>>"$RV_CLI_ERR_ONE" || rc=$?;;
       codex)
         a=(exec --sandbox read-only --cd "$RV_JAIL" --skip-git-repo-check --ephemeral
            -c "model_reasoning_effort=\"$REVIEW_EFFORT\"")
         [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
-        (cd "$RV_JAIL" && codex "${a[@]}" -) 2>>"$RV_CLI_ERR" || rc=$?;;
+        (cd "$RV_JAIL" && codex "${a[@]}" -) 2>>"$RV_CLI_ERR_ONE" || rc=$?;;
       gemini-api)
         # Google's stateless Gemini API CLI: one request, no agent, no tools -
         # nothing for an injected prompt to steer. Prompt on --stdin; with no
@@ -1275,7 +1278,7 @@ if [ "$DO_REVIEW" = 1 ]; then
         # `gemini-api configure`). Non-zero exit = API/usage/auth failure.
         a=(generate --stdin --stream=false --no-interactive)
         [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
-        (cd "$RV_JAIL" && gemini-api "${a[@]}") 2>>"$RV_CLI_ERR" || rc=$?;;
+        (cd "$RV_JAIL" && gemini-api "${a[@]}") 2>>"$RV_CLI_ERR_ONE" || rc=$?;;
       gemini)
         # Gemini CLI - since 2026-06-18 for Gemini Code Assist Standard/Enterprise
         # and legacy paid keys only; other accounts moved to agy (see README).
@@ -1287,25 +1290,52 @@ if [ "$DO_REVIEW" = 1 ]; then
         # hooks, extensions or context files for trust to enable).
         a=(--skip-trust --approval-mode plan --output-format json -p "Follow the instructions given on standard input exactly.")
         [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
-        local gout; gout="$( (cd "$RV_JAIL" && gemini "${a[@]}") 2>>"$RV_CLI_ERR")" || rc=$?
-        if grep -q 'Approval mode overridden' "$RV_CLI_ERR" 2>/dev/null; then
+        local gout; gout="$( (cd "$RV_JAIL" && gemini "${a[@]}") 2>>"$RV_CLI_ERR_ONE")" || rc=$?
+        if grep -q 'Approval mode overridden' "$RV_CLI_ERR_ONE" 2>/dev/null; then
           # The read-only lock-down did not hold. Discard the answer: a review
           # that ran with weaker isolation than documented is not delivered.
           printf 'gemini overrode the read-only approval mode (plan) - lock-down not in effect, review discarded\n' > "$RV_ERR"
-          return 0
+          RV_RC=0; return 0
         fi
         if printf '%s' "$gout" | jq -e 'has("response")' >/dev/null 2>&1; then
           printf '%s' "$gout" | jq -r '.response // ""'
         else
-          printf '%s' "$gout" | jq -r '.error.message // empty' 2>/dev/null >> "$RV_CLI_ERR"
+          printf '%s' "$gout" | jq -r '.error.message // empty' 2>/dev/null >> "$RV_CLI_ERR_ONE"
         fi;;
     esac
-    if [ "$rc" -ne 0 ] && [ ! -s "$RV_ERR" ]; then
-      local hint=""
+    RV_RC=$rc; return 0
+  }
+
+  # Retry wrapper, same policy as the HTTP API path: transient failures (5xx,
+  # 429/529, "high demand", overloaded, rate limits, timeouts) are retried with
+  # backoff; auth and usage errors are not - they need a human, not a retry.
+  RV_CLI_ERR_ONE="$OUTDIR/.review-cli-stderr.last"
+  exec 4>&1   # the console: rv_ask's stdout/stderr are captured, retry notices must still show
+  RV_RETRY_DELAY="${VIBECHECK_REVIEW_RETRY_DELAY:-15}"   # seconds x attempt, capped at 60
+  rv_cli() {  # prompt on stdin -> model text on stdout; records the final error
+    local pf of attempt=1 wait_s
+    pf="$(mktemp)"; of="$(mktemp)"; cat > "$pf"
+    while :; do
+      : > "$RV_CLI_ERR_ONE"; RV_RC=0
+      rv_cli_once < "$pf" > "$of"
+      cat "$RV_CLI_ERR_ONE" >> "$RV_CLI_ERR"
+      [ -s "$RV_ERR" ] && break                       # terminal (e.g. lock-down not held)
+      [ "$RV_RC" -eq 0 ] && break
+      grep -qiE '401|403|unauthori|authenticat|IneligibleTier|not logged in|api key|usage:|invalid (flag|arg|model)' "$RV_CLI_ERR_ONE" && break
+      grep -qiE 'HTTP status: (429|5[0-9][0-9])|(^|[^0-9])(429|500|502|503|504|529)([^0-9]|$)|high demand|overloaded|rate.?limit|RESOURCE_EXHAUSTED|UNAVAILABLE|try again later|timed? ?out|ETIMEDOUT|ECONNRESET' "$RV_CLI_ERR_ONE" || break
+      [ "$attempt" -ge "$RV_RETRIES" ] && break
+      wait_s=$((attempt * RV_RETRY_DELAY)); [ "$wait_s" -gt 60 ] && wait_s=60
+      warn "review: $RV_MODE call failed transiently (exit $RV_RC) - retry $attempt/$((RV_RETRIES - 1)) in ${wait_s}s" >&4
+      sleep "$wait_s"; attempt=$((attempt + 1))
+    done
+    cat "$of"; rm -f "$pf" "$of"
+    if [ "$RV_RC" -ne 0 ] && [ ! -s "$RV_ERR" ]; then
+      local hint="" tries=""
+      [ "$attempt" -gt 1 ] && tries=" after $attempt attempts"
       # Since 2026-06-18 the Gemini CLI serves enterprise Code Assist only.
-      grep -q 'IneligibleTierError' "$RV_CLI_ERR" 2>/dev/null && \
+      grep -q 'IneligibleTierError' "$RV_CLI_ERR_ONE" 2>/dev/null && \
         hint=" [individual Google accounts can no longer use the Gemini CLI - use --review-provider gemini-api with GEMINI_API_KEY]"
-      printf '%s exited %s: %s%s\n' "$RV_MODE" "$rc" "$(grep -v 'Approval mode overridden' "$RV_CLI_ERR" | tr '\n' ' ' | cut -c1-200)" "$hint" > "$RV_ERR"
+      printf '%s exited %s%s: %s%s\n' "$RV_MODE" "$RV_RC" "$tries" "$(grep -v 'Approval mode overridden' "$RV_CLI_ERR_ONE" | tr '\n' ' ' | cut -c1-200)" "$hint" > "$RV_ERR"
     fi
     return 0
   }
@@ -1348,7 +1378,7 @@ if [ "$DO_REVIEW" = 1 ]; then
               wait_s="$(awk -F': *' 'tolower($1)=="retry-after"{gsub(/\r/,"",$2); print int($2)}' "$hfile" 2>/dev/null | head -1)"
               [ -n "$wait_s" ] && [ "$wait_s" -gt 0 ] 2>/dev/null || wait_s=$((attempt * 10))
               [ "$wait_s" -gt 120 ] && wait_s=120
-              printf '  review API returned HTTP %s - retry %s/%s in %ss\n' "$code" "$attempt" "$((RV_RETRIES - 1))" "$wait_s" >&2
+              printf '  review API returned HTTP %s - retry %s/%s in %ss\n' "$code" "$attempt" "$((RV_RETRIES - 1))" "$wait_s" >&4
               sleep "$wait_s"; attempt=$((attempt + 1));;
             *) break;;
           esac
