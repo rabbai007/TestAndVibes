@@ -17,7 +17,7 @@ read-only dynamic** checks against a URL you control, and an optional
 |------|----------------|---------|
 | 🔑 Secrets | Committed / working-tree credentials (verified only) | trufflehog, gitleaks |
 | 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) **+ AI/LLM (OWASP-LLM), SSRF, resource-exhaustion** | semgrep + [`rules/`](rules/) |
-| 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) | trivy + osv-scanner + npm audit + grype |
+| 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) **+ CISA KEV: actively exploited CVEs raised to critical** | trivy + osv-scanner + npm audit + grype + [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
 | 🧭 Review *(default; needs a provider)* | Access control, tenant isolation, lifecycle, races, missing controls, prompt injection | an LLM |
@@ -81,12 +81,16 @@ targets). No config required.
 | `--semgrep-config X` | `auto` | Semgrep ruleset; `p/ci` avoids the network |
 | `--secrets-strict` | — | Rate unverified secrets high instead of medium |
 | `--skip-secrets`/`-sast`/`-deps`/`-iac` | — | Explicitly skip a pass (recorded as *skipped*) |
+| `--kev` | **on** | Match dependency CVEs against CISA KEV. On by default (warns if the feed is unreachable); passing `--kev` makes an unreachable feed an **ERROR** |
+| `--no-kev` | — | Skip the CISA KEV check |
+| `--kev-file PATH` | — | Use a local copy of the KEV JSON feed (air-gapped CI; implies `--kev`) |
 | `--review` | **on** | Adversarial reasoning pass (report-only). Runs by default when a provider exists; **skips** if none. |
 | `--no-review` | — | Turn the review pass off |
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
-| `--review-model` | `claude-opus-5` | Model for the review pass |
+| `--review-provider` | `auto` | `auto` \| `cmd` \| `anthropic` \| `claude` \| `codex` \| `gemini-api` \| `gemini` — pin the review's model provider (see *Providers*) |
+| `--review-model` | provider default | Model for the review pass. Unset = the CLI's own default; the Anthropic HTTP API defaults to `claude-opus-5-5` |
 | `--review-effort` | `high` | `low\|medium\|high\|xhigh\|max` |
-| `--review-budget` | `200000` | Max bytes of source sent for review |
+| `--review-budget` | `400000` | Max bytes of source sent for review (~100k tokens). Files that do not fit are listed and the review is marked **PARTIAL** — never silently dropped |
 | `--review-skeptics` | `2` | Independent refutation attempts per finding |
 | `--review-cmd CMD` | — | Provider override: prompt on stdin, text on stdout |
 | `--mcp TARGET` | — | Probe a running MCP server (read-only): URL or command to spawn |
@@ -140,6 +144,44 @@ recognised as the same vulnerability rather than counted twice. Which scanners
 corroborated a finding is deliberately *not* part of its fingerprint, so
 installing another tool never invalidates your baseline.
 
+## Actively exploited: the CISA KEV check
+
+The advisory databases say a CVE **exists**. CISA's
+[Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
+catalog says it is **being exploited in the wild** — the strongest prioritisation
+signal there is, and the list US federal agencies must patch against a deadline.
+
+After the dependency pass, every CVE (and every CVE alias of a GHSA id, via
+OSV's alias table and grype's related-vulnerability data) is matched against the
+catalog, fetched fresh from cisa.gov on each run. A match is **raised to
+critical** whatever its CVSS, and labelled with CISA's due date and whether it is
+known to be used in ransomware campaigns:
+
+```
+▶ 3b. CISA Known Exploited Vulnerabilities
+  ✗ CISA KEV: 1 dependency CVE(s) are being actively exploited in the wild - raised to critical
+      · CVE-2020-11023  jquery@3.4.1: ...  (CISA due 2025-02-13, ransomware: Unknown)
+```
+
+That one is real, and it is the point: all four scanners rate it **medium**, so
+without KEV it passes a `--fail-on high` gate.
+
+- `findings.json` keeps `severity_original` and a `kev` object (`cve`, `dateAdded`,
+  `dueDate`, `ransomware`, `name`); the report records the catalog version used.
+- **The baseline cannot quietly accept an exploited CVE.** An entry accepted
+  *before* the CVE was KEV-listed stops suppressing it — accepting a medium is not
+  accepting an actively exploited bug. Re-accept it deliberately with
+  `--write-baseline`, which records `"kev": true`.
+- **Unreachable feed:** by default a warning, recorded in the report as *KEV NOT
+  checked* (a cisa.gov outage should not redden every build). Pass `--kev` to make
+  it an ERROR (exit 3). On air-gapped runners, mirror the
+  [JSON feed](https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json)
+  and pass `--kev-file`; a copy older than 14 days warns.
+- **Scope, honestly:** KEV is weighted toward vendor products (VPNs, firewalls,
+  Windows), so hits on application dependencies are rare — but when one fires,
+  it is the finding to fix today. Matching is by CVE id: an advisory with no CVE
+  alias cannot match. EPSS (exploit *probability*) is not yet used.
+
 ## The adversarial review pass
 
 Everything else in VibeCheck matches patterns. `--review` reasons instead: it is
@@ -166,12 +208,55 @@ Every candidate is put to independent **refutation** — skeptics asked to argue
 *against* it, defaulting to refuted. A majority refuting drops it. Findings that
 survive are reported with their reasoning; refuted ones are counted, not shown.
 
-**Providers**, in precedence order: `--review-cmd` (anything — prompt on stdin,
-text on stdout, so self-hosted models work), `ANTHROPIC_API_KEY` (the HTTP API),
-or a local `claude` CLI. The review runs **by default** when one is present; with
+**Providers.** The review works with whichever AI tool you already use. With
+`--review-provider auto` (the default) the first available one wins:
+
+| Order | Provider | Needs | Model when `--review-model` is unset | Effort |
+|---|---|---|---|---|
+| 1 | `cmd` | `--review-cmd CMD` (prompt on stdin, text on stdout — self-hosted, Ollama, anything) | yours | yours |
+| 2 | `anthropic` | `ANTHROPIC_API_KEY` (HTTP API, with retries) | `claude-opus-5-5` | `output_config.effort` |
+| 3 | `claude` | Claude Code CLI, signed in | the CLI's default | `--effort` |
+| 4 | `codex` | OpenAI Codex CLI, signed in (`codex login`) | the CLI's default | `model_reasoning_effort` |
+| 5 | `gemini-api` | Google's [Gemini API CLI](https://github.com/google-gemini/gemini-api-cli) + `GEMINI_API_KEY` | the CLI's default | not supported (ignored, noted) |
+| 6 | `gemini` | Gemini CLI — **Gemini Code Assist Standard/Enterprise only** since 2026-06-18 | the CLI's default | not supported (ignored, noted) |
+
+**Using Gemini:** use `gemini-api` with a `GEMINI_API_KEY`. Since June 18, 2026,
+free and Google AI Pro/Ultra accounts can no longer use the Gemini CLI (they moved
+to the Antigravity CLI, `agy`), and `gemini-api` is the better fit anyway: a
+stateless API call with no agent and no tools. **`agy` is not supported as a
+provider:** headless `agy` takes the prompt only as a command-line argument
+(`-p`), which Linux caps at 128 KB per argument — smaller than a typical review
+context — and it has no documented way to disable its tools, only a soft-deny of
+actions that need approval.
+
+Pin one with `--review-provider codex` (a pinned provider that is missing is an
+ERROR — it never silently falls back to another), and pick a model with
+`--review-model`, e.g. `--review-provider gemini --review-model gemini-2.5-pro`.
+
+**AI CLIs run locked down.** They are agents, and the code under review may be
+hostile: a prompt injection in a scanned file could otherwise steer the CLI
+into reading secrets or running commands. Each one runs from an **empty scratch
+directory** with the strictest mode it has — `claude -p --tools ""
+--strict-mcp-config`, `codex exec --sandbox read-only --ephemeral`, `gemini
+--skip-trust --approval-mode plan` (headless Gemini also denies anything needing
+approval; `--skip-trust` stops it silently downgrading `plan` in an untrusted
+folder, and is safe because that folder is the empty scratch dir — if Gemini
+still reports a downgrade, the review is discarded and the pass fails closed);
+`gemini-api` has no tools to begin with. The
+prompt carries all the code the review needs, so nothing is lost.
+
+The review runs **by default** when a provider is present; with
 no provider it **skips gracefully** (the rest of the scan still runs, so a
 provider-less CI job is not reddened). An *explicit* `--review` with no provider
 is an **ERROR (exit 3)** — never a quiet "reviewed, found nothing".
+
+Transient failures are retried with backoff on every provider — over the HTTP
+API (network errors, 408, 429, 5xx including 529 overloaded; honouring
+`Retry-After`) and on the CLIs (5xx, 429, "high demand", overloaded, rate limits,
+timeouts) — 3 attempts by default, `VIBECHECK_REVIEW_RETRIES=N` to change it. Anything else (a bad key, an
+unknown model) fails at once, and the report names the API's own error. A
+response that cannot be parsed as a findings array is an **ERROR**, never "0
+findings".
 
 **Two honest limits.** Identity is anchored to the code (class + file + the
 referenced line) rather than the model's wording, so a reworded finding keeps its
@@ -411,6 +496,19 @@ A scanner that is missing makes its pass an **ERROR**, not a silent skip — use
 `--skip-*` if you don't want that pass. Note `--semgrep-config auto` fetches
 rules from semgrep.dev and needs network access; use `--semgrep-config p/ci` on
 air-gapped runners.
+
+## Testing VibeCheck itself
+
+```bash
+semgrep --test --config rules/ tests/ai-fixtures   # every rule fires on bad, quiet on good
+shellcheck -S warning vibecheck.sh
+bats tests/vibecheck.bats                           # the fail-closed contract
+```
+
+`tests/vibecheck.bats` pins the behaviour a security gate lives or dies by — every
+path where a pass cannot complete must exit 3, not 0. It needs only bash, jq and
+[bats](https://github.com/bats-core/bats-core): no scanners, network, or API key
+(the model provider and the HTTP API are faked). All three run in CI.
 
 ## Philosophy
 

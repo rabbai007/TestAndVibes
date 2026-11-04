@@ -1,5 +1,10 @@
-# Generated scan output (any location).
-vibecheck-report/
+# Generated scan output (any location), including renamed --out dirs such as
+# vibecheck-report-<app>/. Reports describe real vulnerabilities in real apps:
+# never commit one by accident.
+vibecheck-report*/
+
+# macOS Finder metadata.
+.DS_Store
 
 # Local config, read from the repo/target root — anchored with a leading slash
 # so these patterns cannot match same-named files deeper in the tree.

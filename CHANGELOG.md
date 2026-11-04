@@ -9,6 +9,156 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.10.0] — 2026-11-04
+
+Adds the **CISA Known Exploited Vulnerabilities** check, and fixes a fail-open in the
+review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
+
+### Added
+
+- **CISA KEV check** (step 3b, on by default). Dependency CVEs — including the CVE
+  aliases of GHSA ids, from OSV's alias table and grype's related-vulnerability data —
+  are matched against CISA's catalog, fetched fresh from cisa.gov. A match is raised to
+  **critical** whatever its CVSS and labelled with CISA's due date and ransomware use;
+  `findings.json` keeps `severity_original` and a `kev` object. Verified end to end:
+  `jquery@3.4.1` (CVE-2020-11023) is rated medium by all four scanners and passed the
+  default gate; with KEV it fails it.
+- **KEV-aware baseline.** An entry accepted before its CVE was KEV-listed no longer
+  suppresses it; `--write-baseline` records `"kev": true` for a deliberate acceptance.
+- `--kev` (unreachable feed becomes an ERROR, exit 3), `--no-kev`, `--kev-file PATH`
+  (air-gapped CI; warns when the copy is older than 14 days). Default-on with the feed
+  unreachable warns and records *KEV NOT checked* rather than reddening the build.
+- 9 KEV behaviour tests (fake scanners and feed; no network).
+
+### Fixed
+
+Seven of these were found by VibeCheck's own review pass, run against this repository
+before release: two through the new `gemini-api` provider, five through `codex`. Each
+has a test that fails on the unfixed script.
+
+- **`--diff` review could send a host file to the model (data exposure).** Changed-file
+  paths come from git, not the regular-file search, so a pull request could commit a
+  symlink to, say, `~/.aws/credentials` and have its contents put in the review
+  prompt. The review now reads only regular files whose real directory is inside the
+  target; symlinks and out-of-tree paths are skipped with a warning.
+- **One dependency finding per CVE + package hid the other lockfiles.** The same CVE in
+  an unchanged and a changed lockfile merged into one finding that kept the first
+  file, so `--diff` (or a baseline entry for the other file) could drop the new
+  occurrence. The lockfile is now part of the merge key: one finding per lockfile.
+- **`--diff` against a ref with no merge base gated on nothing.** In a shallow checkout
+  `base...HEAD` fails; the error was discarded and only uncommitted files were treated
+  as changed, so every committed finding left the gate. It is now an **ERROR (exit 3)**
+  telling you to fetch full history.
+- **A trufflehog crash read as "0 secrets".** Its exit status was recorded and never
+  checked; with no output the pass reported clean. Exit codes other than 0 (and 183,
+  `--fail`) are now an **ERROR (exit 3)** naming the failed scan and its stderr.
+- **An `npm audit` error was accepted as a completed scan.** npm reports registry and
+  auth failures as valid JSON (`{"error": ...}`); any parseable JSON was accepted and
+  yielded 0 CVEs. A `vulnerabilities` report is now required; otherwise the pass errors
+  with npm's own summary. (This path also crashed on an unset variable when npm was
+  the only dependency source; fixed.)
+
+- **`--diff` never gated grype-only CVEs or MCP findings.** The PR gate keeps findings
+  whose file is in the diff, but grype findings carried the placeholder path
+  `dependencies` and MCP findings carry the server URL/command — neither can match, so
+  both were silently moved out of scope (a KEV-listed CVE seen only by grype included).
+  grype findings now carry the lockfile grype read; MCP findings, like dynamic ones,
+  describe the running target and always stay in scope. *Baseline note:* a grype-only
+  finding's identity changes with its path, so re-accept it once with `--write-baseline`.
+- **`--diff` never prioritised the PR's own files in the review.** The review reads the
+  changed-file list to put those files first in its budget, but the list was written
+  only later, in the Diff scope step. It is now computed before the review; on a repo
+  larger than `--review-budget`, unchanged files no longer crowd out the PR's changes.
+- **`--help` executed an external program.** The help text is an unquoted heredoc and
+  contained a tool name in backticks, which the shell ran as a command substitution
+  every time help was printed (present since the review pass shipped). Escaped; a test
+  now asserts `--help` runs nothing.
+- **The review pass silently skipped large files.** A hidden 120 KB per-file cap dropped
+  any bigger file from the review context without a word and still reported "0
+  findings" — on this repository it skipped `vibecheck.sh` itself (129 KB) and reviewed
+  only 17 test fixtures (7 KB). The cap is gone; files are taken in priority order until
+  `--review-budget` is spent, and any file that does not fit is **listed in the console
+  and the report, with the pass marked PARTIAL**. Default budget raised 200 KB -> 400 KB
+  (~100k input tokens; roughly $0.40 per review run at current Opus pricing).
+- **Refutation judged the wrong code in large files.** Each skeptic was shown the first
+  400 lines of the flagged file, so a finding at line 1,400 was weighed against unrelated
+  code and — skeptics default to REFUTED — dropped. Skeptics now see a numbered window
+  around the claimed line (150 before, 250 after).
+- **The adversarial review could report "0 findings" for a review that produced
+  nothing usable (fail-open).** A model response containing square brackets that
+  was not a valid JSON array — prose such as `the handler at [server.js line 1] looks
+  fine`, or output truncated after an inner `]` — was turned into an empty array and
+  recorded as a clean review. It is now an **ERROR (exit 3)**, like every other pass
+  that cannot complete. Plain prose with no brackets already failed closed.
+- **Review API errors are no longer opaque.** The HTTP status is checked; a 4xx such as
+  a bad key or unknown model fails at once with the API's own error type and message
+  in the report, instead of "review provider returned nothing".
+- **Transient review API failures are retried** (network, 408, 429, 5xx incl. 529
+  overloaded) with backoff that honours `Retry-After`, capped at 120 s per wait —
+  3 attempts by default, `VIBECHECK_REVIEW_RETRIES` to change it. One blip no longer
+  turns a run into exit 3.
+- **Bun projects using the text lockfile (`bun.lock`, the default since Bun 1.2) no
+  longer fail with "no scannable lockfile".** Verified that trivy and osv-scanner both
+  resolve vulnerabilities from it.
+
+### Changed
+
+- **The review pass works with any AI CLI, not one vendor's model.** New
+  `--review-provider` (values in `--help` / the README); `auto` (default) uses the
+  first available: `--review-cmd`, the HTTP API key, then whichever coding CLI is on
+  PATH — OpenAI **Codex** and Google **Gemini** are now first-class alongside the
+  existing CLI provider, plus Google's stateless **Gemini API CLI** (`gemini-api`, the
+  recommended Gemini route since the Gemini CLI became enterprise-only on 2026-06-18).
+  The Antigravity CLI (`agy`) is deliberately not supported: it takes the prompt only as
+  an argument (Linux caps one at 128 KB) and cannot have its tools disabled.
+  `--review-model` is now passed to every provider (previously
+  the CLI path ignored it while the console claimed otherwise); left unset, each CLI
+  uses its own default model. Effort maps to each CLI's native setting (ignored, and
+  said so, where unsupported). A pinned provider that is missing is an ERROR and never
+  falls back.
+- **AI CLIs run locked down.** They are agents and the code under review may carry a
+  prompt injection, so each runs from an empty scratch directory with tools disabled or
+  its strictest read-only mode (no tools / no MCP; read-only sandbox, ephemeral; plan
+  approval mode). Previously the CLI provider ran with its default tool set in the
+  caller's working directory. CLI failures (not signed in, bad model) fail closed and
+  name the error. The Gemini CLI silently downgrades its read-only approval mode in an
+  untrusted folder; VibeCheck trusts only its empty scratch dir for the session, and
+  discards the review (exit 3) if a downgrade is still reported. An individual Google
+  account rejected by the enterprise-only Gemini CLI gets a pointer to `gemini-api`.
+- **CLI providers retry transient failures**, with the same policy as the HTTP API:
+  5xx / 429 / 529, "high demand", overloaded, rate limits and timeouts are retried with
+  backoff (`VIBECHECK_REVIEW_RETRIES`, default 3 attempts); auth and usage errors are
+  not. Found in a real run: a `gemini-api` 503 on a busy model failed the whole review.
+  Retry notices now reach the console for both paths (they were swallowed before).
+- **Quota and billing errors are told apart from load.** A model with no quota on the
+  key's tier (`limit: 0`), an exhausted daily quota, or a billing problem fails at once
+  with a `QUOTA/BILLING` hint naming the model, instead of being retried. Per-minute
+  rate limits are still retried, now after the delay the API asks for ("retry in 23s").
+- **Default HTTP-API review model moves to the current Opus generation** (see `--review-model`
+  in `--help` / the README options table) — ~20% cheaper per token. Effort is still sent
+  explicitly (`high`), so the new model's lower built-in default (`medium`) does not
+  apply. `--review-model` restores the previous model.
+- Refusal fallbacks use the server-chosen form (`fallbacks: "default"`, beta
+  `server-side-fallback-2026-07-01`) instead of a hard-coded fallback model.
+
+### Added (tests)
+
+- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract (56 with the KEV, `--help`, review-coverage, provider, retry, `--diff` and scanner-failure tests): coverage
+  guard, review parse/empty/refusal/no-provider paths, refutation, `--fail-on-review`,
+  and HTTP API error/retry handling (provider and API faked; no network or key).
+- CI: a `script-tests` job runs `shellcheck -S warning` and the bats suite.
+
+### CI / housekeeping
+
+- `.github/workflows/vibecheck-review.yml` was still pinned to v4 (Node 20) action SHAs
+  missed by #14; now `checkout` v7.0.1 / `upload-artifact` v7.0.2. The main workflow
+  moves to `upload-artifact` v7.0.2 and `setup-python` v7.1.0.
+- Baseline entry (with reason) for the mutable tags in the copy-paste template
+  `ci/github-actions-review.yml`, which surfaced as two medium findings in the self-scan.
+- `.gitignore` covers every `vibecheck-report*/` output directory (renamed `--out` dirs
+  hold real vulnerability reports and must not be committed by accident) and `.DS_Store`.
+- shellcheck-clean at warning level (quoting only; no behaviour change).
+
 ## [0.9.0] — 2026-09-24
 
 Acts on pentest feedback: broadens the deterministic SAST layer beyond
@@ -594,6 +744,7 @@ consolidated report plus a CI-friendly exit code.
 - Complementary to [benavlabs/vibe-check](https://github.com/benavlabs/vibe-check)
   (a checklist + AI-rules approach); VibeCheck adds the executable automation layer.
 
-[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.0...v0.10.0
 [0.2.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rabbai007/TestAndVibes/releases/tag/v0.1.0

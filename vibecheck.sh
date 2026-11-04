@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.9.0"
+VERSION="0.10.0"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -42,11 +42,18 @@ DO_REVIEW=1             # default ON (deep review scope); degrades to a skip whe
 REVIEW_EXPLICIT=0        # 1 = user passed --review (then no-provider fails closed, not skips)
 EXTRA_EXCLUDES=()        # --exclude PATH (repeatable): operator-trusted, added to scan excludes
 REVIEW_CMD="${VIBECHECK_REVIEW_CMD:-}"   # override: reads a prompt on stdin, writes JSON to stdout
-REVIEW_MODEL="claude-opus-5"
+REVIEW_PROVIDER="auto"  # auto | cmd | anthropic | claude | codex | gemini-api | gemini
+REVIEW_MODEL=""         # empty = the provider's own default (CLIs) / RV_API_DEFAULT_MODEL (HTTP API)
+RV_API_DEFAULT_MODEL="claude-opus-5-5"   # the Anthropic HTTP API needs an explicit model
 REVIEW_EFFORT="high"
-REVIEW_BUDGET=200000    # max bytes of source sent for review
+REVIEW_BUDGET=400000    # max bytes of source sent for review (~100k tokens)
 REVIEW_SKEPTICS=2       # independent refutation attempts per finding
 FAIL_ON_REVIEW=0        # 1 = review findings count toward the exit code
+DO_KEV=1                # default ON: match dependency CVEs against CISA KEV (needs network or --kev-file)
+KEV_EXPLICIT=0          # 1 = user passed --kev / --kev-file (then an unavailable feed fails closed)
+KEV_FILE="${VIBECHECK_KEV_FILE:-}"   # local copy of the KEV JSON feed (air-gapped CI)
+KEV_URL="${VIBECHECK_KEV_URL:-https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json}"
+KEV_STALE_DAYS=14       # warn when a --kev-file catalog is older than this
 MCP_TARGET=""           # opt-in MCP server probe: URL (http/https) or a command to spawn (stdio)
 MCP_TIMEOUT=20          # seconds for the MCP handshake/list calls
 MCP_HEADER=""           # optional single HTTP header for an authed MCP endpoint (e.g. "Authorization: Bearer …")
@@ -95,15 +102,27 @@ OPTIONS
   --skip-sast          Skip the SAST pass
   --skip-deps          Skip the dependency pass
   --skip-iac           Skip the IaC pass
+  --kev                Require the CISA Known Exploited Vulnerabilities check (ON by
+                       default; with --kev an unreachable feed is an ERROR, not a warning).
+                       A dependency CVE listed in KEV is raised to critical.
+  --no-kev             Skip the CISA KEV check
+  --kev-file PATH      Use a local copy of the KEV JSON feed (air-gapped CI; implies --kev)
   --review             Adversarial review pass: an LLM reasons about trust
                        boundaries, lifecycle and logic — the classes no scanner
-                       can reach. ON BY DEFAULT and REPORT-ONLY. Needs
-                       ANTHROPIC_API_KEY, the `claude` CLI, or --review-cmd; with
-                       no provider it is skipped (an explicit --review errors).
+                       can reach. ON BY DEFAULT and REPORT-ONLY. Uses the first
+                       provider found (see --review-provider); with none it is
+                       skipped (an explicit --review errors).
   --no-review          Disable the default adversarial review pass
-  --review-model M     Model for the review (default: claude-opus-5)
-  --review-effort E    low|medium|high|xhigh|max (default: high)
-  --review-budget N    Max bytes of source to send (default: 200000)
+  --review-provider P  auto (default) | cmd | anthropic | claude | codex |
+                       gemini-api | gemini. auto order: --review-cmd,
+                       ANTHROPIC_API_KEY, then the first AI CLI on PATH (claude,
+                       codex, gemini-api, gemini). CLIs run with tools disabled /
+                       read-only, from an empty directory.
+  --review-model M     Model for the review (default: the provider's own default;
+                       anthropic HTTP API: claude-opus-5-5)
+  --review-effort E    low|medium|high|xhigh|max (default: high; gemini/gemini-api ignore it)
+  --review-budget N    Max bytes of source to send (default: 400000); files that
+                       do not fit are listed and the review is marked PARTIAL
   --review-skeptics N  Independent refutation attempts per finding (default: 2)
   --review-cmd CMD     Provider override: reads a prompt on stdin, writes the
                        model's text to stdout
@@ -274,11 +293,15 @@ while [ $# -gt 0 ]; do
     --review) DO_REVIEW=1; REVIEW_EXPLICIT=1; shift;;
     --no-review) DO_REVIEW=0; shift;;
     --review-model) REVIEW_MODEL="${2:?}"; shift 2;;
+    --review-provider) REVIEW_PROVIDER="${2:?--review-provider needs auto|cmd|anthropic|claude|codex|gemini-api|gemini}"; shift 2;;
     --review-effort) REVIEW_EFFORT="${2:?}"; shift 2;;
     --review-budget) REVIEW_BUDGET="${2:?}"; shift 2;;
     --review-skeptics) REVIEW_SKEPTICS="${2:?}"; shift 2;;
     --review-cmd) REVIEW_CMD="${2:?}"; shift 2;;
     --fail-on-review) FAIL_ON_REVIEW=1; shift;;
+    --kev) DO_KEV=1; KEV_EXPLICIT=1; shift;;
+    --no-kev) DO_KEV=0; shift;;
+    --kev-file) KEV_FILE="${2:?--kev-file needs a path}"; DO_KEV=1; KEV_EXPLICIT=1; shift 2;;
     --mcp) MCP_TARGET="${2:?--mcp needs a URL or command}"; shift 2;;
     --mcp-timeout) MCP_TIMEOUT="${2:?}"; shift 2;;
     --mcp-header) MCP_HEADER="${2:?}"; shift 2;;
@@ -530,19 +553,26 @@ elif have trufflehog; then
   # keys, internal tokens). We classify per finding instead.
   UNSEV=medium; [ "$SECRETS_STRICT" = 1 ] && UNSEV=high
   th_json="$OUTDIR/trufflehog.json"; : > "$th_json"
-  th_failed=0
+  th_err="$OUTDIR/.trufflehog.err"; : > "$th_err"
+  th_failed=""
+  # trufflehog exits 0 whether or not it finds secrets (183 only with --fail,
+  # which is accepted too). Anything else means that scan did not complete -
+  # 0.9.0 ignored this, so a crash with no output read as "0 secrets".
   if [ -d "$TARGET/.git" ]; then
-    trufflehog git "file://$TARGET" --json --no-update >> "$th_json" 2>/dev/null || th_failed=$((th_failed+1))
+    trufflehog git "file://$TARGET" --json --no-update >> "$th_json" 2>>"$th_err"; th_rc=$?
+    case "$th_rc" in 0|183) ;; *) th_failed="$th_failed git(exit $th_rc)";; esac
   fi
   trufflehog filesystem "$TARGET" --json --no-update \
-    --exclude-paths "$TH_EXCLUDE" >> "$th_json" 2>/dev/null || th_failed=$((th_failed+1))
+    --exclude-paths "$TH_EXCLUDE" >> "$th_json" 2>>"$th_err"; th_rc=$?
+  case "$th_rc" in 0|183) ;; *) th_failed="$th_failed filesystem(exit $th_rc)";; esac
 
-  # trufflehog exits non-zero when it finds secrets, so a non-zero exit alone
-  # is not an error — only unparseable output is.
-  if ! jq -e -rR 'fromjson? | .DetectorName? // empty' "$th_json" >/dev/null 2>&1 && [ -s "$th_json" ]; then
+  if [ -n "$th_failed" ]; then
+    pass_error secrets "trufflehog scan failed:$th_failed - secrets NOT fully scanned: $(head -c 200 "$th_err" | tr '\n' ' ')"
+  elif ! jq -e -rR 'fromjson? | .DetectorName? // empty' "$th_json" >/dev/null 2>&1 && [ -s "$th_json" ]; then
     pass_error secrets "trufflehog produced unparseable output — see $th_json"
   else
     nv=0; nu=0
+    # shellcheck disable=SC2034  # 'raw' names the 5th field; read must consume it
     while IFS=$'\x1f' read -r verified detector file lineno raw; do
       [ -z "${detector:-}" ] && continue
       f="$(rel "${file:-}")"
@@ -640,6 +670,7 @@ elif have semgrep; then
   # Load every pack in rules/ (vibecheck-extra.yml, vibecheck-ai.yml, …) so new
   # packs are picked up without touching this wiring.
   EXTRA_RULES_DIR="$SELF_DIR/rules"
+  # shellcheck disable=SC2034  # RULESET_EXTRA: set but never read - dead store, harmless; left as-is
   if ls "$EXTRA_RULES_DIR"/*.yml >/dev/null 2>&1; then sg_args+=("--config=$EXTRA_RULES_DIR"); RULESET_EXTRA=1; else
     warn "supplementary rule packs not found in $EXTRA_RULES_DIR — registry rules only"; fi
   for e in "${EXCLUDES[@]}"; do sg_args+=("--exclude=$e"); done
@@ -688,11 +719,12 @@ lockcheck() { # stack  "file1 file2 ..."
   has_stack "$1" || return 0
   local f
   for f in $2; do
+    # shellcheck disable=SC2034  # LOCK_OK: set but never read - dead store, harmless; left as-is
     [ -n "$(findx -name "$f" | head -1)" ] && { LOCK_OK=1; return 0; }
   done
   LOCK_MISSING="$LOCK_MISSING $1"
 }
-lockcheck node   "package-lock.json yarn.lock pnpm-lock.yaml npm-shrinkwrap.json bun.lockb"
+lockcheck node   "package-lock.json yarn.lock pnpm-lock.yaml npm-shrinkwrap.json bun.lock bun.lockb"
 lockcheck python "poetry.lock Pipfile.lock uv.lock requirements.txt"
 lockcheck go     "go.sum"
 lockcheck rust   "Cargo.lock"
@@ -730,6 +762,7 @@ else
   DEP_TSV="$OUTDIR/.deps.tsv"; : > "$DEP_TSV"
   ALIAS_MAP="$OUTDIR/.alias-map.tsv"; : > "$ALIAS_MAP"
   DEP_SRC_OK=""      # sources that completed
+  scanned=0          # set once a source result is merged; unset crashed set -u
   # rank orders which source's record is kept when several report one vuln;
   # lower wins. Fixed order, so the surviving record does not depend on timing.
   dep_row() { printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' "$@" >> "$DEP_TSV"; }
@@ -738,7 +771,7 @@ else
   # ── source: trivy ──
   if have trivy; then
     tv="$OUTDIR/trivy-deps.json"; rm -f "$tv"
-    tv_args=(fs --scanners vuln --severity MEDIUM,HIGH,CRITICAL --quiet --format json --output "$tv")
+    tv_args=(fs --scanners vuln --severity 'MEDIUM,HIGH,CRITICAL' --quiet --format json --output "$tv")
     for e in "${EXCLUDES[@]}"; do tv_args+=(--skip-dirs "$e"); done
     trivy "${tv_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.trivy.err"; tv_rc=$?
     if [ ! -f "$tv" ] || ! jq -e . "$tv" >/dev/null 2>&1; then
@@ -801,7 +834,9 @@ else
     if [ -n "$(findx -name 'package-lock.json' | head -1)" ]; then
       na="$OUTDIR/npm-audit.json"; rm -f "$na"
       (cd "$TARGET" && npm audit --omit=dev --json > "$na" 2>/dev/null) || true
-      if [ -s "$na" ] && jq -e . "$na" >/dev/null 2>&1; then
+      # npm audit reports registry/auth failures as valid JSON ({"error":...}),
+      # so "parses" is not "completed": require the vulnerabilities report.
+      if [ -s "$na" ] && jq -e 'has("vulnerabilities") and (has("error")|not)' "$na" >/dev/null 2>&1; then
         while IFS=$'\x1f' read -r sev pkg title url ghsa; do
           [ -z "${pkg:-}" ] && continue
           case "$sev" in critical) vs=critical;; high) vs=high;; moderate) vs=medium;; *) vs=low;; esac
@@ -815,7 +850,7 @@ else
                           ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$na" 2>/dev/null)
         DEP_SRC_OK="$DEP_SRC_OK npm-audit"
       else
-        deps_error "npm audit produced no parseable JSON"
+        deps_error "npm audit did not complete - $(jq -r '(.error.summary // .error.code // .message // "no vulnerabilities report in its output")|tostring' "$na" 2>/dev/null | head -c 200 || echo 'no parseable JSON')"
       fi
     else
       deps_error "node stack with no package-lock.json — dependencies NOT scanned (run npm i --package-lock-only)"
@@ -827,12 +862,17 @@ else
     gr="$OUTDIR/grype.json"; rm -f "$gr"
     grype "dir:$TARGET" -o json --file "$gr" >/dev/null 2>&1; gr_rc=$?
     if [ -s "$gr" ] && jq -e . "$gr" >/dev/null 2>&1; then
-      while IFS=$'\x1f' read -r sev id pkg url; do
+      # .file is the lockfile grype read (locations are relative to the scan
+      # root, "/package-lock.json"). It used to be the placeholder
+      # "dependencies", which can never match a path - so under --diff every
+      # grype-only CVE, KEV-listed or not, silently dropped out of the gate.
+      while IFS=$'\x1f' read -r sev id pkg url loc; do
         [ -z "${id:-}" ] && continue
         case "$sev" in Critical) vs=critical;; High) vs=high;; Medium) vs=medium;; *) vs=low;; esac
-        dep_row 4 "$vs" "$id" "dependencies" "$pkg" "known vulnerability" "$url" grype
+        dep_row 4 "$vs" "$id" "${loc:-dependencies}" "$pkg" "known vulnerability" "$url" grype
       done < <(jq -r '.matches[]? | [ (.vulnerability.severity//"Unknown"), (.vulnerability.id//""),
-                        (.artifact.name+"@"+(.artifact.version//"?")), (.vulnerability.dataSource//"") ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$gr" 2>/dev/null)
+                        (.artifact.name+"@"+(.artifact.version//"?")), (.vulnerability.dataSource//""),
+                        ((.artifact.locations[0].path // "dependencies") | ltrimstr("/")) ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$gr" 2>/dev/null)
       DEP_SRC_OK="$DEP_SRC_OK grype"
     else
       deps_error "grype exited $gr_rc and produced no parseable JSON"
@@ -853,7 +893,11 @@ else
         { id=$3; if (id in canon && canon[id] != "") id=canon[id]
           if (id == "") next                      # never emit a finding with no id
           pkgname=$5; sub(/@[^@]*$/, "", pkgname) # lodash@4.17.4 -> lodash, so a
-          key=id FS pkgname                       # source omitting the version merges
+          key=id FS pkgname FS $4                 # source omitting the version merges.
+                                                  # The lockfile is part of the key: the
+                                                  # same CVE in two lockfiles is two
+                                                  # findings, or --diff and the baseline
+                                                  # could act on the wrong one.
           if (!(key in seen)) { seen[key]=1; n++; order[n]=key
                                 rec[key]=$2 FS id FS $4 FS $5 FS $6 FS $7; src[key]=$8 }
           else if (index(src[key], $8) == 0) src[key]=src[key] "," $8 }
@@ -878,6 +922,121 @@ else
   fi
 fi
 
+# ── --diff: the changed-file list, computed once, early ──
+# The review pass (6) puts changed files first in its budget, and the Diff
+# scope step gates on them. It used to be written only in the Diff scope step,
+# AFTER the review had looked for it, so the review never prioritised a PR's
+# own files. Validation and errors stay in the Diff scope step.
+diff_changed_files() {  # returns non-zero if the committed diff cannot be computed
+  local prefix raw="$OUTDIR/.changed-raw"
+  prefix="$(git -C "$TARGET" rev-parse --show-prefix 2>/dev/null)"
+  # A ref can exist with no merge base (a shallow checkout): A...B then fails.
+  # That must not degrade to "only the uncommitted files changed".
+  git -C "$TARGET" diff --name-only "$DIFF_REF...HEAD" > "$raw" 2>"$OUTDIR/.diff.err" || return 1
+  git -C "$TARGET" diff --name-only HEAD >> "$raw" 2>>"$OUTDIR/.diff.err" || return 1
+  sed "s|^$prefix||" "$raw" | sed '/^$/d' | sort -u > "$OUTDIR/.changed-files"
+}
+if [ -n "$DIFF_REF" ] && git -C "$TARGET" rev-parse --verify --quiet "$DIFF_REF" >/dev/null 2>&1; then
+  diff_changed_files || rm -f "$OUTDIR/.changed-files"   # reported in the Diff scope step
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 3b. CISA Known Exploited Vulnerabilities (KEV)
+# ═══════════════════════════════════════════════════════════════════
+# The advisory databases above say a CVE EXISTS; KEV says it is being EXPLOITED
+# IN THE WILD (CISA BOD 22-01 / 26-04). That is the strongest prioritisation
+# signal there is, so a KEV-listed dependency CVE is raised to critical whatever
+# its CVSS. The catalog is matched directly - not via one scanner's enrichment -
+# so the answer does not depend on which scanners happen to be installed.
+#
+# Identity is unchanged (the fingerprint is stored at add time), but a baseline
+# entry accepted BEFORE the CVE was KEV-listed no longer suppresses it: "we
+# accept this medium" is not the same decision as "we accept an actively
+# exploited bug". See the baseline split below.
+KEV_N=0; KEV_VERSION=""
+KEV_JSON="$OUTDIR/cisa-kev.json"
+kev_fail() {  # explicit -> fail closed; default-on -> loud warning, recorded
+  if [ "$KEV_EXPLICIT" = 1 ]; then pass_error kev "$1 - CISA KEV NOT checked"
+  else warn "$1 - CISA KEV NOT checked (pass --kev to make this an error, --kev-file for offline)"
+       set_status kev skipped "$1"; fi
+}
+if [ "$DO_KEV" = 1 ] && [ "$DO_DEPS" = 1 ]; then
+  DEP_CVES="$(jq -s '[.[] | select(.tool=="deps")] | length' "$FINDINGS")"
+  if [ "${DEP_CVES:-0}" -eq 0 ]; then
+    set_status kev skipped "no dependency CVEs to check"
+  else
+    head2 "3b. CISA Known Exploited Vulnerabilities"
+    rm -f "$KEV_JSON"
+    if [ -n "$KEV_FILE" ]; then
+      if [ -f "$KEV_FILE" ]; then cp "$KEV_FILE" "$KEV_JSON"
+      else kev_fail "KEV file not found: $KEV_FILE"; fi
+    elif have curl; then
+      kev_code="$(curl -sS --retry 2 --retry-delay 3 --max-time 60 -o "$KEV_JSON" -w '%{http_code}' "$KEV_URL" 2>/dev/null)" || kev_code="${kev_code:-000}"
+      case "$kev_code" in 2??) ;; *) rm -f "$KEV_JSON"; kev_fail "KEV feed download failed (HTTP $kev_code from $KEV_URL)";; esac
+    else
+      kev_fail "curl not installed"
+    fi
+
+    if [ -f "$KEV_JSON" ]; then
+      # A truncated or empty catalog must not read as "nothing exploited".
+      if ! jq -e '(.vulnerabilities|type=="array") and (.vulnerabilities|length > 0)' "$KEV_JSON" >/dev/null 2>&1; then
+        kev_fail "KEV feed is not a valid catalog (no vulnerabilities array)"
+      else
+        KEV_VERSION="$(jq -r '.catalogVersion // "unknown"' "$KEV_JSON")"
+        kev_total="$(jq '.vulnerabilities|length' "$KEV_JSON")"
+        kev_rel="$(jq -r '(.dateReleased // "")[0:10]' "$KEV_JSON")"
+        kev_age="$( [ -n "$kev_rel" ] && days_since "$kev_rel" )"
+        [ -n "$kev_age" ] && [ "$kev_age" -gt "$KEV_STALE_DAYS" ] && \
+          warn "KEV catalog is $kev_age days old ($KEV_VERSION) - refresh the --kev-file copy"
+        printf '%s\n' "$(jq -cn --arg v "CISA KEV $KEV_VERSION ($kev_total entries)" \
+          '{tool:"cisa-kev", pass:"deps", version:$v, installed:true}')" >> "$TOOLING"
+
+        # Candidate CVE ids per finding: the id itself plus every alias we know.
+        # OSV's alias table bridges GHSA<->CVE; grype's relatedVulnerabilities
+        # adds the same bridge when osv-scanner is absent. Used for this lookup
+        # only - the dedup merge above is untouched, so fingerprints are stable.
+        KEV_ALIASES="$OUTDIR/.kev-aliases.jsonl"; : > "$KEV_ALIASES"
+        [ -s "${ALIAS_MAP:-}" ] && awk -F'\037' '{print $1"\t"$2; print $2"\t"$1}' "$ALIAS_MAP" \
+          | jq -R -c 'split("\t") | {id:.[0], alias:.[1]}' >> "$KEV_ALIASES" 2>/dev/null
+        [ -s "$OUTDIR/grype.json" ] && jq -c '.matches[]? | .vulnerability.id as $i
+            | (.relatedVulnerabilities // [])[] | {id:$i, alias:.id}, {id:.id, alias:$i}' \
+            "$OUTDIR/grype.json" >> "$KEV_ALIASES" 2>/dev/null
+
+        KEV_TMP="$OUTDIR/.findings.kev.jsonl"
+        # -s: build the lookup tables once, not once per finding.
+        jq -s -c --slurpfile kev "$KEV_JSON" --slurpfile al <(jq -s '.' "$KEV_ALIASES") '
+          ($kev[0].vulnerabilities | map({key:.cveID, value:.}) | from_entries) as $k |
+          ($al[0] | group_by(.id) | map({key:.[0].id, value:map(.alias)}) | from_entries) as $a |
+          .[] |
+          if .tool != "deps" then . else
+            ([.rule] + ($a[.rule] // []) | map(ascii_upcase) | unique
+              | map(select(startswith("CVE-") and ($k[.] != null)))) as $hits |
+            if ($hits|length) == 0 then . else
+              $k[$hits[0]] as $e |
+              . + { severity_original: .severity, severity: "critical",
+                    kev: { cve: $e.cveID, dateAdded: $e.dateAdded, dueDate: $e.dueDate,
+                           ransomware: ($e.knownRansomwareCampaignUse // "Unknown"),
+                           name: $e.vulnerabilityName },
+                    title: ("[CISA KEV: actively exploited, \($e.cveID), CISA due \($e.dueDate), ransomware: \($e.knownRansomwareCampaignUse // "Unknown")] " + .title) }
+            end
+          end' "$FINDINGS" > "$KEV_TMP" && mv "$KEV_TMP" "$FINDINGS"
+
+        KEV_N="$(jq -s '[.[] | select(.kev != null)] | length' "$FINDINGS")"
+        if [ "$KEV_N" -gt 0 ]; then
+          bad "CISA KEV: $KEV_N dependency CVE(s) are being actively exploited in the wild - raised to critical"
+          jq -r 'select(.kev != null) | "      · \(.kev.cve)  \(.title | sub("^\\[CISA KEV[^]]*\\] "; ""))  (CISA due \(.kev.dueDate), ransomware: \(.kev.ransomware))"' "$FINDINGS"
+          set_status kev findings "$KEV_N of $DEP_CVES dependency CVE(s) in CISA KEV $KEV_VERSION"
+        else
+          ok "CISA KEV: none of $DEP_CVES dependency CVE(s) are known-exploited (catalog $KEV_VERSION, $kev_total entries)"
+          set_status kev ok "0 of $DEP_CVES in CISA KEV $KEV_VERSION"
+        fi
+      fi
+    fi
+  fi
+elif [ "$DO_KEV" = 0 ]; then
+  set_status kev skipped "disabled by --no-kev"
+fi
+
 # ═══════════════════════════════════════════════════════════════════
 # 4. IaC / container misconfig
 # ═══════════════════════════════════════════════════════════════════
@@ -893,7 +1052,7 @@ elif ! have trivy; then
   pass_error iac "IaC files present but trivy is not installed — misconfigurations NOT scanned"
 else
   ti="$OUTDIR/trivy-iac.json"; rm -f "$ti"
-  ti_args=(config --severity MEDIUM,HIGH,CRITICAL --quiet --format json --output "$ti")
+  ti_args=(config --severity 'MEDIUM,HIGH,CRITICAL' --quiet --format json --output "$ti")
   for e in "${EXCLUDES[@]}"; do ti_args+=(--skip-dirs "$e"); done
   trivy "${ti_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.trivy-iac.err"; ti_rc=$?
   if [ ! -f "$ti" ] || ! jq -e . "$ti" >/dev/null 2>&1; then
@@ -1099,37 +1258,190 @@ REVIEW_N=0; REVIEW_REFUTED=0
 if [ "$DO_REVIEW" = 1 ]; then
   head2 "6. Adversarial review (reasoning)"
 
-  # provider ladder: explicit command wins (any provider, self-hosted included),
-  # then the documented HTTP API, then a local claude CLI.
-  RV_MODE=""
-  if [ -n "$REVIEW_CMD" ]; then RV_MODE="cmd"
-  elif [ -n "${ANTHROPIC_API_KEY:-}" ] && have curl; then RV_MODE="api"
-  elif have claude; then RV_MODE="cli"
-  fi
+  # Provider ladder (auto): an explicit command wins (any provider, self-hosted
+  # included), then the Anthropic HTTP API, then whichever AI CLI the developer
+  # already has signed in: claude, codex, gemini. --review-provider pins one; a
+  # pinned provider that is unavailable fails closed rather than falling back.
+  RV_MODE=""; RV_UNAVAILABLE=""
+  rv_available() {
+    case "$1" in
+      cmd)       [ -n "$REVIEW_CMD" ];;
+      anthropic) [ -n "${ANTHROPIC_API_KEY:-}" ] && have curl;;
+      claude|codex|gemini-api|gemini) have "$1";;
+      *) return 1;;
+    esac
+  }
+  case "$REVIEW_PROVIDER" in
+    auto)
+      for p in cmd anthropic claude codex gemini-api gemini; do
+        rv_available "$p" && { RV_MODE="$p"; break; }
+      done;;
+    cmd|anthropic|claude|codex|gemini-api|gemini)
+      if rv_available "$REVIEW_PROVIDER"; then RV_MODE="$REVIEW_PROVIDER"
+      else RV_UNAVAILABLE="$REVIEW_PROVIDER"; fi;;
+    *) err "unknown --review-provider: $REVIEW_PROVIDER (auto|cmd|anthropic|claude|codex|gemini-api|gemini)"; exit 2;;
+  esac
+  [ "$RV_MODE" = anthropic ] && [ -z "$REVIEW_MODEL" ] && REVIEW_MODEL="$RV_API_DEFAULT_MODEL"
+
+  RV_ERR="$OUTDIR/.review-api-error"; : > "$RV_ERR"
+  RV_RETRIES="${VIBECHECK_REVIEW_RETRIES:-3}"   # total attempts per API call
+
+  # AI CLIs are agents: given tools, a prompt-injection planted in the code under
+  # review could steer them into reading secrets or running commands. Each one
+  # runs with tools disabled (or its strictest read-only mode) from an empty
+  # scratch directory - the prompt already carries all the code it needs.
+  RV_JAIL="$(mktemp -d)"; trap 'rm -rf "$RV_JAIL"' EXIT
+  RV_CLI_ERR="$OUTDIR/.review-cli-stderr"; : > "$RV_CLI_ERR"
+  # One provider call: prompt on stdin, model text on stdout. Sets RV_RC; stderr
+  # goes to RV_CLI_ERR_ONE (this attempt only). Must run in the current shell
+  # (redirects, not a pipeline) so RV_RC survives.
+  rv_cli_once() {
+    local rc=0 a=()
+    case "$RV_MODE" in
+      claude)
+        a=(-p --tools "" --strict-mcp-config --no-session-persistence --effort "$REVIEW_EFFORT")
+        [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
+        (cd "$RV_JAIL" && claude "${a[@]}") 2>>"$RV_CLI_ERR_ONE" || rc=$?;;
+      codex)
+        a=(exec --sandbox read-only --cd "$RV_JAIL" --skip-git-repo-check --ephemeral
+           -c "model_reasoning_effort=\"$REVIEW_EFFORT\"")
+        [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
+        (cd "$RV_JAIL" && codex "${a[@]}" -) 2>>"$RV_CLI_ERR_ONE" || rc=$?;;
+      gemini-api)
+        # Google's stateless Gemini API CLI: one request, no agent, no tools -
+        # nothing for an injected prompt to steer. Prompt on --stdin; with no
+        # --output-format it prints only the answer. Needs GEMINI_API_KEY (or
+        # `gemini-api configure`). Non-zero exit = API/usage/auth failure.
+        a=(generate --stdin --stream=false --no-interactive)
+        [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
+        (cd "$RV_JAIL" && gemini-api "${a[@]}") 2>>"$RV_CLI_ERR_ONE" || rc=$?;;
+      gemini)
+        # Gemini CLI - since 2026-06-18 for Gemini Code Assist Standard/Enterprise
+        # and legacy paid keys only; other accounts moved to agy (see README).
+        # plan = read-only approval mode; headless mode also turns every
+        # ask-the-user decision into DENY. JSON output separates the answer
+        # from any error. The CLI silently downgrades plan to "default" in an
+        # untrusted folder, so --skip-trust trusts the cwd for this session -
+        # safe only because the cwd is our EMPTY scratch dir (no settings,
+        # hooks, extensions or context files for trust to enable).
+        a=(--skip-trust --approval-mode plan --output-format json -p "Follow the instructions given on standard input exactly.")
+        [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
+        local gout; gout="$( (cd "$RV_JAIL" && gemini "${a[@]}") 2>>"$RV_CLI_ERR_ONE")" || rc=$?
+        if grep -q 'Approval mode overridden' "$RV_CLI_ERR_ONE" 2>/dev/null; then
+          # The read-only lock-down did not hold. Discard the answer: a review
+          # that ran with weaker isolation than documented is not delivered.
+          printf 'gemini overrode the read-only approval mode (plan) - lock-down not in effect, review discarded\n' > "$RV_ERR"
+          RV_RC=0; return 0
+        fi
+        if printf '%s' "$gout" | jq -e 'has("response")' >/dev/null 2>&1; then
+          printf '%s' "$gout" | jq -r '.response // ""'
+        else
+          printf '%s' "$gout" | jq -r '.error.message // empty' 2>/dev/null >> "$RV_CLI_ERR_ONE"
+        fi;;
+    esac
+    RV_RC=$rc; return 0
+  }
+
+  # Retry wrapper, same policy as the HTTP API path: transient failures (5xx,
+  # 429/529, "high demand", overloaded, rate limits, timeouts) are retried with
+  # backoff; auth and usage errors are not - they need a human, not a retry.
+  RV_CLI_ERR_ONE="$OUTDIR/.review-cli-stderr.last"
+  exec 4>&1   # the console: rv_ask's stdout/stderr are captured, retry notices must still show
+  RV_RETRY_DELAY="${VIBECHECK_REVIEW_RETRY_DELAY:-15}"   # seconds x attempt, capped at 60
+  rv_cli() {  # prompt on stdin -> model text on stdout; records the final error
+    local pf of attempt=1 wait_s
+    RV_QUOTA=0
+    pf="$(mktemp)"; of="$(mktemp)"; cat > "$pf"
+    while :; do
+      : > "$RV_CLI_ERR_ONE"; RV_RC=0
+      rv_cli_once < "$pf" > "$of"
+      cat "$RV_CLI_ERR_ONE" >> "$RV_CLI_ERR"
+      [ -s "$RV_ERR" ] && break                       # terminal (e.g. lock-down not held)
+      [ "$RV_RC" -eq 0 ] && break
+      grep -qiE '401|403|unauthori|authenticat|IneligibleTier|not logged in|api key|usage:|invalid (flag|arg|model)' "$RV_CLI_ERR_ONE" && break
+      # Quota/billing, not load: a model with no quota on this tier ("limit: 0"),
+      # an exhausted daily quota, or a billing problem will not clear in a minute.
+      if grep -qiE 'limit: ?0([^0-9]|$)|per ?day|PerDay|daily|check your plan and billing|billing (details|account|is not enabled)|insufficient.{0,20}(credit|quota|balance)|credit balance' "$RV_CLI_ERR_ONE"; then
+        RV_QUOTA=1; break
+      fi
+      grep -qiE 'HTTP status: (429|5[0-9][0-9])|(^|[^0-9])(429|500|502|503|504|529)([^0-9]|$)|high demand|overloaded|rate.?limit|RESOURCE_EXHAUSTED|UNAVAILABLE|try again later|timed? ?out|ETIMEDOUT|ECONNRESET' "$RV_CLI_ERR_ONE" || break
+      [ "$attempt" -ge "$RV_RETRIES" ] && break
+      wait_s=$((attempt * RV_RETRY_DELAY)); [ "$wait_s" -gt 60 ] && wait_s=60
+      # Per-minute rate limits say when to come back ("Please retry in 23.4s" /
+      # retryDelay "23s"); honour that instead of guessing, up to 90 s.
+      local hinted; hinted="$(grep -oiE 'retry in [0-9]+(\.[0-9]+)?s|retryDelay"?: ?"?[0-9]+s' "$RV_CLI_ERR_ONE" | head -1 | grep -oE '[0-9]+' | head -1)"
+      if [ -n "$hinted" ]; then wait_s=$((hinted + 1)); [ "$wait_s" -gt 90 ] && wait_s=90; fi
+      warn "review: $RV_MODE call failed transiently (exit $RV_RC) - retry $attempt/$((RV_RETRIES - 1)) in ${wait_s}s" >&4
+      sleep "$wait_s"; attempt=$((attempt + 1))
+    done
+    cat "$of"; rm -f "$pf" "$of"
+    if [ "$RV_RC" -ne 0 ] && [ ! -s "$RV_ERR" ]; then
+      local hint="" tries=""
+      [ "$attempt" -gt 1 ] && tries=" after $attempt attempts"
+      # Since 2026-06-18 the Gemini CLI serves enterprise Code Assist only.
+      grep -q 'IneligibleTierError' "$RV_CLI_ERR_ONE" 2>/dev/null && \
+        hint=" [individual Google accounts can no longer use the Gemini CLI - use --review-provider gemini-api with GEMINI_API_KEY]"
+      [ "$RV_QUOTA" = 1 ] && \
+        hint=" [QUOTA/BILLING, not retried: this key has no quota left for ${REVIEW_MODEL:-the default model} (free tier, daily cap, or billing not enabled). Enable billing for the key's project, or pick a model your tier includes with --review-model]"
+      # hint first: the reported line is truncated, the hint is the actionable part
+      printf '%s exited %s%s:%s %s\n' "$RV_MODE" "$RV_RC" "$tries" "$hint" "$(grep -v 'Approval mode overridden' "$RV_CLI_ERR_ONE" | tr '\n' ' ' | cut -c1-200)" > "$RV_ERR"
+    fi
+    return 0
+  }
 
   rv_ask() {   # prompt on stdin, model text on stdout
     local prompt; prompt="$(cat)"
     case "$RV_MODE" in
       cmd) printf '%s' "$prompt" | sh -c "$REVIEW_CMD" 2>/dev/null;;
-      cli) printf '%s' "$prompt" | claude -p 2>/dev/null;;
-      api)
-        local body resp
+      claude|codex|gemini-api|gemini) printf '%s' "$prompt" | rv_cli;;
+      anthropic)
+        local body resp code attempt=1 wait_s rfile hfile
         # jq builds the body so the code under review is escaped correctly.
-        # Opus 5 runs adaptive thinking by default and rejects budget_tokens and
-        # temperature; effort belongs inside output_config. Refusal fallbacks are
-        # opted into because reviewing security code trips classifiers now and then.
+        # Opus 5.5 always runs adaptive thinking and rejects budget_tokens and
+        # temperature; effort belongs inside output_config (set explicitly - the
+        # model's own default is "medium"). Refusal fallbacks are opted into
+        # because reviewing security code trips classifiers now and then;
+        # "default" lets the server pick the fallback by refusal category.
         body="$(jq -n --arg m "$REVIEW_MODEL" --arg e "$REVIEW_EFFORT" --arg p "$prompt" \
           '{model:$m, max_tokens:16000,
             thinking:{type:"adaptive"},
             output_config:{effort:$e},
-            fallbacks:[{model:"claude-opus-4-8"}],
+            fallbacks:"default",
             messages:[{role:"user", content:$p}]}')"
-        resp="$(curl -sS https://api.anthropic.com/v1/messages \
-          -H "Content-Type: application/json" \
-          -H "x-api-key: $ANTHROPIC_API_KEY" \
-          -H "anthropic-version: 2023-06-01" \
-          -H "anthropic-beta: server-side-fallback-2026-06-01" \
-          --max-time 900 -d "$body" 2>/dev/null)"
+        rfile="$(mktemp)"; hfile="$(mktemp)"
+        # Retry transient failures (network, 408, 429, 5xx incl. 529 overloaded)
+        # so one blip does not turn the whole run into an exit 3. Anything else
+        # (400/401/403/404) is a configuration problem: fail at once, loudly.
+        while :; do
+          code="$(curl -sS https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "anthropic-beta: server-side-fallback-2026-07-01" \
+            --max-time 900 -o "$rfile" -D "$hfile" -w '%{http_code}' \
+            -d "$body" 2>/dev/null)" || code="${code:-000}"
+          case "$code" in
+            2??) break;;
+            000|408|429|5??)
+              if [ "$attempt" -ge "$RV_RETRIES" ]; then break; fi
+              wait_s="$(awk -F': *' 'tolower($1)=="retry-after"{gsub(/\r/,"",$2); print int($2)}' "$hfile" 2>/dev/null | head -1)"
+              [ -n "$wait_s" ] && [ "$wait_s" -gt 0 ] 2>/dev/null || wait_s=$((attempt * 10))
+              [ "$wait_s" -gt 120 ] && wait_s=120
+              printf '  review API returned HTTP %s - retry %s/%s in %ss\n' "$code" "$attempt" "$((RV_RETRIES - 1))" "$wait_s" >&4
+              sleep "$wait_s"; attempt=$((attempt + 1));;
+            *) break;;
+          esac
+        done
+        resp="$(cat "$rfile" 2>/dev/null)"; rm -f "$rfile" "$hfile"
+        case "$code" in
+          2??) ;;
+          *)
+            # Record WHY for the 3 AM operator instead of a bare "returned nothing".
+            printf 'HTTP %s: %s\n' "$code" \
+              "$(printf '%s' "$resp" | jq -er '(.error.type // "error") + ": " + (.error.message // "no message")' 2>/dev/null || printf '%s' "${resp:-no response}" | head -c 300)" \
+              > "$RV_ERR"
+            return 0;;
+        esac
         # A refusal is HTTP 200 with stop_reason "refusal"; check it before reading
         # content, or an empty answer reads as a clean review.
         if [ "$(printf '%s' "$resp" | jq -r '.stop_reason // ""' 2>/dev/null)" = "refusal" ]; then
@@ -1141,24 +1453,41 @@ if [ "$DO_REVIEW" = 1 ]; then
     esac
   }
 
-  if [ -z "$RV_MODE" ]; then
+  if [ -n "$RV_UNAVAILABLE" ]; then
+    # A pinned provider never silently falls back to a different one.
+    pass_error review "--review-provider $RV_UNAVAILABLE is not available ($([ "$RV_UNAVAILABLE" = anthropic ] && echo 'ANTHROPIC_API_KEY unset or curl missing' || { [ "$RV_UNAVAILABLE" = cmd ] && echo 'no --review-cmd given' || echo "'$RV_UNAVAILABLE' not on PATH"; })) - NOT reviewed"
+  elif [ -z "$RV_MODE" ]; then
     if [ "$REVIEW_EXPLICIT" = 1 ]; then
       # Explicitly requested -> fail closed. "reviewed, found nothing" would be a lie.
-      pass_error review "--review requested but no provider available (set ANTHROPIC_API_KEY, install the claude CLI, or pass --review-cmd) - NOT reviewed"
+      pass_error review "--review requested but no provider available (set ANTHROPIC_API_KEY, install the claude, codex or gemini-api CLI, or pass --review-cmd) - NOT reviewed"
     else
       # On by default -> degrade gracefully so provider-less runs (most CI) still
       # work. The report records that the deep review did not run.
-      skip "adversarial review" "no model provider — set ANTHROPIC_API_KEY, install the claude CLI, or pass --review-cmd (or --no-review to silence)"
+      skip "adversarial review" "no model provider — set ANTHROPIC_API_KEY, install the claude, codex or gemini-api CLI, or pass --review-cmd (or --no-review to silence)"
       set_status review skipped "no provider (default review skipped)"
     fi
   else
-    say "  ${C_D}provider: $RV_MODE  model: $REVIEW_MODEL  effort: $REVIEW_EFFORT${C_0}"
+    # (no `case` inside $(...): bash 3.2 mis-parses its `)` patterns there)
+    rv_effort_note=""
+    case "$RV_MODE" in gemini|gemini-api) rv_effort_note=" (not supported by $RV_MODE; ignored)";; esac
+    say "  ${C_D}provider: $RV_MODE  model: ${REVIEW_MODEL:-($RV_MODE default)}  effort: $REVIEW_EFFORT$rv_effort_note${C_0}"
 
     # Context assembly is the hard part: a logic bug spans files, so per-file
     # review misses exactly what this pass exists to find. Order by how likely a
     # file is to carry a trust decision, then fill to the byte budget.
     RV_CTX="$OUTDIR/.review-context.txt"; : > "$RV_CTX"
     RV_LIST="$OUTDIR/.review-files"; : > "$RV_LIST"
+    # The code a skeptic sees: a window around the claimed line in that file
+    # (150 before, 250 after), with line numbers. 0.9.0 sent the first 400
+    # lines, so a skeptic judging a finding deep in a large file saw unrelated
+    # code - and, defaulting to REFUTED, dropped it.
+    rv_window() {  # file line
+      local ln="${2:-0}"; case "$ln" in ''|*[!0-9]*) ln=0;; esac
+      awk -v f="$1" -v ln="$ln" '
+        /^===== FILE: / { p = (index($0, "FILE: " f " ") > 0); n = 0; next }
+        p { n++; lo = (ln > 150 ? ln - 150 : 1); hi = (ln > 0 ? ln + 250 : 400)
+            if (n >= lo && n <= hi) printf "%5d  %s\n", n, $0 }' "$RV_CTX"
+    }
     rv_srcs() { findx -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.jsx' \
                       -o -name '*.py' -o -name '*.go' -o -name '*.rb' -o -name '*.php' \
                       -o -name '*.java' -o -name '*.cs' -o -name '*.rs' -o -name '*.sh'; }
@@ -1166,17 +1495,38 @@ if [ "$DO_REVIEW" = 1 ]; then
       rv_srcs | grep -iE '/(server|app|index|main|api|auth|middleware|route|handler|controller|session|token|permission|tenant)[^/]*$'
       rv_srcs
     } 2>/dev/null | awk '!seen[$0]++' > "$RV_LIST.all"
+    # Files are taken in priority order until the budget is spent. A file that
+    # does not fit is NEVER dropped silently: it is listed, and the pass is
+    # marked PARTIAL. (0.9.0 had a hidden 120 KB per-file cap that skipped the
+    # largest - usually the most important - file and still reported "0 findings".)
+    RV_SKIPPED="$OUTDIR/.review-skipped"; : > "$RV_SKIPPED"
     bytes=0; nfiles=0
+    # Changed-file paths come from git, not findx (-type f), so a PR could add a
+    # symlink to a host file (~/.aws/credentials) and have it sent to the model.
+    # Only regular files whose real directory is inside the target are read.
+    RV_TARGET_P="$(cd "$TARGET" && pwd -P)"
     while IFS= read -r f; do
       [ -f "$f" ] || continue
+      rv_d="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || continue
+      case "$rv_d/" in "$RV_TARGET_P"/*) ;; *) warn "review: $(rel "$f") is outside the target - NOT sent"; continue;; esac
+      if [ -L "$f" ]; then warn "review: $(rel "$f") is a symlink - NOT sent"; continue; fi
       sz=$(wc -c < "$f" 2>/dev/null | tr -d ' '); [ -n "$sz" ] || continue
-      [ "$sz" -gt 120000 ] && continue                  # one huge file would eat the budget
-      [ $((bytes + sz)) -gt "$REVIEW_BUDGET" ] && continue
+      if [ $((bytes + sz)) -gt "$REVIEW_BUDGET" ]; then
+        printf '%s\t%s\n' "$(rel "$f")" "$sz" >> "$RV_SKIPPED"; continue
+      fi
       bytes=$((bytes + sz)); nfiles=$((nfiles + 1))
       printf '%s\n' "$(rel "$f")" >> "$RV_LIST"
       { printf '\n===== FILE: %s =====\n' "$(rel "$f")"; cat "$f"; } >> "$RV_CTX"
     done < "$RV_LIST.all"
+    RV_SKIP_N=$(wc -l < "$RV_SKIPPED" | tr -d ' ')
     say "  ${C_D}context: $nfiles file(s), $bytes bytes (budget $REVIEW_BUDGET)${C_0}"
+    RV_PARTIAL=""
+    if [ "$RV_SKIP_N" -gt 0 ]; then
+      RV_PARTIAL="; PARTIAL: $RV_SKIP_N file(s) NOT reviewed (over --review-budget $REVIEW_BUDGET): $(cut -f1 "$RV_SKIPPED" | head -5 | tr '\n' ' ' | sed 's/ $//')$([ "$RV_SKIP_N" -gt 5 ] && echo " ...")"
+      warn "review: $RV_SKIP_N file(s) did not fit the budget and were NOT reviewed (raise --review-budget):"
+      awk -F'\t' 'NR<=10 {printf "      · %s (%s bytes)\n", $1, $2}' "$RV_SKIPPED"
+      [ "$RV_SKIP_N" -gt 10 ] && say "      · ... $((RV_SKIP_N - 10)) more (see $(basename "$RV_SKIPPED"))"
+    fi
 
     if [ "$nfiles" -eq 0 ]; then
       pass_error review "no reviewable source files found - NOT reviewed"
@@ -1254,12 +1604,20 @@ PROMPT_TAIL
       if grep -q '^REFUSAL:' "$RV_OUT" 2>/dev/null; then
         pass_error review "the model declined the review request ($(head -1 "$RV_OUT")) - NOT reviewed"
       elif [ ! -s "$RV_OUT" ]; then
-        pass_error review "review provider returned nothing - NOT reviewed"
+        if [ -s "$RV_ERR" ]; then
+          pass_error review "review provider call failed ($(head -1 "$RV_ERR" | cut -c1-400)) - NOT reviewed"
+        else
+          pass_error review "review provider returned nothing - NOT reviewed"
+        fi
       else
         # Models sometimes fence the JSON despite instructions; extract rather
         # than fail the pass over formatting.
         RV_JSON="$OUTDIR/.review.json"
-        jq -R -s 'try (capture("(?<j>\\[[\\s\\S]*\\])").j | fromjson) catch []' "$RV_OUT" > "$RV_JSON" 2>/dev/null || echo '[]' > "$RV_JSON"
+        # A response with no parseable array must NOT become [] — that would
+        # record "reviewed, 0 findings" for a review that produced nothing usable.
+        # Emit a non-array sentinel so the check below fails closed.
+        jq -R -s 'try (capture("(?<j>\\[[\\s\\S]*\\])").j | fromjson) catch {"vibecheck_parse_error": true}' \
+          "$RV_OUT" > "$RV_JSON" 2>/dev/null || echo '{"vibecheck_parse_error": true}' > "$RV_JSON"
         if ! jq -e 'type=="array"' "$RV_JSON" >/dev/null 2>&1; then
           pass_error review "could not parse the review response as JSON - NOT reviewed (raw output in $(basename "$RV_OUT"))"
         else
@@ -1269,6 +1627,7 @@ PROMPT_TAIL
           # Refutation: make the model argue against its own finding. Independent
           # skeptics, each asked to REFUTE; a majority refuting drops it. This is
           # what makes model output safe to put in front of a reviewer.
+          # shellcheck disable=SC2034  # 'conf' names the last field; read must consume it
           while IFS=$'\x1f' read -r sev cls file line anchor title why conf; do
             [ -z "${title:-}" ] && continue
             refuted=0; i=0
@@ -1284,7 +1643,7 @@ File: $file (around line $line)
 Reasoning given: $why
 
 Relevant code:
-$(awk -v f="$file" '/^===== FILE: /{p=(index($0, "FILE: " f " ")>0)} p' "$RV_CTX" | head -400)
+$(rv_window "$file" "$line")
 
 Answer with ONLY one word: REFUTED if the claim is wrong, does not apply, or
 cannot be substantiated from this code; CONFIRMED if it is genuinely exploitable
@@ -1313,8 +1672,8 @@ PROMPT_R
                                 || ok "review: no findings survived refutation"
           [ "$REVIEW_REFUTED" -gt 0 ] && say "  ${C_D}$REVIEW_REFUTED candidate(s) refuted and dropped${C_0}"
           [ "$FAIL_ON_REVIEW" = 1 ] || say "  ${C_D}report-only (pass --fail-on-review to let these affect the exit code)${C_0}"
-          if [ "$REVIEW_N" -gt 0 ]; then set_status review findings "$REVIEW_N surviving, $REVIEW_REFUTED refuted"
-          else set_status review ok "0 findings ($REVIEW_REFUTED refuted)"; fi
+          if [ "$REVIEW_N" -gt 0 ]; then set_status review findings "$REVIEW_N surviving, $REVIEW_REFUTED refuted$RV_PARTIAL"
+          else set_status review ok "0 findings ($REVIEW_REFUTED refuted)$RV_PARTIAL"; fi
         fi
       fi
     fi
@@ -1477,7 +1836,8 @@ if [ "$WRITE_BASELINE" = 1 ]; then
       generated: $today,
       note: "VibeCheck accepted findings. Entries suppress a finding from the exit-code gate; they are still listed in the report. Delete an entry to re-gate it.",
       entries: ( group_by(.fingerprint)
-                 | map( (.[0] | {fingerprint, tool, rule, file, title}) + {occurrences: length} )
+                 | map( (.[0] | {fingerprint, tool, rule, file, title}) + {occurrences: length}
+                        + (if (map(.kev) | map(select(. != null)) | length) > 0 then {kev: true} else {} end) )
                  | map( . as $n
                         | ($bykey[$n.fingerprint] // null) as $o
                         | $n + { added: ($o.added // $today),
@@ -1498,10 +1858,21 @@ BASE_N=0; BASE_STALE=0
 if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ] && [ -f "$BASELINE" ]; then
   jq -r '.entries[]?.fingerprint' "$BASELINE" 2>/dev/null | sort -u > "$OUTDIR/.bl-fps"
   # An accepted finding is suppressed from the gate but still reported.
-  jq -c --slurpfile bl <(jq '[.entries[]?.fingerprint]' "$BASELINE") \
-    'select((.fingerprint as $f | $bl[0] | index($f)) != null)' "$FINDINGS" > "$ACCEPTED"
-  jq -c --slurpfile bl <(jq '[.entries[]?.fingerprint]' "$BASELINE") \
-    'select((.fingerprint as $f | $bl[0] | index($f)) == null)' "$FINDINGS" > "$ACTIVE"
+  # A CISA KEV finding is suppressed only by an entry accepted while it was
+  # already KEV-listed ("kev": true). Accepting a medium CVE is not accepting an
+  # actively exploited one, so KEV listing after the fact re-gates the finding.
+  BL_KEYS="$OUTDIR/.bl-keys.json"
+  jq '{all: [.entries[]?.fingerprint], kev: [.entries[]? | select(.kev == true) | .fingerprint]}' "$BASELINE" > "$BL_KEYS"
+  bl_ok='(.fingerprint as $f | ($bl[0].all | index($f)) != null
+           and (.kev == null or ($bl[0].kev | index($f)) != null))'
+  jq -c --slurpfile bl "$BL_KEYS" "select($bl_ok)" "$FINDINGS" > "$ACCEPTED"
+  jq -c --slurpfile bl "$BL_KEYS" "select($bl_ok | not)" "$FINDINGS" > "$ACTIVE"
+  jq -r --slurpfile bl "$BL_KEYS" 'select(.kev != null and (.fingerprint as $f | ($bl[0].all | index($f)) != null)
+        and (.fingerprint as $f | ($bl[0].kev | index($f)) == null))
+        | "\(.fingerprint)\u001f\(.kev.cve)\u001f\(.file)"' "$FINDINGS" 2>/dev/null \
+  | while IFS=$'\x1f' read -r kfp kcve kfile; do
+      warn "baseline entry $kfp ($kfile) was accepted before $kcve was listed in CISA KEV - re-gated (re-review; --write-baseline to accept it as KEV)"
+    done
   BASE_N=$(jq -s 'length' "$ACCEPTED")
   head2 "Baseline"
   say "  ${C_D}$BASELINE_LABEL${C_0}"
@@ -1551,24 +1922,23 @@ if [ -n "$DIFF_REF" ]; then
     # Fail closed: silently scoping to nothing would turn --diff into "gate on
     # nothing", which is exactly the fail-open behaviour this tool refuses.
     pass_error diff "git ref '$DIFF_REF' not found — cannot determine what changed (fetch it, or drop --diff)"
+  elif ! diff_changed_files; then
+    pass_error diff "cannot diff against '$DIFF_REF' ($(head -c 160 "$OUTDIR/.diff.err" | tr '\n' ' ')) - no merge base? fetch full history (fetch-depth: 0)"
   else
     CHANGED="$OUTDIR/.changed-files"
-    prefix="$(git -C "$TARGET" rev-parse --show-prefix 2>/dev/null)"
-    { git -C "$TARGET" diff --name-only "$DIFF_REF...HEAD" 2>/dev/null
-      git -C "$TARGET" diff --name-only HEAD 2>/dev/null; } \
-      | sed "s|^$prefix||" | sed '/^$/d' | sort -u > "$CHANGED"
     n_changed=$(wc -l < "$CHANGED" | tr -d ' ')
     say "  ${C_D}$n_changed file(s) changed vs $DIFF_REF${C_0}"
     if [ "$n_changed" -eq 0 ]; then
       ok "no files changed — nothing to gate on"
     fi
     OUTSCOPE="$OUTDIR/.outscope.jsonl"
-    # Dynamic findings describe the running application, not a file in the diff,
-    # so they always stay in scope.
+    # Dynamic and MCP findings describe the running application / server, not a
+    # file in the diff (their .file is a URL or command), so they always stay in
+    # scope - otherwise --diff would silently never gate on them.
     jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
-      'select(.tool=="dynamic" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
+      'select(.tool=="dynamic" or .tool=="mcp" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
     jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
-      'select(.tool!="dynamic" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
+      'select(.tool!="dynamic" and .tool!="mcp" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
     DIFF_N=$(jq -s 'length' "$OUTSCOPE")
     mv "$OUTDIR/.inscope.jsonl" "$ACTIVE"
     [ "$DIFF_N" -gt 0 ] && warn "$DIFF_N pre-existing finding(s) outside the diff — reported, not gated" \
@@ -1898,7 +2268,7 @@ printf '<div class="verdict %s"><div class="vlabel"><span>%s</span><span>%s</spa
 # ── executive summary: KPI row (headline numbers, not a chart) ──
 printf '<h2>Summary of findings</h2>\n<div class="kpis">\n'
 for s in critical high medium low; do
-  case "$s" in critical) cls=t-crit; n=$CRIT;; high) cls=t-high; n=$HIGH;; medium) cls=t-med; n=$MED;; low) cls=t-low; n=$LOW;; esac
+  case "$s" in critical) cls='t-crit'; n=$CRIT;; high) cls='t-high'; n=$HIGH;; medium) cls='t-med'; n=$MED;; low) cls='t-low'; n=$LOW;; esac
   printf '<div class="tile %s"><span class="num">%s</span><span class="lab"><span class="ico">%s</span>%s</span></div>\n' \
     "$cls" "$n" "$(sev_icon "$s")" "$s"
 done
