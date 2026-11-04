@@ -32,8 +32,31 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
 
 ### Fixed
 
-Two of these were found by VibeCheck's own review pass, run against this repository
-through the new `gemini-api` provider before release:
+Seven of these were found by VibeCheck's own review pass, run against this repository
+before release: two through the new `gemini-api` provider, five through `codex`. Each
+has a test that fails on the unfixed script.
+
+- **`--diff` review could send a host file to the model (data exposure).** Changed-file
+  paths come from git, not the regular-file search, so a pull request could commit a
+  symlink to, say, `~/.aws/credentials` and have its contents put in the review
+  prompt. The review now reads only regular files whose real directory is inside the
+  target; symlinks and out-of-tree paths are skipped with a warning.
+- **One dependency finding per CVE + package hid the other lockfiles.** The same CVE in
+  an unchanged and a changed lockfile merged into one finding that kept the first
+  file, so `--diff` (or a baseline entry for the other file) could drop the new
+  occurrence. The lockfile is now part of the merge key: one finding per lockfile.
+- **`--diff` against a ref with no merge base gated on nothing.** In a shallow checkout
+  `base...HEAD` fails; the error was discarded and only uncommitted files were treated
+  as changed, so every committed finding left the gate. It is now an **ERROR (exit 3)**
+  telling you to fetch full history.
+- **A trufflehog crash read as "0 secrets".** Its exit status was recorded and never
+  checked; with no output the pass reported clean. Exit codes other than 0 (and 183,
+  `--fail`) are now an **ERROR (exit 3)** naming the failed scan and its stderr.
+- **An `npm audit` error was accepted as a completed scan.** npm reports registry and
+  auth failures as valid JSON (`{"error": ...}`); any parseable JSON was accepted and
+  yielded 0 CVEs. A `vulnerabilities` report is now required; otherwise the pass errors
+  with npm's own summary. (This path also crashed on an unset variable when npm was
+  the only dependency source; fixed.)
 
 - **`--diff` never gated grype-only CVEs or MCP findings.** The PR gate keeps findings
   whose file is in the diff, but grype findings carried the placeholder path
@@ -120,7 +143,7 @@ through the new `gemini-api` provider before release:
 
 ### Added (tests)
 
-- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract (41 with the KEV, `--help`, review-coverage and provider tests): coverage
+- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract (56 with the KEV, `--help`, review-coverage, provider, retry, `--diff` and scanner-failure tests): coverage
   guard, review parse/empty/refusal/no-provider paths, refutation, `--fail-on-review`,
   and HTTP API error/retry handling (provider and API faked; no network or key).
 - CI: a `script-tests` job runs `shellcheck -S warning` and the bats suite.

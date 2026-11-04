@@ -553,16 +553,22 @@ elif have trufflehog; then
   # keys, internal tokens). We classify per finding instead.
   UNSEV=medium; [ "$SECRETS_STRICT" = 1 ] && UNSEV=high
   th_json="$OUTDIR/trufflehog.json"; : > "$th_json"
-  th_failed=0
+  th_err="$OUTDIR/.trufflehog.err"; : > "$th_err"
+  th_failed=""
+  # trufflehog exits 0 whether or not it finds secrets (183 only with --fail,
+  # which is accepted too). Anything else means that scan did not complete -
+  # 0.9.0 ignored this, so a crash with no output read as "0 secrets".
   if [ -d "$TARGET/.git" ]; then
-    trufflehog git "file://$TARGET" --json --no-update >> "$th_json" 2>/dev/null || th_failed=$((th_failed+1))
+    trufflehog git "file://$TARGET" --json --no-update >> "$th_json" 2>>"$th_err"; th_rc=$?
+    case "$th_rc" in 0|183) ;; *) th_failed="$th_failed git(exit $th_rc)";; esac
   fi
   trufflehog filesystem "$TARGET" --json --no-update \
-    --exclude-paths "$TH_EXCLUDE" >> "$th_json" 2>/dev/null || th_failed=$((th_failed+1))
+    --exclude-paths "$TH_EXCLUDE" >> "$th_json" 2>>"$th_err"; th_rc=$?
+  case "$th_rc" in 0|183) ;; *) th_failed="$th_failed filesystem(exit $th_rc)";; esac
 
-  # trufflehog exits non-zero when it finds secrets, so a non-zero exit alone
-  # is not an error — only unparseable output is.
-  if ! jq -e -rR 'fromjson? | .DetectorName? // empty' "$th_json" >/dev/null 2>&1 && [ -s "$th_json" ]; then
+  if [ -n "$th_failed" ]; then
+    pass_error secrets "trufflehog scan failed:$th_failed - secrets NOT fully scanned: $(head -c 200 "$th_err" | tr '\n' ' ')"
+  elif ! jq -e -rR 'fromjson? | .DetectorName? // empty' "$th_json" >/dev/null 2>&1 && [ -s "$th_json" ]; then
     pass_error secrets "trufflehog produced unparseable output — see $th_json"
   else
     nv=0; nu=0
@@ -756,6 +762,7 @@ else
   DEP_TSV="$OUTDIR/.deps.tsv"; : > "$DEP_TSV"
   ALIAS_MAP="$OUTDIR/.alias-map.tsv"; : > "$ALIAS_MAP"
   DEP_SRC_OK=""      # sources that completed
+  scanned=0          # set once a source result is merged; unset crashed set -u
   # rank orders which source's record is kept when several report one vuln;
   # lower wins. Fixed order, so the surviving record does not depend on timing.
   dep_row() { printf '%s\037%s\037%s\037%s\037%s\037%s\037%s\037%s\n' "$@" >> "$DEP_TSV"; }
@@ -827,7 +834,9 @@ else
     if [ -n "$(findx -name 'package-lock.json' | head -1)" ]; then
       na="$OUTDIR/npm-audit.json"; rm -f "$na"
       (cd "$TARGET" && npm audit --omit=dev --json > "$na" 2>/dev/null) || true
-      if [ -s "$na" ] && jq -e . "$na" >/dev/null 2>&1; then
+      # npm audit reports registry/auth failures as valid JSON ({"error":...}),
+      # so "parses" is not "completed": require the vulnerabilities report.
+      if [ -s "$na" ] && jq -e 'has("vulnerabilities") and (has("error")|not)' "$na" >/dev/null 2>&1; then
         while IFS=$'\x1f' read -r sev pkg title url ghsa; do
           [ -z "${pkg:-}" ] && continue
           case "$sev" in critical) vs=critical;; high) vs=high;; moderate) vs=medium;; *) vs=low;; esac
@@ -841,7 +850,7 @@ else
                           ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$na" 2>/dev/null)
         DEP_SRC_OK="$DEP_SRC_OK npm-audit"
       else
-        deps_error "npm audit produced no parseable JSON"
+        deps_error "npm audit did not complete - $(jq -r '(.error.summary // .error.code // .message // "no vulnerabilities report in its output")|tostring' "$na" 2>/dev/null | head -c 200 || echo 'no parseable JSON')"
       fi
     else
       deps_error "node stack with no package-lock.json — dependencies NOT scanned (run npm i --package-lock-only)"
@@ -884,7 +893,11 @@ else
         { id=$3; if (id in canon && canon[id] != "") id=canon[id]
           if (id == "") next                      # never emit a finding with no id
           pkgname=$5; sub(/@[^@]*$/, "", pkgname) # lodash@4.17.4 -> lodash, so a
-          key=id FS pkgname                       # source omitting the version merges
+          key=id FS pkgname FS $4                 # source omitting the version merges.
+                                                  # The lockfile is part of the key: the
+                                                  # same CVE in two lockfiles is two
+                                                  # findings, or --diff and the baseline
+                                                  # could act on the wrong one.
           if (!(key in seen)) { seen[key]=1; n++; order[n]=key
                                 rec[key]=$2 FS id FS $4 FS $5 FS $6 FS $7; src[key]=$8 }
           else if (index(src[key], $8) == 0) src[key]=src[key] "," $8 }
@@ -914,15 +927,17 @@ fi
 # scope step gates on them. It used to be written only in the Diff scope step,
 # AFTER the review had looked for it, so the review never prioritised a PR's
 # own files. Validation and errors stay in the Diff scope step.
-diff_changed_files() {
-  local prefix
+diff_changed_files() {  # returns non-zero if the committed diff cannot be computed
+  local prefix raw="$OUTDIR/.changed-raw"
   prefix="$(git -C "$TARGET" rev-parse --show-prefix 2>/dev/null)"
-  { git -C "$TARGET" diff --name-only "$DIFF_REF...HEAD" 2>/dev/null
-    git -C "$TARGET" diff --name-only HEAD 2>/dev/null; } \
-    | sed "s|^$prefix||" | sed '/^$/d' | sort -u > "$OUTDIR/.changed-files"
+  # A ref can exist with no merge base (a shallow checkout): A...B then fails.
+  # That must not degrade to "only the uncommitted files changed".
+  git -C "$TARGET" diff --name-only "$DIFF_REF...HEAD" > "$raw" 2>"$OUTDIR/.diff.err" || return 1
+  git -C "$TARGET" diff --name-only HEAD >> "$raw" 2>>"$OUTDIR/.diff.err" || return 1
+  sed "s|^$prefix||" "$raw" | sed '/^$/d' | sort -u > "$OUTDIR/.changed-files"
 }
 if [ -n "$DIFF_REF" ] && git -C "$TARGET" rev-parse --verify --quiet "$DIFF_REF" >/dev/null 2>&1; then
-  diff_changed_files
+  diff_changed_files || rm -f "$OUTDIR/.changed-files"   # reported in the Diff scope step
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1486,8 +1501,15 @@ if [ "$DO_REVIEW" = 1 ]; then
     # largest - usually the most important - file and still reported "0 findings".)
     RV_SKIPPED="$OUTDIR/.review-skipped"; : > "$RV_SKIPPED"
     bytes=0; nfiles=0
+    # Changed-file paths come from git, not findx (-type f), so a PR could add a
+    # symlink to a host file (~/.aws/credentials) and have it sent to the model.
+    # Only regular files whose real directory is inside the target are read.
+    RV_TARGET_P="$(cd "$TARGET" && pwd -P)"
     while IFS= read -r f; do
       [ -f "$f" ] || continue
+      rv_d="$(cd "$(dirname "$f")" 2>/dev/null && pwd -P)" || continue
+      case "$rv_d/" in "$RV_TARGET_P"/*) ;; *) warn "review: $(rel "$f") is outside the target - NOT sent"; continue;; esac
+      if [ -L "$f" ]; then warn "review: $(rel "$f") is a symlink - NOT sent"; continue; fi
       sz=$(wc -c < "$f" 2>/dev/null | tr -d ' '); [ -n "$sz" ] || continue
       if [ $((bytes + sz)) -gt "$REVIEW_BUDGET" ]; then
         printf '%s\t%s\n' "$(rel "$f")" "$sz" >> "$RV_SKIPPED"; continue
@@ -1900,9 +1922,10 @@ if [ -n "$DIFF_REF" ]; then
     # Fail closed: silently scoping to nothing would turn --diff into "gate on
     # nothing", which is exactly the fail-open behaviour this tool refuses.
     pass_error diff "git ref '$DIFF_REF' not found — cannot determine what changed (fetch it, or drop --diff)"
+  elif ! diff_changed_files; then
+    pass_error diff "cannot diff against '$DIFF_REF' ($(head -c 160 "$OUTDIR/.diff.err" | tr '\n' ' ')) - no merge base? fetch full history (fetch-depth: 0)"
   else
     CHANGED="$OUTDIR/.changed-files"
-    diff_changed_files
     n_changed=$(wc -l < "$CHANGED" | tr -d ' ')
     say "  ${C_D}$n_changed file(s) changed vs $DIFF_REF${C_0}"
     if [ "$n_changed" -eq 0 ]; then

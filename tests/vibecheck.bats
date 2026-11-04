@@ -641,3 +641,71 @@ SH
   [ "$status" -eq 1 ]
   [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0002") | .file' "$OUT/findings.json")" = "requirements.txt" ]
 }
+
+# ── second-model review findings (fail-open paths) ─────────────────────────
+
+@test "diff: a changed symlink to a host file is never sent to the review model" {
+  printf 'TOP-SECRET-HOST-FILE\n' > "$BATS_TEST_TMPDIR/host-secret"
+  diff_repo
+  ln -s "$BATS_TEST_TMPDIR/host-secret" "$APP/creds.js"
+  git -C "$APP" -c user.email=t@t -c user.name=t add -A
+  git -C "$APP" -c user.email=t@t -c user.name=t commit -q -m link
+  run "$VC" "${REVIEW_ONLY[@]}" --review --review-cmd 'echo "[]"' --diff main
+  ! grep -q 'TOP-SECRET-HOST-FILE' "$OUT/.review-context.txt"
+  ! grep -qx 'creds.js' "$OUT/.review-files"
+  [[ "$output" == *"creds.js is a symlink - NOT sent"* ]] || false
+}
+
+@test "diff: a ref with no merge base fails closed (exit 3), it does not gate on nothing" {
+  diff_repo
+  git -C "$APP" checkout -q --orphan lonely
+  git -C "$APP" -c user.email=t@t -c user.name=t commit -q -m unrelated
+  git -C "$APP" checkout -q pr
+  run "$VC" "${REVIEW_ONLY[@]}" --review --review-cmd 'echo "[]"' --diff lonely
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"cannot diff against 'lonely'"* ]] || false
+}
+
+@test "deps: the same CVE in two lockfiles is two findings; the changed one gates the PR" {
+  kev_setup
+  mkdir -p "$APP/svc"; printf 'demo==1.0\n' > "$APP/svc/requirements.txt"
+  git -C "$APP" init -q -b main
+  git -C "$APP" -c user.email=t@t -c user.name=t add -A
+  git -C "$APP" -c user.email=t@t -c user.name=t commit -q -m base
+  git -C "$APP" checkout -q -b pr
+  printf 'demo==1.0\n# touched\n' > "$APP/svc/requirements.txt"
+  git -C "$APP" -c user.email=t@t -c user.name=t commit -qam pr
+  # The unchanged lockfile is listed first, so a (CVE, package) dedup kept it.
+  cat > "$FAKE_TRIVY_JSON" <<'JSON'
+{"Results":[
+ {"Target":"requirements.txt","Vulnerabilities":[{"VulnerabilityID":"CVE-2099-0003","PkgName":"demo","InstalledVersion":"1.0","Severity":"HIGH","Title":"t"}]},
+ {"Target":"svc/requirements.txt","Vulnerabilities":[{"VulnerabilityID":"CVE-2099-0003","PkgName":"demo","InstalledVersion":"1.0","Severity":"HIGH","Title":"t"}]}]}
+JSON
+  kev_run "${DEPS_ONLY[@]}" --no-kev --fail-on high --diff main
+  [ "$status" -eq 1 ]
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0003") | .file' "$OUT/findings.json")" = "svc/requirements.txt" ]
+}
+
+@test "deps: an npm audit error document is not a completed scan (exit 3)" {
+  printf '{"name":"a","lockfileVersion":3}\n' > "$APP/package-lock.json"
+  printf '{"name":"a"}\n' > "$APP/package.json"
+  cat > "$BIN/npm" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = "--version" ] && { echo 10.0.0; exit 0; }
+echo '{"error":{"code":"E401","summary":"Unable to authenticate"}}'; exit 1
+SH
+  chmod +x "$BIN/npm"
+  PATH="$BIN:$CLEAN_PATH" run "$VC" --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --no-kev \
+          --skip-secrets --skip-sast --skip-iac
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"npm audit did not complete - Unable to authenticate"* ]] || false
+}
+
+@test "secrets: a trufflehog crash with no output is an error (exit 3), not '0 secrets'" {
+  printf '#!/usr/bin/env bash\necho "fatal: boom" >&2; exit 1\n' > "$BIN/trufflehog"
+  chmod +x "$BIN/trufflehog"
+  PATH="$BIN:$CLEAN_PATH" run "$VC" --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review \
+          --skip-sast --skip-deps --skip-iac
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"trufflehog scan failed: filesystem(exit 1)"* ]] || false
+}
