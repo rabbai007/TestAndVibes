@@ -9,6 +9,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.9.1] — 2026-11-04
+
+A correctness release for the review pass, plus the script's first behaviour tests.
+
+### Fixed
+
+- **The adversarial review could report "0 findings" for a review that produced
+  nothing usable (fail-open).** A model response containing square brackets that
+  was not a valid JSON array — prose such as `the handler at [server.js line 1] looks
+  fine`, or output truncated after an inner `]` — was turned into an empty array and
+  recorded as a clean review. It is now an **ERROR (exit 3)**, like every other pass
+  that cannot complete. Plain prose with no brackets already failed closed.
+- **Review API errors are no longer opaque.** The HTTP status is checked; a 4xx such as
+  a bad key or unknown model fails at once with the API's own error type and message
+  in the report, instead of "review provider returned nothing".
+- **Transient review API failures are retried** (network, 408, 429, 5xx incl. 529
+  overloaded) with backoff that honours `Retry-After`, capped at 120 s per wait —
+  3 attempts by default, `VIBECHECK_REVIEW_RETRIES` to change it. One blip no longer
+  turns a run into exit 3.
+- **Bun projects using the text lockfile (`bun.lock`, the default since Bun 1.2) no
+  longer fail with "no scannable lockfile".** Verified that trivy and osv-scanner both
+  resolve vulnerabilities from it.
+
+### Changed
+
+- **Default review model is now `claude-opus-5-5`** (was `claude-opus-5`) — the current
+  Opus, ~20% cheaper per token. Effort is still sent explicitly (`high`), so Opus 5.5's
+  lower built-in default (`medium`) does not apply. `--review-model claude-opus-5`
+  restores the old behaviour.
+- Refusal fallbacks use the server-chosen form (`fallbacks: "default"`, beta
+  `server-side-fallback-2026-07-01`) instead of a hard-coded fallback model.
+
+### Added
+
+- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract: coverage
+  guard, review parse/empty/refusal/no-provider paths, refutation, `--fail-on-review`,
+  and HTTP API error/retry handling (provider and API faked; no network or key).
+- CI: a `script-tests` job runs `shellcheck -S warning` and the bats suite.
+
+### CI / housekeeping
+
+- `.github/workflows/vibecheck-review.yml` was still pinned to v4 (Node 20) action SHAs
+  missed by #14; now `checkout` v7.0.1 / `upload-artifact` v7.0.2. The main workflow
+  moves to `upload-artifact` v7.0.2 and `setup-python` v7.1.0.
+- Baseline entry (with reason) for the mutable tags in the copy-paste template
+  `ci/github-actions-review.yml`, which surfaced as two medium findings in the self-scan.
+- `.gitignore` covers every `vibecheck-report*/` output directory (renamed `--out` dirs
+  hold real vulnerability reports and must not be committed by accident) and `.DS_Store`.
+- shellcheck-clean at warning level (quoting only; no behaviour change).
+
 ## [0.9.0] — 2026-09-24
 
 Acts on pentest feedback: broadens the deterministic SAST layer beyond
@@ -594,6 +644,7 @@ consolidated report plus a CI-friendly exit code.
 - Complementary to [benavlabs/vibe-check](https://github.com/benavlabs/vibe-check)
   (a checklist + AI-rules approach); VibeCheck adds the executable automation layer.
 
-[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.1...HEAD
+[0.9.1]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.0...v0.9.1
 [0.2.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rabbai007/TestAndVibes/releases/tag/v0.1.0

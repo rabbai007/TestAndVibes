@@ -84,7 +84,7 @@ targets). No config required.
 | `--review` | **on** | Adversarial reasoning pass (report-only). Runs by default when a provider exists; **skips** if none. |
 | `--no-review` | — | Turn the review pass off |
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
-| `--review-model` | `claude-opus-5` | Model for the review pass |
+| `--review-model` | `claude-opus-5-5` | Model for the review pass |
 | `--review-effort` | `high` | `low\|medium\|high\|xhigh\|max` |
 | `--review-budget` | `200000` | Max bytes of source sent for review |
 | `--review-skeptics` | `2` | Independent refutation attempts per finding |
@@ -172,6 +172,13 @@ or a local `claude` CLI. The review runs **by default** when one is present; wit
 no provider it **skips gracefully** (the rest of the scan still runs, so a
 provider-less CI job is not reddened). An *explicit* `--review` with no provider
 is an **ERROR (exit 3)** — never a quiet "reviewed, found nothing".
+
+Over the HTTP API, transient failures (network errors, 408, 429, 5xx including
+529 overloaded) are retried with backoff, honouring `Retry-After` — 3 attempts by
+default, `VIBECHECK_REVIEW_RETRIES=N` to change it. Anything else (a bad key, an
+unknown model) fails at once, and the report names the API's own error. A
+response that cannot be parsed as a findings array is an **ERROR**, never "0
+findings".
 
 **Two honest limits.** Identity is anchored to the code (class + file + the
 referenced line) rather than the model's wording, so a reworded finding keeps its
@@ -411,6 +418,19 @@ A scanner that is missing makes its pass an **ERROR**, not a silent skip — use
 `--skip-*` if you don't want that pass. Note `--semgrep-config auto` fetches
 rules from semgrep.dev and needs network access; use `--semgrep-config p/ci` on
 air-gapped runners.
+
+## Testing VibeCheck itself
+
+```bash
+semgrep --test --config rules/ tests/ai-fixtures   # every rule fires on bad, quiet on good
+shellcheck -S warning vibecheck.sh
+bats tests/vibecheck.bats                           # the fail-closed contract
+```
+
+`tests/vibecheck.bats` pins the behaviour a security gate lives or dies by — every
+path where a pass cannot complete must exit 3, not 0. It needs only bash, jq and
+[bats](https://github.com/bats-core/bats-core): no scanners, network, or API key
+(the model provider and the HTTP API are faked). All three run in CI.
 
 ## Philosophy
 

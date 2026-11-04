@@ -20,6 +20,24 @@ permissions:
   security-events: write    # required to upload SARIF to Code Scanning
 
 jobs:
+  # The script's own behaviour: lint + the fail-closed contract (tests/vibecheck.bats).
+  # Separate job so "the gate's code is broken" is never confused with "the gate
+  # found something". Needs no scanners, network, or API key.
+  script-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+
+      - name: shellcheck (warning and above)
+        # Preinstalled on ubuntu-latest.
+        run: shellcheck --version && shellcheck -S warning vibecheck.sh
+
+      - name: Install bats + jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats jq
+
+      - name: bats - fail-closed contract
+        run: bats tests/vibecheck.bats
+
   vibecheck:
     runs-on: ubuntu-latest
     steps:
@@ -27,7 +45,7 @@ jobs:
         with:
           fetch-depth: 0    # full history for secret scanning
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97   # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0   # v7.1.0
         with:
           python-version: "3.12"
 
@@ -100,7 +118,7 @@ jobs:
           sarif_file: vibecheck-report/vibecheck.sarif
           category: vibecheck
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a   # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
         if: always()
         with:
           name: vibecheck-report

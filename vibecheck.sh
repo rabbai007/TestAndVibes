@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.9.0"
+VERSION="0.9.1"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -42,7 +42,7 @@ DO_REVIEW=1             # default ON (deep review scope); degrades to a skip whe
 REVIEW_EXPLICIT=0        # 1 = user passed --review (then no-provider fails closed, not skips)
 EXTRA_EXCLUDES=()        # --exclude PATH (repeatable): operator-trusted, added to scan excludes
 REVIEW_CMD="${VIBECHECK_REVIEW_CMD:-}"   # override: reads a prompt on stdin, writes JSON to stdout
-REVIEW_MODEL="claude-opus-5"
+REVIEW_MODEL="claude-opus-5-5"
 REVIEW_EFFORT="high"
 REVIEW_BUDGET=200000    # max bytes of source sent for review
 REVIEW_SKEPTICS=2       # independent refutation attempts per finding
@@ -101,7 +101,7 @@ OPTIONS
                        ANTHROPIC_API_KEY, the `claude` CLI, or --review-cmd; with
                        no provider it is skipped (an explicit --review errors).
   --no-review          Disable the default adversarial review pass
-  --review-model M     Model for the review (default: claude-opus-5)
+  --review-model M     Model for the review (default: claude-opus-5-5)
   --review-effort E    low|medium|high|xhigh|max (default: high)
   --review-budget N    Max bytes of source to send (default: 200000)
   --review-skeptics N  Independent refutation attempts per finding (default: 2)
@@ -543,6 +543,7 @@ elif have trufflehog; then
     pass_error secrets "trufflehog produced unparseable output — see $th_json"
   else
     nv=0; nu=0
+    # shellcheck disable=SC2034  # 'raw' names the 5th field; read must consume it
     while IFS=$'\x1f' read -r verified detector file lineno raw; do
       [ -z "${detector:-}" ] && continue
       f="$(rel "${file:-}")"
@@ -640,6 +641,7 @@ elif have semgrep; then
   # Load every pack in rules/ (vibecheck-extra.yml, vibecheck-ai.yml, …) so new
   # packs are picked up without touching this wiring.
   EXTRA_RULES_DIR="$SELF_DIR/rules"
+  # shellcheck disable=SC2034  # RULESET_EXTRA: set but never read - dead store, harmless; left as-is
   if ls "$EXTRA_RULES_DIR"/*.yml >/dev/null 2>&1; then sg_args+=("--config=$EXTRA_RULES_DIR"); RULESET_EXTRA=1; else
     warn "supplementary rule packs not found in $EXTRA_RULES_DIR — registry rules only"; fi
   for e in "${EXCLUDES[@]}"; do sg_args+=("--exclude=$e"); done
@@ -688,11 +690,12 @@ lockcheck() { # stack  "file1 file2 ..."
   has_stack "$1" || return 0
   local f
   for f in $2; do
+    # shellcheck disable=SC2034  # LOCK_OK: set but never read - dead store, harmless; left as-is
     [ -n "$(findx -name "$f" | head -1)" ] && { LOCK_OK=1; return 0; }
   done
   LOCK_MISSING="$LOCK_MISSING $1"
 }
-lockcheck node   "package-lock.json yarn.lock pnpm-lock.yaml npm-shrinkwrap.json bun.lockb"
+lockcheck node   "package-lock.json yarn.lock pnpm-lock.yaml npm-shrinkwrap.json bun.lock bun.lockb"
 lockcheck python "poetry.lock Pipfile.lock uv.lock requirements.txt"
 lockcheck go     "go.sum"
 lockcheck rust   "Cargo.lock"
@@ -738,7 +741,7 @@ else
   # ── source: trivy ──
   if have trivy; then
     tv="$OUTDIR/trivy-deps.json"; rm -f "$tv"
-    tv_args=(fs --scanners vuln --severity MEDIUM,HIGH,CRITICAL --quiet --format json --output "$tv")
+    tv_args=(fs --scanners vuln --severity 'MEDIUM,HIGH,CRITICAL' --quiet --format json --output "$tv")
     for e in "${EXCLUDES[@]}"; do tv_args+=(--skip-dirs "$e"); done
     trivy "${tv_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.trivy.err"; tv_rc=$?
     if [ ! -f "$tv" ] || ! jq -e . "$tv" >/dev/null 2>&1; then
@@ -893,7 +896,7 @@ elif ! have trivy; then
   pass_error iac "IaC files present but trivy is not installed — misconfigurations NOT scanned"
 else
   ti="$OUTDIR/trivy-iac.json"; rm -f "$ti"
-  ti_args=(config --severity MEDIUM,HIGH,CRITICAL --quiet --format json --output "$ti")
+  ti_args=(config --severity 'MEDIUM,HIGH,CRITICAL' --quiet --format json --output "$ti")
   for e in "${EXCLUDES[@]}"; do ti_args+=(--skip-dirs "$e"); done
   trivy "${ti_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.trivy-iac.err"; ti_rc=$?
   if [ ! -f "$ti" ] || ! jq -e . "$ti" >/dev/null 2>&1; then
@@ -1107,29 +1110,62 @@ if [ "$DO_REVIEW" = 1 ]; then
   elif have claude; then RV_MODE="cli"
   fi
 
+  RV_ERR="$OUTDIR/.review-api-error"; : > "$RV_ERR"
+  RV_RETRIES="${VIBECHECK_REVIEW_RETRIES:-3}"   # total attempts per API call
+
   rv_ask() {   # prompt on stdin, model text on stdout
     local prompt; prompt="$(cat)"
     case "$RV_MODE" in
       cmd) printf '%s' "$prompt" | sh -c "$REVIEW_CMD" 2>/dev/null;;
       cli) printf '%s' "$prompt" | claude -p 2>/dev/null;;
       api)
-        local body resp
+        local body resp code attempt=1 wait_s rfile hfile
         # jq builds the body so the code under review is escaped correctly.
-        # Opus 5 runs adaptive thinking by default and rejects budget_tokens and
-        # temperature; effort belongs inside output_config. Refusal fallbacks are
-        # opted into because reviewing security code trips classifiers now and then.
+        # Opus 5.5 always runs adaptive thinking and rejects budget_tokens and
+        # temperature; effort belongs inside output_config (set explicitly - the
+        # model's own default is "medium"). Refusal fallbacks are opted into
+        # because reviewing security code trips classifiers now and then;
+        # "default" lets the server pick the fallback by refusal category.
         body="$(jq -n --arg m "$REVIEW_MODEL" --arg e "$REVIEW_EFFORT" --arg p "$prompt" \
           '{model:$m, max_tokens:16000,
             thinking:{type:"adaptive"},
             output_config:{effort:$e},
-            fallbacks:[{model:"claude-opus-4-8"}],
+            fallbacks:"default",
             messages:[{role:"user", content:$p}]}')"
-        resp="$(curl -sS https://api.anthropic.com/v1/messages \
-          -H "Content-Type: application/json" \
-          -H "x-api-key: $ANTHROPIC_API_KEY" \
-          -H "anthropic-version: 2023-06-01" \
-          -H "anthropic-beta: server-side-fallback-2026-06-01" \
-          --max-time 900 -d "$body" 2>/dev/null)"
+        rfile="$(mktemp)"; hfile="$(mktemp)"
+        # Retry transient failures (network, 408, 429, 5xx incl. 529 overloaded)
+        # so one blip does not turn the whole run into an exit 3. Anything else
+        # (400/401/403/404) is a configuration problem: fail at once, loudly.
+        while :; do
+          code="$(curl -sS https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "anthropic-beta: server-side-fallback-2026-07-01" \
+            --max-time 900 -o "$rfile" -D "$hfile" -w '%{http_code}' \
+            -d "$body" 2>/dev/null)" || code="${code:-000}"
+          case "$code" in
+            2??) break;;
+            000|408|429|5??)
+              if [ "$attempt" -ge "$RV_RETRIES" ]; then break; fi
+              wait_s="$(awk -F': *' 'tolower($1)=="retry-after"{gsub(/\r/,"",$2); print int($2)}' "$hfile" 2>/dev/null | head -1)"
+              [ -n "$wait_s" ] && [ "$wait_s" -gt 0 ] 2>/dev/null || wait_s=$((attempt * 10))
+              [ "$wait_s" -gt 120 ] && wait_s=120
+              printf '  review API returned HTTP %s - retry %s/%s in %ss\n' "$code" "$attempt" "$((RV_RETRIES - 1))" "$wait_s" >&2
+              sleep "$wait_s"; attempt=$((attempt + 1));;
+            *) break;;
+          esac
+        done
+        resp="$(cat "$rfile" 2>/dev/null)"; rm -f "$rfile" "$hfile"
+        case "$code" in
+          2??) ;;
+          *)
+            # Record WHY for the 3 AM operator instead of a bare "returned nothing".
+            printf 'HTTP %s: %s\n' "$code" \
+              "$(printf '%s' "$resp" | jq -er '(.error.type // "error") + ": " + (.error.message // "no message")' 2>/dev/null || printf '%s' "${resp:-no response}" | head -c 300)" \
+              > "$RV_ERR"
+            return 0;;
+        esac
         # A refusal is HTTP 200 with stop_reason "refusal"; check it before reading
         # content, or an empty answer reads as a clean review.
         if [ "$(printf '%s' "$resp" | jq -r '.stop_reason // ""' 2>/dev/null)" = "refusal" ]; then
@@ -1254,12 +1290,20 @@ PROMPT_TAIL
       if grep -q '^REFUSAL:' "$RV_OUT" 2>/dev/null; then
         pass_error review "the model declined the review request ($(head -1 "$RV_OUT")) - NOT reviewed"
       elif [ ! -s "$RV_OUT" ]; then
-        pass_error review "review provider returned nothing - NOT reviewed"
+        if [ -s "$RV_ERR" ]; then
+          pass_error review "review API call failed ($(head -1 "$RV_ERR" | cut -c1-240)) - NOT reviewed"
+        else
+          pass_error review "review provider returned nothing - NOT reviewed"
+        fi
       else
         # Models sometimes fence the JSON despite instructions; extract rather
         # than fail the pass over formatting.
         RV_JSON="$OUTDIR/.review.json"
-        jq -R -s 'try (capture("(?<j>\\[[\\s\\S]*\\])").j | fromjson) catch []' "$RV_OUT" > "$RV_JSON" 2>/dev/null || echo '[]' > "$RV_JSON"
+        # A response with no parseable array must NOT become [] — that would
+        # record "reviewed, 0 findings" for a review that produced nothing usable.
+        # Emit a non-array sentinel so the check below fails closed.
+        jq -R -s 'try (capture("(?<j>\\[[\\s\\S]*\\])").j | fromjson) catch {"vibecheck_parse_error": true}' \
+          "$RV_OUT" > "$RV_JSON" 2>/dev/null || echo '{"vibecheck_parse_error": true}' > "$RV_JSON"
         if ! jq -e 'type=="array"' "$RV_JSON" >/dev/null 2>&1; then
           pass_error review "could not parse the review response as JSON - NOT reviewed (raw output in $(basename "$RV_OUT"))"
         else
@@ -1269,6 +1313,7 @@ PROMPT_TAIL
           # Refutation: make the model argue against its own finding. Independent
           # skeptics, each asked to REFUTE; a majority refuting drops it. This is
           # what makes model output safe to put in front of a reviewer.
+          # shellcheck disable=SC2034  # 'conf' names the last field; read must consume it
           while IFS=$'\x1f' read -r sev cls file line anchor title why conf; do
             [ -z "${title:-}" ] && continue
             refuted=0; i=0
@@ -1898,7 +1943,7 @@ printf '<div class="verdict %s"><div class="vlabel"><span>%s</span><span>%s</spa
 # ── executive summary: KPI row (headline numbers, not a chart) ──
 printf '<h2>Summary of findings</h2>\n<div class="kpis">\n'
 for s in critical high medium low; do
-  case "$s" in critical) cls=t-crit; n=$CRIT;; high) cls=t-high; n=$HIGH;; medium) cls=t-med; n=$MED;; low) cls=t-low; n=$LOW;; esac
+  case "$s" in critical) cls='t-crit'; n=$CRIT;; high) cls='t-high'; n=$HIGH;; medium) cls='t-med'; n=$MED;; low) cls='t-low'; n=$LOW;; esac
   printf '<div class="tile %s"><span class="num">%s</span><span class="lab"><span class="ico">%s</span>%s</span></div>\n' \
     "$cls" "$n" "$(sev_icon "$s")" "$s"
 done
