@@ -9,12 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
-## [0.9.1] — 2026-11-04
+## [0.10.0] — 2026-11-04
 
-A correctness release for the review pass, plus the script's first behaviour tests.
+Adds the **CISA Known Exploited Vulnerabilities** check, and fixes a fail-open in the
+review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
+
+### Added
+
+- **CISA KEV check** (step 3b, on by default). Dependency CVEs — including the CVE
+  aliases of GHSA ids, from OSV's alias table and grype's related-vulnerability data —
+  are matched against CISA's catalog, fetched fresh from cisa.gov. A match is raised to
+  **critical** whatever its CVSS and labelled with CISA's due date and ransomware use;
+  `findings.json` keeps `severity_original` and a `kev` object. Verified end to end:
+  `jquery@3.4.1` (CVE-2020-11023) is rated medium by all four scanners and passed the
+  default gate; with KEV it fails it.
+- **KEV-aware baseline.** An entry accepted before its CVE was KEV-listed no longer
+  suppresses it; `--write-baseline` records `"kev": true` for a deliberate acceptance.
+- `--kev` (unreachable feed becomes an ERROR, exit 3), `--no-kev`, `--kev-file PATH`
+  (air-gapped CI; warns when the copy is older than 14 days). Default-on with the feed
+  unreachable warns and records *KEV NOT checked* rather than reddening the build.
+- 9 KEV behaviour tests (fake scanners and feed; no network).
 
 ### Fixed
 
+- **`--help` executed the `claude` binary.** The help text is an unquoted heredoc and
+  contained `` `claude` `` in backticks, which the shell ran as a command substitution
+  every time help was printed (present since the review pass shipped). Escaped; a test
+  now asserts `--help` runs nothing.
 - **The adversarial review could report "0 findings" for a review that produced
   nothing usable (fail-open).** A model response containing square brackets that
   was not a valid JSON array — prose such as `the handler at [server.js line 1] looks
@@ -41,9 +62,9 @@ A correctness release for the review pass, plus the script's first behaviour tes
 - Refusal fallbacks use the server-chosen form (`fallbacks: "default"`, beta
   `server-side-fallback-2026-07-01`) instead of a hard-coded fallback model.
 
-### Added
+### Added (tests)
 
-- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract: coverage
+- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract (27 with the KEV and `--help` tests): coverage
   guard, review parse/empty/refusal/no-provider paths, refutation, `--fail-on-review`,
   and HTTP API error/retry handling (provider and API faked; no network or key).
 - CI: a `script-tests` job runs `shellcheck -S warning` and the bats suite.
@@ -644,7 +665,7 @@ consolidated report plus a CI-friendly exit code.
 - Complementary to [benavlabs/vibe-check](https://github.com/benavlabs/vibe-check)
   (a checklist + AI-rules approach); VibeCheck adds the executable automation layer.
 
-[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.1...HEAD
-[0.9.1]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.0...v0.9.1
+[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.0...v0.10.0
 [0.2.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rabbai007/TestAndVibes/releases/tag/v0.1.0

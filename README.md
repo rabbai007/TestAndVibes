@@ -17,7 +17,7 @@ read-only dynamic** checks against a URL you control, and an optional
 |------|----------------|---------|
 | 🔑 Secrets | Committed / working-tree credentials (verified only) | trufflehog, gitleaks |
 | 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) **+ AI/LLM (OWASP-LLM), SSRF, resource-exhaustion** | semgrep + [`rules/`](rules/) |
-| 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) | trivy + osv-scanner + npm audit + grype |
+| 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) **+ CISA KEV: actively exploited CVEs raised to critical** | trivy + osv-scanner + npm audit + grype + [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
 | 🧭 Review *(default; needs a provider)* | Access control, tenant isolation, lifecycle, races, missing controls, prompt injection | an LLM |
@@ -81,6 +81,9 @@ targets). No config required.
 | `--semgrep-config X` | `auto` | Semgrep ruleset; `p/ci` avoids the network |
 | `--secrets-strict` | — | Rate unverified secrets high instead of medium |
 | `--skip-secrets`/`-sast`/`-deps`/`-iac` | — | Explicitly skip a pass (recorded as *skipped*) |
+| `--kev` | **on** | Match dependency CVEs against CISA KEV. On by default (warns if the feed is unreachable); passing `--kev` makes an unreachable feed an **ERROR** |
+| `--no-kev` | — | Skip the CISA KEV check |
+| `--kev-file PATH` | — | Use a local copy of the KEV JSON feed (air-gapped CI; implies `--kev`) |
 | `--review` | **on** | Adversarial reasoning pass (report-only). Runs by default when a provider exists; **skips** if none. |
 | `--no-review` | — | Turn the review pass off |
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
@@ -139,6 +142,44 @@ table, which is what lets a CVE from trivy and a GHSA from npm audit be
 recognised as the same vulnerability rather than counted twice. Which scanners
 corroborated a finding is deliberately *not* part of its fingerprint, so
 installing another tool never invalidates your baseline.
+
+## Actively exploited: the CISA KEV check
+
+The advisory databases say a CVE **exists**. CISA's
+[Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
+catalog says it is **being exploited in the wild** — the strongest prioritisation
+signal there is, and the list US federal agencies must patch against a deadline.
+
+After the dependency pass, every CVE (and every CVE alias of a GHSA id, via
+OSV's alias table and grype's related-vulnerability data) is matched against the
+catalog, fetched fresh from cisa.gov on each run. A match is **raised to
+critical** whatever its CVSS, and labelled with CISA's due date and whether it is
+known to be used in ransomware campaigns:
+
+```
+▶ 3b. CISA Known Exploited Vulnerabilities
+  ✗ CISA KEV: 1 dependency CVE(s) are being actively exploited in the wild - raised to critical
+      · CVE-2020-11023  jquery@3.4.1: ...  (CISA due 2025-02-13, ransomware: Unknown)
+```
+
+That one is real, and it is the point: all four scanners rate it **medium**, so
+without KEV it passes a `--fail-on high` gate.
+
+- `findings.json` keeps `severity_original` and a `kev` object (`cve`, `dateAdded`,
+  `dueDate`, `ransomware`, `name`); the report records the catalog version used.
+- **The baseline cannot quietly accept an exploited CVE.** An entry accepted
+  *before* the CVE was KEV-listed stops suppressing it — accepting a medium is not
+  accepting an actively exploited bug. Re-accept it deliberately with
+  `--write-baseline`, which records `"kev": true`.
+- **Unreachable feed:** by default a warning, recorded in the report as *KEV NOT
+  checked* (a cisa.gov outage should not redden every build). Pass `--kev` to make
+  it an ERROR (exit 3). On air-gapped runners, mirror the
+  [JSON feed](https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json)
+  and pass `--kev-file`; a copy older than 14 days warns.
+- **Scope, honestly:** KEV is weighted toward vendor products (VPNs, firewalls,
+  Windows), so hits on application dependencies are rare — but when one fires,
+  it is the finding to fix today. Matching is by CVE id: an advisory with no CVE
+  alias cannot match. EPSS (exploit *probability*) is not yet used.
 
 ## The adversarial review pass
 

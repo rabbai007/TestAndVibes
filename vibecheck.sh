@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.9.1"
+VERSION="0.10.0"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -47,6 +47,11 @@ REVIEW_EFFORT="high"
 REVIEW_BUDGET=200000    # max bytes of source sent for review
 REVIEW_SKEPTICS=2       # independent refutation attempts per finding
 FAIL_ON_REVIEW=0        # 1 = review findings count toward the exit code
+DO_KEV=1                # default ON: match dependency CVEs against CISA KEV (needs network or --kev-file)
+KEV_EXPLICIT=0          # 1 = user passed --kev / --kev-file (then an unavailable feed fails closed)
+KEV_FILE="${VIBECHECK_KEV_FILE:-}"   # local copy of the KEV JSON feed (air-gapped CI)
+KEV_URL="${VIBECHECK_KEV_URL:-https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json}"
+KEV_STALE_DAYS=14       # warn when a --kev-file catalog is older than this
 MCP_TARGET=""           # opt-in MCP server probe: URL (http/https) or a command to spawn (stdio)
 MCP_TIMEOUT=20          # seconds for the MCP handshake/list calls
 MCP_HEADER=""           # optional single HTTP header for an authed MCP endpoint (e.g. "Authorization: Bearer …")
@@ -95,10 +100,15 @@ OPTIONS
   --skip-sast          Skip the SAST pass
   --skip-deps          Skip the dependency pass
   --skip-iac           Skip the IaC pass
+  --kev                Require the CISA Known Exploited Vulnerabilities check (ON by
+                       default; with --kev an unreachable feed is an ERROR, not a warning).
+                       A dependency CVE listed in KEV is raised to critical.
+  --no-kev             Skip the CISA KEV check
+  --kev-file PATH      Use a local copy of the KEV JSON feed (air-gapped CI; implies --kev)
   --review             Adversarial review pass: an LLM reasons about trust
                        boundaries, lifecycle and logic — the classes no scanner
                        can reach. ON BY DEFAULT and REPORT-ONLY. Needs
-                       ANTHROPIC_API_KEY, the `claude` CLI, or --review-cmd; with
+                       ANTHROPIC_API_KEY, the \`claude\` CLI, or --review-cmd; with
                        no provider it is skipped (an explicit --review errors).
   --no-review          Disable the default adversarial review pass
   --review-model M     Model for the review (default: claude-opus-5-5)
@@ -279,6 +289,9 @@ while [ $# -gt 0 ]; do
     --review-skeptics) REVIEW_SKEPTICS="${2:?}"; shift 2;;
     --review-cmd) REVIEW_CMD="${2:?}"; shift 2;;
     --fail-on-review) FAIL_ON_REVIEW=1; shift;;
+    --kev) DO_KEV=1; KEV_EXPLICIT=1; shift;;
+    --no-kev) DO_KEV=0; shift;;
+    --kev-file) KEV_FILE="${2:?--kev-file needs a path}"; DO_KEV=1; KEV_EXPLICIT=1; shift 2;;
     --mcp) MCP_TARGET="${2:?--mcp needs a URL or command}"; shift 2;;
     --mcp-timeout) MCP_TIMEOUT="${2:?}"; shift 2;;
     --mcp-header) MCP_HEADER="${2:?}"; shift 2;;
@@ -879,6 +892,103 @@ else
   else
     deps_error "no dependency scanner available (trivy, osv-scanner, npm, or grype) — dependencies NOT scanned"
   fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 3b. CISA Known Exploited Vulnerabilities (KEV)
+# ═══════════════════════════════════════════════════════════════════
+# The advisory databases above say a CVE EXISTS; KEV says it is being EXPLOITED
+# IN THE WILD (CISA BOD 22-01 / 26-04). That is the strongest prioritisation
+# signal there is, so a KEV-listed dependency CVE is raised to critical whatever
+# its CVSS. The catalog is matched directly - not via one scanner's enrichment -
+# so the answer does not depend on which scanners happen to be installed.
+#
+# Identity is unchanged (the fingerprint is stored at add time), but a baseline
+# entry accepted BEFORE the CVE was KEV-listed no longer suppresses it: "we
+# accept this medium" is not the same decision as "we accept an actively
+# exploited bug". See the baseline split below.
+KEV_N=0; KEV_VERSION=""
+KEV_JSON="$OUTDIR/cisa-kev.json"
+kev_fail() {  # explicit -> fail closed; default-on -> loud warning, recorded
+  if [ "$KEV_EXPLICIT" = 1 ]; then pass_error kev "$1 - CISA KEV NOT checked"
+  else warn "$1 - CISA KEV NOT checked (pass --kev to make this an error, --kev-file for offline)"
+       set_status kev skipped "$1"; fi
+}
+if [ "$DO_KEV" = 1 ] && [ "$DO_DEPS" = 1 ]; then
+  DEP_CVES="$(jq -s '[.[] | select(.tool=="deps")] | length' "$FINDINGS")"
+  if [ "${DEP_CVES:-0}" -eq 0 ]; then
+    set_status kev skipped "no dependency CVEs to check"
+  else
+    head2 "3b. CISA Known Exploited Vulnerabilities"
+    rm -f "$KEV_JSON"
+    if [ -n "$KEV_FILE" ]; then
+      if [ -f "$KEV_FILE" ]; then cp "$KEV_FILE" "$KEV_JSON"
+      else kev_fail "KEV file not found: $KEV_FILE"; fi
+    elif have curl; then
+      kev_code="$(curl -sS --retry 2 --retry-delay 3 --max-time 60 -o "$KEV_JSON" -w '%{http_code}' "$KEV_URL" 2>/dev/null)" || kev_code="${kev_code:-000}"
+      case "$kev_code" in 2??) ;; *) rm -f "$KEV_JSON"; kev_fail "KEV feed download failed (HTTP $kev_code from $KEV_URL)";; esac
+    else
+      kev_fail "curl not installed"
+    fi
+
+    if [ -f "$KEV_JSON" ]; then
+      # A truncated or empty catalog must not read as "nothing exploited".
+      if ! jq -e '(.vulnerabilities|type=="array") and (.vulnerabilities|length > 0)' "$KEV_JSON" >/dev/null 2>&1; then
+        kev_fail "KEV feed is not a valid catalog (no vulnerabilities array)"
+      else
+        KEV_VERSION="$(jq -r '.catalogVersion // "unknown"' "$KEV_JSON")"
+        kev_total="$(jq '.vulnerabilities|length' "$KEV_JSON")"
+        kev_rel="$(jq -r '(.dateReleased // "")[0:10]' "$KEV_JSON")"
+        kev_age="$( [ -n "$kev_rel" ] && days_since "$kev_rel" )"
+        [ -n "$kev_age" ] && [ "$kev_age" -gt "$KEV_STALE_DAYS" ] && \
+          warn "KEV catalog is $kev_age days old ($KEV_VERSION) - refresh the --kev-file copy"
+        printf '%s\n' "$(jq -cn --arg v "CISA KEV $KEV_VERSION ($kev_total entries)" \
+          '{tool:"cisa-kev", pass:"deps", version:$v, installed:true}')" >> "$TOOLING"
+
+        # Candidate CVE ids per finding: the id itself plus every alias we know.
+        # OSV's alias table bridges GHSA<->CVE; grype's relatedVulnerabilities
+        # adds the same bridge when osv-scanner is absent. Used for this lookup
+        # only - the dedup merge above is untouched, so fingerprints are stable.
+        KEV_ALIASES="$OUTDIR/.kev-aliases.jsonl"; : > "$KEV_ALIASES"
+        [ -s "${ALIAS_MAP:-}" ] && awk -F'\037' '{print $1"\t"$2; print $2"\t"$1}' "$ALIAS_MAP" \
+          | jq -R -c 'split("\t") | {id:.[0], alias:.[1]}' >> "$KEV_ALIASES" 2>/dev/null
+        [ -s "$OUTDIR/grype.json" ] && jq -c '.matches[]? | .vulnerability.id as $i
+            | (.relatedVulnerabilities // [])[] | {id:$i, alias:.id}, {id:.id, alias:$i}' \
+            "$OUTDIR/grype.json" >> "$KEV_ALIASES" 2>/dev/null
+
+        KEV_TMP="$OUTDIR/.findings.kev.jsonl"
+        # -s: build the lookup tables once, not once per finding.
+        jq -s -c --slurpfile kev "$KEV_JSON" --slurpfile al <(jq -s '.' "$KEV_ALIASES") '
+          ($kev[0].vulnerabilities | map({key:.cveID, value:.}) | from_entries) as $k |
+          ($al[0] | group_by(.id) | map({key:.[0].id, value:map(.alias)}) | from_entries) as $a |
+          .[] |
+          if .tool != "deps" then . else
+            ([.rule] + ($a[.rule] // []) | map(ascii_upcase) | unique
+              | map(select(startswith("CVE-") and ($k[.] != null)))) as $hits |
+            if ($hits|length) == 0 then . else
+              $k[$hits[0]] as $e |
+              . + { severity_original: .severity, severity: "critical",
+                    kev: { cve: $e.cveID, dateAdded: $e.dateAdded, dueDate: $e.dueDate,
+                           ransomware: ($e.knownRansomwareCampaignUse // "Unknown"),
+                           name: $e.vulnerabilityName },
+                    title: ("[CISA KEV: actively exploited, \($e.cveID), CISA due \($e.dueDate), ransomware: \($e.knownRansomwareCampaignUse // "Unknown")] " + .title) }
+            end
+          end' "$FINDINGS" > "$KEV_TMP" && mv "$KEV_TMP" "$FINDINGS"
+
+        KEV_N="$(jq -s '[.[] | select(.kev != null)] | length' "$FINDINGS")"
+        if [ "$KEV_N" -gt 0 ]; then
+          bad "CISA KEV: $KEV_N dependency CVE(s) are being actively exploited in the wild - raised to critical"
+          jq -r 'select(.kev != null) | "      · \(.kev.cve)  \(.title | sub("^\\[CISA KEV[^]]*\\] "; ""))  (CISA due \(.kev.dueDate), ransomware: \(.kev.ransomware))"' "$FINDINGS"
+          set_status kev findings "$KEV_N of $DEP_CVES dependency CVE(s) in CISA KEV $KEV_VERSION"
+        else
+          ok "CISA KEV: none of $DEP_CVES dependency CVE(s) are known-exploited (catalog $KEV_VERSION, $kev_total entries)"
+          set_status kev ok "0 of $DEP_CVES in CISA KEV $KEV_VERSION"
+        fi
+      fi
+    fi
+  fi
+elif [ "$DO_KEV" = 0 ]; then
+  set_status kev skipped "disabled by --no-kev"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1522,7 +1632,8 @@ if [ "$WRITE_BASELINE" = 1 ]; then
       generated: $today,
       note: "VibeCheck accepted findings. Entries suppress a finding from the exit-code gate; they are still listed in the report. Delete an entry to re-gate it.",
       entries: ( group_by(.fingerprint)
-                 | map( (.[0] | {fingerprint, tool, rule, file, title}) + {occurrences: length} )
+                 | map( (.[0] | {fingerprint, tool, rule, file, title}) + {occurrences: length}
+                        + (if (map(.kev) | map(select(. != null)) | length) > 0 then {kev: true} else {} end) )
                  | map( . as $n
                         | ($bykey[$n.fingerprint] // null) as $o
                         | $n + { added: ($o.added // $today),
@@ -1543,10 +1654,21 @@ BASE_N=0; BASE_STALE=0
 if [ -n "$BASELINE" ] && [ "$USE_BASELINE" = 1 ] && [ -f "$BASELINE" ]; then
   jq -r '.entries[]?.fingerprint' "$BASELINE" 2>/dev/null | sort -u > "$OUTDIR/.bl-fps"
   # An accepted finding is suppressed from the gate but still reported.
-  jq -c --slurpfile bl <(jq '[.entries[]?.fingerprint]' "$BASELINE") \
-    'select((.fingerprint as $f | $bl[0] | index($f)) != null)' "$FINDINGS" > "$ACCEPTED"
-  jq -c --slurpfile bl <(jq '[.entries[]?.fingerprint]' "$BASELINE") \
-    'select((.fingerprint as $f | $bl[0] | index($f)) == null)' "$FINDINGS" > "$ACTIVE"
+  # A CISA KEV finding is suppressed only by an entry accepted while it was
+  # already KEV-listed ("kev": true). Accepting a medium CVE is not accepting an
+  # actively exploited one, so KEV listing after the fact re-gates the finding.
+  BL_KEYS="$OUTDIR/.bl-keys.json"
+  jq '{all: [.entries[]?.fingerprint], kev: [.entries[]? | select(.kev == true) | .fingerprint]}' "$BASELINE" > "$BL_KEYS"
+  bl_ok='(.fingerprint as $f | ($bl[0].all | index($f)) != null
+           and (.kev == null or ($bl[0].kev | index($f)) != null))'
+  jq -c --slurpfile bl "$BL_KEYS" "select($bl_ok)" "$FINDINGS" > "$ACCEPTED"
+  jq -c --slurpfile bl "$BL_KEYS" "select($bl_ok | not)" "$FINDINGS" > "$ACTIVE"
+  jq -r --slurpfile bl "$BL_KEYS" 'select(.kev != null and (.fingerprint as $f | ($bl[0].all | index($f)) != null)
+        and (.fingerprint as $f | ($bl[0].kev | index($f)) == null))
+        | "\(.fingerprint)\u001f\(.kev.cve)\u001f\(.file)"' "$FINDINGS" 2>/dev/null \
+  | while IFS=$'\x1f' read -r kfp kcve kfile; do
+      warn "baseline entry $kfp ($kfile) was accepted before $kcve was listed in CISA KEV - re-gated (re-review; --write-baseline to accept it as KEV)"
+    done
   BASE_N=$(jq -s 'length' "$ACCEPTED")
   head2 "Baseline"
   say "  ${C_D}$BASELINE_LABEL${C_0}"
