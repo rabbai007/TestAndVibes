@@ -42,7 +42,7 @@ DO_REVIEW=1             # default ON (deep review scope); degrades to a skip whe
 REVIEW_EXPLICIT=0        # 1 = user passed --review (then no-provider fails closed, not skips)
 EXTRA_EXCLUDES=()        # --exclude PATH (repeatable): operator-trusted, added to scan excludes
 REVIEW_CMD="${VIBECHECK_REVIEW_CMD:-}"   # override: reads a prompt on stdin, writes JSON to stdout
-REVIEW_PROVIDER="auto"  # auto | cmd | anthropic | claude | codex | gemini
+REVIEW_PROVIDER="auto"  # auto | cmd | anthropic | claude | codex | gemini-api | gemini
 REVIEW_MODEL=""         # empty = the provider's own default (CLIs) / RV_API_DEFAULT_MODEL (HTTP API)
 RV_API_DEFAULT_MODEL="claude-opus-5-5"   # the Anthropic HTTP API needs an explicit model
 REVIEW_EFFORT="high"
@@ -113,13 +113,14 @@ OPTIONS
                        provider found (see --review-provider); with none it is
                        skipped (an explicit --review errors).
   --no-review          Disable the default adversarial review pass
-  --review-provider P  auto (default) | cmd | anthropic | claude | codex | gemini.
-                       auto order: --review-cmd, ANTHROPIC_API_KEY, then the
-                       first AI CLI on PATH (claude, codex, gemini). CLIs run with
-                       tools disabled / read-only, from an empty directory.
+  --review-provider P  auto (default) | cmd | anthropic | claude | codex |
+                       gemini-api | gemini. auto order: --review-cmd,
+                       ANTHROPIC_API_KEY, then the first AI CLI on PATH (claude,
+                       codex, gemini-api, gemini). CLIs run with tools disabled /
+                       read-only, from an empty directory.
   --review-model M     Model for the review (default: the provider's own default;
                        anthropic HTTP API: claude-opus-5-5)
-  --review-effort E    low|medium|high|xhigh|max (default: high; gemini ignores it)
+  --review-effort E    low|medium|high|xhigh|max (default: high; gemini/gemini-api ignore it)
   --review-budget N    Max bytes of source to send (default: 400000); files that
                        do not fit are listed and the review is marked PARTIAL
   --review-skeptics N  Independent refutation attempts per finding (default: 2)
@@ -292,7 +293,7 @@ while [ $# -gt 0 ]; do
     --review) DO_REVIEW=1; REVIEW_EXPLICIT=1; shift;;
     --no-review) DO_REVIEW=0; shift;;
     --review-model) REVIEW_MODEL="${2:?}"; shift 2;;
-    --review-provider) REVIEW_PROVIDER="${2:?--review-provider needs auto|cmd|anthropic|claude|codex|gemini}"; shift 2;;
+    --review-provider) REVIEW_PROVIDER="${2:?--review-provider needs auto|cmd|anthropic|claude|codex|gemini-api|gemini}"; shift 2;;
     --review-effort) REVIEW_EFFORT="${2:?}"; shift 2;;
     --review-budget) REVIEW_BUDGET="${2:?}"; shift 2;;
     --review-skeptics) REVIEW_SKEPTICS="${2:?}"; shift 2;;
@@ -1230,19 +1231,19 @@ if [ "$DO_REVIEW" = 1 ]; then
     case "$1" in
       cmd)       [ -n "$REVIEW_CMD" ];;
       anthropic) [ -n "${ANTHROPIC_API_KEY:-}" ] && have curl;;
-      claude|codex|gemini) have "$1";;
+      claude|codex|gemini-api|gemini) have "$1";;
       *) return 1;;
     esac
   }
   case "$REVIEW_PROVIDER" in
     auto)
-      for p in cmd anthropic claude codex gemini; do
+      for p in cmd anthropic claude codex gemini-api gemini; do
         rv_available "$p" && { RV_MODE="$p"; break; }
       done;;
-    cmd|anthropic|claude|codex|gemini)
+    cmd|anthropic|claude|codex|gemini-api|gemini)
       if rv_available "$REVIEW_PROVIDER"; then RV_MODE="$REVIEW_PROVIDER"
       else RV_UNAVAILABLE="$REVIEW_PROVIDER"; fi;;
-    *) err "unknown --review-provider: $REVIEW_PROVIDER (auto|cmd|anthropic|claude|codex|gemini)"; exit 2;;
+    *) err "unknown --review-provider: $REVIEW_PROVIDER (auto|cmd|anthropic|claude|codex|gemini-api|gemini)"; exit 2;;
   esac
   [ "$RV_MODE" = anthropic ] && [ -z "$REVIEW_MODEL" ] && REVIEW_MODEL="$RV_API_DEFAULT_MODEL"
 
@@ -1267,7 +1268,17 @@ if [ "$DO_REVIEW" = 1 ]; then
            -c "model_reasoning_effort=\"$REVIEW_EFFORT\"")
         [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
         (cd "$RV_JAIL" && codex "${a[@]}" -) 2>>"$RV_CLI_ERR" || rc=$?;;
+      gemini-api)
+        # Google's stateless Gemini API CLI: one request, no agent, no tools -
+        # nothing for an injected prompt to steer. Prompt on --stdin; with no
+        # --output-format it prints only the answer. Needs GEMINI_API_KEY (or
+        # `gemini-api configure`). Non-zero exit = API/usage/auth failure.
+        a=(generate --stdin --stream=false --no-interactive)
+        [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
+        (cd "$RV_JAIL" && gemini-api "${a[@]}") 2>>"$RV_CLI_ERR" || rc=$?;;
       gemini)
+        # Gemini CLI - since 2026-06-18 for Gemini Code Assist Standard/Enterprise
+        # and legacy paid keys only; other accounts moved to agy (see README).
         # plan = read-only approval mode; headless mode also turns every
         # ask-the-user decision into DENY. JSON output separates the answer
         # from any error.
@@ -1290,7 +1301,7 @@ if [ "$DO_REVIEW" = 1 ]; then
     local prompt; prompt="$(cat)"
     case "$RV_MODE" in
       cmd) printf '%s' "$prompt" | sh -c "$REVIEW_CMD" 2>/dev/null;;
-      claude|codex|gemini) printf '%s' "$prompt" | rv_cli;;
+      claude|codex|gemini-api|gemini) printf '%s' "$prompt" | rv_cli;;
       anthropic)
         local body resp code attempt=1 wait_s rfile hfile
         # jq builds the body so the code under review is escaped correctly.
@@ -1356,15 +1367,18 @@ if [ "$DO_REVIEW" = 1 ]; then
   elif [ -z "$RV_MODE" ]; then
     if [ "$REVIEW_EXPLICIT" = 1 ]; then
       # Explicitly requested -> fail closed. "reviewed, found nothing" would be a lie.
-      pass_error review "--review requested but no provider available (set ANTHROPIC_API_KEY, install the claude, codex or gemini CLI, or pass --review-cmd) - NOT reviewed"
+      pass_error review "--review requested but no provider available (set ANTHROPIC_API_KEY, install the claude, codex or gemini-api CLI, or pass --review-cmd) - NOT reviewed"
     else
       # On by default -> degrade gracefully so provider-less runs (most CI) still
       # work. The report records that the deep review did not run.
-      skip "adversarial review" "no model provider — set ANTHROPIC_API_KEY, install the claude, codex or gemini CLI, or pass --review-cmd (or --no-review to silence)"
+      skip "adversarial review" "no model provider — set ANTHROPIC_API_KEY, install the claude, codex or gemini-api CLI, or pass --review-cmd (or --no-review to silence)"
       set_status review skipped "no provider (default review skipped)"
     fi
   else
-    say "  ${C_D}provider: $RV_MODE  model: ${REVIEW_MODEL:-($RV_MODE default)}  effort: $REVIEW_EFFORT$([ "$RV_MODE" = gemini ] && echo ' (not supported by gemini; ignored)')${C_0}"
+    # (no `case` inside $(...): bash 3.2 mis-parses its `)` patterns there)
+    rv_effort_note=""
+    case "$RV_MODE" in gemini|gemini-api) rv_effort_note=" (not supported by $RV_MODE; ignored)";; esac
+    say "  ${C_D}provider: $RV_MODE  model: ${REVIEW_MODEL:-($RV_MODE default)}  effort: $REVIEW_EFFORT$rv_effort_note${C_0}"
 
     # Context assembly is the hard part: a logic bug spans files, so per-file
     # review misses exactly what this pass exists to find. Order by how likely a

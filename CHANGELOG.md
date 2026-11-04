@@ -70,7 +70,11 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
   `--review-provider` (values in `--help` / the README); `auto` (default) uses the
   first available: `--review-cmd`, the HTTP API key, then whichever coding CLI is on
   PATH — OpenAI **Codex** and Google **Gemini** are now first-class alongside the
-  existing CLI provider. `--review-model` is now passed to every provider (previously
+  existing CLI provider, plus Google's stateless **Gemini API CLI** (`gemini-api`, the
+  recommended Gemini route since the Gemini CLI became enterprise-only on 2026-06-18).
+  The Antigravity CLI (`agy`) is deliberately not supported: it takes the prompt only as
+  an argument (Linux caps one at 128 KB) and cannot have its tools disabled.
+  `--review-model` is now passed to every provider (previously
   the CLI path ignored it while the console claimed otherwise); left unset, each CLI
   uses its own default model. Effort maps to each CLI's native setting (ignored, and
   said so, where unsupported). A pinned provider that is missing is an ERROR and never
@@ -90,7 +94,7 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
 
 ### Added (tests)
 
-- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract (39 with the KEV, `--help`, review-coverage and provider tests): coverage
+- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract (41 with the KEV, `--help`, review-coverage and provider tests): coverage
   guard, review parse/empty/refusal/no-provider paths, refutation, `--fail-on-review`,
   and HTTP API error/retry handling (provider and API faked; no network or key).
 - CI: a `script-tests` job runs `shellcheck -S warning` and the bats suite.

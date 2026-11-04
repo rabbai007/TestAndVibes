@@ -35,7 +35,7 @@ setup_file() {
     [ -d "$d" ] || continue
     for f in "$d"/*; do
       n="${f##*/}"
-      case "$n" in claude|codex|gemini|ant|trivy|osv-scanner|grype|npm|semgrep|trufflehog|gitleaks) continue;; esac
+      case "$n" in claude|codex|gemini|gemini-api|agy|ant|trivy|osv-scanner|grype|npm|semgrep|trufflehog|gitleaks) continue;; esac
       [ -x "$f" ] && [ ! -e "$clean/$n" ] && ln -s "$f" "$clean/$n"
     done
   done
@@ -478,4 +478,24 @@ argv_has() { grep -qxF -- "$2" "$BATS_TEST_TMPDIR/$1.argv"; }
 @test "provider: unknown --review-provider is a usage error (exit 2)" {
   cli_run --review-provider bard
   [ "$status" -eq 2 ]
+}
+
+@test "provider gemini-api: stateless generate, prompt on --stdin, no agent flags needed" {
+  fake_cli gemini-api
+  cli_run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"provider: gemini-api"*"not supported by gemini-api; ignored"* ]] || false
+  [[ "$output" == *"no findings survived refutation"* ]] || false
+  argv_has gemini-api generate
+  argv_has gemini-api --stdin
+  argv_has gemini-api --stream=false
+  argv_has gemini-api --no-interactive
+  grep -q 'FILE: server.js' "$BATS_TEST_TMPDIR/gemini-api.stdin"
+}
+
+@test "provider auto: gemini-api is preferred over the enterprise-only gemini CLI" {
+  fake_cli gemini; fake_cli gemini-api
+  cli_run
+  [[ "$output" == *"provider: gemini-api"* ]] || false
+  [ ! -e "$BATS_TEST_TMPDIR/gemini.argv" ]
 }

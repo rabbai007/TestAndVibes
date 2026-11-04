@@ -87,7 +87,7 @@ targets). No config required.
 | `--review` | **on** | Adversarial reasoning pass (report-only). Runs by default when a provider exists; **skips** if none. |
 | `--no-review` | — | Turn the review pass off |
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
-| `--review-provider` | `auto` | `auto` \| `cmd` \| `anthropic` \| `claude` \| `codex` \| `gemini` — pin the review's model provider (see *Providers*) |
+| `--review-provider` | `auto` | `auto` \| `cmd` \| `anthropic` \| `claude` \| `codex` \| `gemini-api` \| `gemini` — pin the review's model provider (see *Providers*) |
 | `--review-model` | provider default | Model for the review pass. Unset = the CLI's own default; the Anthropic HTTP API defaults to `claude-opus-5-5` |
 | `--review-effort` | `high` | `low\|medium\|high\|xhigh\|max` |
 | `--review-budget` | `400000` | Max bytes of source sent for review (~100k tokens). Files that do not fit are listed and the review is marked **PARTIAL** — never silently dropped |
@@ -216,8 +216,18 @@ survive are reported with their reasoning; refuted ones are counted, not shown.
 | 1 | `cmd` | `--review-cmd CMD` (prompt on stdin, text on stdout — self-hosted, Ollama, anything) | yours | yours |
 | 2 | `anthropic` | `ANTHROPIC_API_KEY` (HTTP API, with retries) | `claude-opus-5-5` | `output_config.effort` |
 | 3 | `claude` | Claude Code CLI, signed in | the CLI's default | `--effort` |
-| 4 | `codex` | OpenAI Codex CLI, signed in or `OPENAI_API_KEY` | the CLI's default | `model_reasoning_effort` |
-| 5 | `gemini` | Gemini CLI, signed in or `GEMINI_API_KEY` | the CLI's default | not supported (ignored, noted) |
+| 4 | `codex` | OpenAI Codex CLI, signed in (`codex login`) | the CLI's default | `model_reasoning_effort` |
+| 5 | `gemini-api` | Google's [Gemini API CLI](https://github.com/google-gemini/gemini-api-cli) + `GEMINI_API_KEY` | the CLI's default | not supported (ignored, noted) |
+| 6 | `gemini` | Gemini CLI — **Gemini Code Assist Standard/Enterprise only** since 2026-06-18 | the CLI's default | not supported (ignored, noted) |
+
+**Using Gemini:** use `gemini-api` with a `GEMINI_API_KEY`. Since June 18, 2026,
+free and Google AI Pro/Ultra accounts can no longer use the Gemini CLI (they moved
+to the Antigravity CLI, `agy`), and `gemini-api` is the better fit anyway: a
+stateless API call with no agent and no tools. **`agy` is not supported as a
+provider:** headless `agy` takes the prompt only as a command-line argument
+(`-p`), which Linux caps at 128 KB per argument — smaller than a typical review
+context — and it has no documented way to disable its tools, only a soft-deny of
+actions that need approval.
 
 Pin one with `--review-provider codex` (a pinned provider that is missing is an
 ERROR — it never silently falls back to another), and pick a model with
@@ -228,7 +238,8 @@ hostile: a prompt injection in a scanned file could otherwise steer the CLI
 into reading secrets or running commands. Each one runs from an **empty scratch
 directory** with the strictest mode it has — `claude -p --tools ""
 --strict-mcp-config`, `codex exec --sandbox read-only --ephemeral`, `gemini
---approval-mode plan` (headless Gemini also denies anything needing approval). The
+--approval-mode plan` (headless Gemini also denies anything needing approval);
+`gemini-api` has no tools to begin with. The
 prompt carries all the code the review needs, so nothing is lost.
 
 The review runs **by default** when a provider is present; with
