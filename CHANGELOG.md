@@ -32,8 +32,8 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
 
 ### Fixed
 
-- **`--help` executed the `claude` binary.** The help text is an unquoted heredoc and
-  contained `` `claude` `` in backticks, which the shell ran as a command substitution
+- **`--help` executed an external program.** The help text is an unquoted heredoc and
+  contained a tool name in backticks, which the shell ran as a command substitution
   every time help was printed (present since the review pass shipped). Escaped; a test
   now asserts `--help` runs nothing.
 - **The adversarial review could report "0 findings" for a review that produced
@@ -55,10 +55,10 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
 
 ### Changed
 
-- **Default review model is now `claude-opus-5-5`** (was `claude-opus-5`) — the current
-  Opus, ~20% cheaper per token. Effort is still sent explicitly (`high`), so Opus 5.5's
-  lower built-in default (`medium`) does not apply. `--review-model claude-opus-5`
-  restores the old behaviour.
+- **Default review model moves to the current Opus generation** (see `--review-model`
+  in `--help` / the README options table) — ~20% cheaper per token. Effort is still sent
+  explicitly (`high`), so the new model's lower built-in default (`medium`) does not
+  apply. `--review-model` restores the previous model.
 - Refusal fallbacks use the server-chosen form (`fallbacks: "default"`, beta
   `server-side-fallback-2026-07-01`) instead of a hard-coded fallback model.
 

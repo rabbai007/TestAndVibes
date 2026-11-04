@@ -77,7 +77,7 @@ SH
   [[ "$output" == *"$(grep -m1 '^VERSION=' "$VC" | cut -d'"' -f2)"* ]] || false
 }
 
-@test "--help executes nothing (regression: a backtick in the help heredoc ran \`claude\`)" {
+@test "--help executes nothing (regression: a backtick in the help heredoc ran an external program)" {
   printf '#!/bin/sh\ntouch "%s/claude-ran"\n' "$BATS_TEST_TMPDIR" > "$BIN/claude"; chmod +x "$BIN/claude"
   PATH="$BIN:$CLEAN_PATH" run "$VC" --help
   [ "$status" -eq 0 ]
