@@ -42,7 +42,9 @@ DO_REVIEW=1             # default ON (deep review scope); degrades to a skip whe
 REVIEW_EXPLICIT=0        # 1 = user passed --review (then no-provider fails closed, not skips)
 EXTRA_EXCLUDES=()        # --exclude PATH (repeatable): operator-trusted, added to scan excludes
 REVIEW_CMD="${VIBECHECK_REVIEW_CMD:-}"   # override: reads a prompt on stdin, writes JSON to stdout
-REVIEW_MODEL="claude-opus-5-5"
+REVIEW_PROVIDER="auto"  # auto | cmd | anthropic | claude | codex | gemini
+REVIEW_MODEL=""         # empty = the provider's own default (CLIs) / RV_API_DEFAULT_MODEL (HTTP API)
+RV_API_DEFAULT_MODEL="claude-opus-5-5"   # the Anthropic HTTP API needs an explicit model
 REVIEW_EFFORT="high"
 REVIEW_BUDGET=400000    # max bytes of source sent for review (~100k tokens)
 REVIEW_SKEPTICS=2       # independent refutation attempts per finding
@@ -107,12 +109,17 @@ OPTIONS
   --kev-file PATH      Use a local copy of the KEV JSON feed (air-gapped CI; implies --kev)
   --review             Adversarial review pass: an LLM reasons about trust
                        boundaries, lifecycle and logic — the classes no scanner
-                       can reach. ON BY DEFAULT and REPORT-ONLY. Needs
-                       ANTHROPIC_API_KEY, the \`claude\` CLI, or --review-cmd; with
-                       no provider it is skipped (an explicit --review errors).
+                       can reach. ON BY DEFAULT and REPORT-ONLY. Uses the first
+                       provider found (see --review-provider); with none it is
+                       skipped (an explicit --review errors).
   --no-review          Disable the default adversarial review pass
-  --review-model M     Model for the review (default: claude-opus-5-5)
-  --review-effort E    low|medium|high|xhigh|max (default: high)
+  --review-provider P  auto (default) | cmd | anthropic | claude | codex | gemini.
+                       auto order: --review-cmd, ANTHROPIC_API_KEY, then the
+                       first AI CLI on PATH (claude, codex, gemini). CLIs run with
+                       tools disabled / read-only, from an empty directory.
+  --review-model M     Model for the review (default: the provider's own default;
+                       anthropic HTTP API: claude-opus-5-5)
+  --review-effort E    low|medium|high|xhigh|max (default: high; gemini ignores it)
   --review-budget N    Max bytes of source to send (default: 400000); files that
                        do not fit are listed and the review is marked PARTIAL
   --review-skeptics N  Independent refutation attempts per finding (default: 2)
@@ -285,6 +292,7 @@ while [ $# -gt 0 ]; do
     --review) DO_REVIEW=1; REVIEW_EXPLICIT=1; shift;;
     --no-review) DO_REVIEW=0; shift;;
     --review-model) REVIEW_MODEL="${2:?}"; shift 2;;
+    --review-provider) REVIEW_PROVIDER="${2:?--review-provider needs auto|cmd|anthropic|claude|codex|gemini}"; shift 2;;
     --review-effort) REVIEW_EFFORT="${2:?}"; shift 2;;
     --review-budget) REVIEW_BUDGET="${2:?}"; shift 2;;
     --review-skeptics) REVIEW_SKEPTICS="${2:?}"; shift 2;;
@@ -1213,23 +1221,77 @@ REVIEW_N=0; REVIEW_REFUTED=0
 if [ "$DO_REVIEW" = 1 ]; then
   head2 "6. Adversarial review (reasoning)"
 
-  # provider ladder: explicit command wins (any provider, self-hosted included),
-  # then the documented HTTP API, then a local claude CLI.
-  RV_MODE=""
-  if [ -n "$REVIEW_CMD" ]; then RV_MODE="cmd"
-  elif [ -n "${ANTHROPIC_API_KEY:-}" ] && have curl; then RV_MODE="api"
-  elif have claude; then RV_MODE="cli"
-  fi
+  # Provider ladder (auto): an explicit command wins (any provider, self-hosted
+  # included), then the Anthropic HTTP API, then whichever AI CLI the developer
+  # already has signed in: claude, codex, gemini. --review-provider pins one; a
+  # pinned provider that is unavailable fails closed rather than falling back.
+  RV_MODE=""; RV_UNAVAILABLE=""
+  rv_available() {
+    case "$1" in
+      cmd)       [ -n "$REVIEW_CMD" ];;
+      anthropic) [ -n "${ANTHROPIC_API_KEY:-}" ] && have curl;;
+      claude|codex|gemini) have "$1";;
+      *) return 1;;
+    esac
+  }
+  case "$REVIEW_PROVIDER" in
+    auto)
+      for p in cmd anthropic claude codex gemini; do
+        rv_available "$p" && { RV_MODE="$p"; break; }
+      done;;
+    cmd|anthropic|claude|codex|gemini)
+      if rv_available "$REVIEW_PROVIDER"; then RV_MODE="$REVIEW_PROVIDER"
+      else RV_UNAVAILABLE="$REVIEW_PROVIDER"; fi;;
+    *) err "unknown --review-provider: $REVIEW_PROVIDER (auto|cmd|anthropic|claude|codex|gemini)"; exit 2;;
+  esac
+  [ "$RV_MODE" = anthropic ] && [ -z "$REVIEW_MODEL" ] && REVIEW_MODEL="$RV_API_DEFAULT_MODEL"
 
   RV_ERR="$OUTDIR/.review-api-error"; : > "$RV_ERR"
   RV_RETRIES="${VIBECHECK_REVIEW_RETRIES:-3}"   # total attempts per API call
+
+  # AI CLIs are agents: given tools, a prompt-injection planted in the code under
+  # review could steer them into reading secrets or running commands. Each one
+  # runs with tools disabled (or its strictest read-only mode) from an empty
+  # scratch directory - the prompt already carries all the code it needs.
+  RV_JAIL="$(mktemp -d)"; trap 'rm -rf "$RV_JAIL"' EXIT
+  RV_CLI_ERR="$OUTDIR/.review-cli-stderr"; : > "$RV_CLI_ERR"
+  rv_cli() {  # prompt on stdin -> model text on stdout; records stderr + exit code
+    local rc=0 a=()
+    case "$RV_MODE" in
+      claude)
+        a=(-p --tools "" --strict-mcp-config --no-session-persistence --effort "$REVIEW_EFFORT")
+        [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
+        (cd "$RV_JAIL" && claude "${a[@]}") 2>>"$RV_CLI_ERR" || rc=$?;;
+      codex)
+        a=(exec --sandbox read-only --cd "$RV_JAIL" --skip-git-repo-check --ephemeral
+           -c "model_reasoning_effort=\"$REVIEW_EFFORT\"")
+        [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
+        (cd "$RV_JAIL" && codex "${a[@]}" -) 2>>"$RV_CLI_ERR" || rc=$?;;
+      gemini)
+        # plan = read-only approval mode; headless mode also turns every
+        # ask-the-user decision into DENY. JSON output separates the answer
+        # from any error.
+        a=(--approval-mode plan --output-format json -p "Follow the instructions given on standard input exactly.")
+        [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
+        local gout; gout="$( (cd "$RV_JAIL" && gemini "${a[@]}") 2>>"$RV_CLI_ERR")" || rc=$?
+        if printf '%s' "$gout" | jq -e 'has("response")' >/dev/null 2>&1; then
+          printf '%s' "$gout" | jq -r '.response // ""'
+        else
+          printf '%s' "$gout" | jq -r '.error.message // empty' 2>/dev/null >> "$RV_CLI_ERR"
+        fi;;
+    esac
+    if [ "$rc" -ne 0 ]; then
+      printf '%s exited %s: %s\n' "$RV_MODE" "$rc" "$(tr '\n' ' ' < "$RV_CLI_ERR" | cut -c1-200)" > "$RV_ERR"
+    fi
+    return 0
+  }
 
   rv_ask() {   # prompt on stdin, model text on stdout
     local prompt; prompt="$(cat)"
     case "$RV_MODE" in
       cmd) printf '%s' "$prompt" | sh -c "$REVIEW_CMD" 2>/dev/null;;
-      cli) printf '%s' "$prompt" | claude -p 2>/dev/null;;
-      api)
+      claude|codex|gemini) printf '%s' "$prompt" | rv_cli;;
+      anthropic)
         local body resp code attempt=1 wait_s rfile hfile
         # jq builds the body so the code under review is escaped correctly.
         # Opus 5.5 always runs adaptive thinking and rejects budget_tokens and
@@ -1288,18 +1350,21 @@ if [ "$DO_REVIEW" = 1 ]; then
     esac
   }
 
-  if [ -z "$RV_MODE" ]; then
+  if [ -n "$RV_UNAVAILABLE" ]; then
+    # A pinned provider never silently falls back to a different one.
+    pass_error review "--review-provider $RV_UNAVAILABLE is not available ($([ "$RV_UNAVAILABLE" = anthropic ] && echo 'ANTHROPIC_API_KEY unset or curl missing' || { [ "$RV_UNAVAILABLE" = cmd ] && echo 'no --review-cmd given' || echo "'$RV_UNAVAILABLE' not on PATH"; })) - NOT reviewed"
+  elif [ -z "$RV_MODE" ]; then
     if [ "$REVIEW_EXPLICIT" = 1 ]; then
       # Explicitly requested -> fail closed. "reviewed, found nothing" would be a lie.
-      pass_error review "--review requested but no provider available (set ANTHROPIC_API_KEY, install the claude CLI, or pass --review-cmd) - NOT reviewed"
+      pass_error review "--review requested but no provider available (set ANTHROPIC_API_KEY, install the claude, codex or gemini CLI, or pass --review-cmd) - NOT reviewed"
     else
       # On by default -> degrade gracefully so provider-less runs (most CI) still
       # work. The report records that the deep review did not run.
-      skip "adversarial review" "no model provider — set ANTHROPIC_API_KEY, install the claude CLI, or pass --review-cmd (or --no-review to silence)"
+      skip "adversarial review" "no model provider — set ANTHROPIC_API_KEY, install the claude, codex or gemini CLI, or pass --review-cmd (or --no-review to silence)"
       set_status review skipped "no provider (default review skipped)"
     fi
   else
-    say "  ${C_D}provider: $RV_MODE  model: $REVIEW_MODEL  effort: $REVIEW_EFFORT${C_0}"
+    say "  ${C_D}provider: $RV_MODE  model: ${REVIEW_MODEL:-($RV_MODE default)}  effort: $REVIEW_EFFORT$([ "$RV_MODE" = gemini ] && echo ' (not supported by gemini; ignored)')${C_0}"
 
     # Context assembly is the hard part: a logic bug spans files, so per-file
     # review misses exactly what this pass exists to find. Order by how likely a
@@ -1427,7 +1492,7 @@ PROMPT_TAIL
         pass_error review "the model declined the review request ($(head -1 "$RV_OUT")) - NOT reviewed"
       elif [ ! -s "$RV_OUT" ]; then
         if [ -s "$RV_ERR" ]; then
-          pass_error review "review API call failed ($(head -1 "$RV_ERR" | cut -c1-240)) - NOT reviewed"
+          pass_error review "review provider call failed ($(head -1 "$RV_ERR" | cut -c1-240)) - NOT reviewed"
         else
           pass_error review "review provider returned nothing - NOT reviewed"
         fi

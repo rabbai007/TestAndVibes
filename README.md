@@ -87,7 +87,8 @@ targets). No config required.
 | `--review` | **on** | Adversarial reasoning pass (report-only). Runs by default when a provider exists; **skips** if none. |
 | `--no-review` | — | Turn the review pass off |
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
-| `--review-model` | `claude-opus-5-5` | Model for the review pass |
+| `--review-provider` | `auto` | `auto` \| `cmd` \| `anthropic` \| `claude` \| `codex` \| `gemini` — pin the review's model provider (see *Providers*) |
+| `--review-model` | provider default | Model for the review pass. Unset = the CLI's own default; the Anthropic HTTP API defaults to `claude-opus-5-5` |
 | `--review-effort` | `high` | `low\|medium\|high\|xhigh\|max` |
 | `--review-budget` | `400000` | Max bytes of source sent for review (~100k tokens). Files that do not fit are listed and the review is marked **PARTIAL** — never silently dropped |
 | `--review-skeptics` | `2` | Independent refutation attempts per finding |
@@ -207,9 +208,30 @@ Every candidate is put to independent **refutation** — skeptics asked to argue
 *against* it, defaulting to refuted. A majority refuting drops it. Findings that
 survive are reported with their reasoning; refuted ones are counted, not shown.
 
-**Providers**, in precedence order: `--review-cmd` (anything — prompt on stdin,
-text on stdout, so self-hosted models work), `ANTHROPIC_API_KEY` (the HTTP API),
-or a local `claude` CLI. The review runs **by default** when one is present; with
+**Providers.** The review works with whichever AI tool you already use. With
+`--review-provider auto` (the default) the first available one wins:
+
+| Order | Provider | Needs | Model when `--review-model` is unset | Effort |
+|---|---|---|---|---|
+| 1 | `cmd` | `--review-cmd CMD` (prompt on stdin, text on stdout — self-hosted, Ollama, anything) | yours | yours |
+| 2 | `anthropic` | `ANTHROPIC_API_KEY` (HTTP API, with retries) | `claude-opus-5-5` | `output_config.effort` |
+| 3 | `claude` | Claude Code CLI, signed in | the CLI's default | `--effort` |
+| 4 | `codex` | OpenAI Codex CLI, signed in or `OPENAI_API_KEY` | the CLI's default | `model_reasoning_effort` |
+| 5 | `gemini` | Gemini CLI, signed in or `GEMINI_API_KEY` | the CLI's default | not supported (ignored, noted) |
+
+Pin one with `--review-provider codex` (a pinned provider that is missing is an
+ERROR — it never silently falls back to another), and pick a model with
+`--review-model`, e.g. `--review-provider gemini --review-model gemini-2.5-pro`.
+
+**AI CLIs run locked down.** They are agents, and the code under review may be
+hostile: a prompt injection in a scanned file could otherwise steer the CLI
+into reading secrets or running commands. Each one runs from an **empty scratch
+directory** with the strictest mode it has — `claude -p --tools ""
+--strict-mcp-config`, `codex exec --sandbox read-only --ephemeral`, `gemini
+--approval-mode plan` (headless Gemini also denies anything needing approval). The
+prompt carries all the code the review needs, so nothing is lost.
+
+The review runs **by default** when a provider is present; with
 no provider it **skips gracefully** (the rest of the scan still runs, so a
 provider-less CI job is not reddened). An *explicit* `--review` with no provider
 is an **ERROR (exit 3)** — never a quiet "reviewed, found nothing".

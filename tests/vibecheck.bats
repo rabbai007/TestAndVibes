@@ -35,7 +35,7 @@ setup_file() {
     [ -d "$d" ] || continue
     for f in "$d"/*; do
       n="${f##*/}"
-      case "$n" in claude|ant|trivy|osv-scanner|grype|npm|semgrep|trufflehog|gitleaks) continue;; esac
+      case "$n" in claude|codex|gemini|ant|trivy|osv-scanner|grype|npm|semgrep|trufflehog|gitleaks) continue;; esac
       [ -x "$f" ] && [ ! -e "$clean/$n" ] && ln -s "$f" "$clean/$n"
     done
   done
@@ -82,7 +82,7 @@ SH
   PATH="$BIN:$CLEAN_PATH" run "$VC" --help
   [ "$status" -eq 0 ]
   [ ! -e "$BATS_TEST_TMPDIR/claude-ran" ]
-  [[ "$output" == *'the `claude` CLI'* ]] || false
+  [[ "$output" == *"--review-provider"* ]] || false
 }
 
 @test "unknown flag is a usage error (exit 2)" {
@@ -375,4 +375,107 @@ SH
   run "$VC" "${REVIEW_ONLY[@]}" --review --review-cmd "$BIN/provider"
   [ "$status" -eq 0 ]
   [ "$(jq '[.active[] | select(.tool=="review")] | length' "$OUT/findings.json")" -eq 1 ]
+}
+
+# ── review pass: AI CLI providers (fake CLIs record argv, cwd and stdin) ────
+
+# Installs a fake CLI named $1 that logs its argv (one per line), its cwd and its
+# stdin, then prints a valid empty review. gemini answers in its JSON envelope.
+fake_cli() {
+  local name="$1"
+  cat > "$BIN/$name" <<SH
+#!/usr/bin/env bash
+log="$BATS_TEST_TMPDIR/$name"
+printf '%s\n' "\$@" > "\$log.argv"; pwd -P > "\$log.cwd"; cat > "\$log.stdin"
+if [ "$name" = gemini ]; then echo '{"response":"[]","stats":{}}'; else echo '[]'; fi
+SH
+  chmod +x "$BIN/$name"
+}
+cli_run() { PATH="$BIN:$CLEAN_PATH" run "$VC" "${REVIEW_ONLY[@]}" --review "$@"; }
+argv_has() { grep -qxF -- "$2" "$BATS_TEST_TMPDIR/$1.argv"; }
+
+@test "provider claude: tools disabled, no MCP, effort passed, provider-default model, run outside the repo" {
+  fake_cli claude
+  cli_run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"provider: claude  model: (claude default)"* ]] || false
+  argv_has claude -p
+  # `--tools ""` - the flag followed by an empty argument
+  grep -A1 -xF -- '--tools' "$BATS_TEST_TMPDIR/claude.argv" | sed -n 2p | grep -qx ''
+  argv_has claude --strict-mcp-config
+  argv_has claude high
+  ! argv_has claude --model
+  [ "$(cat "$BATS_TEST_TMPDIR/claude.cwd")" != "$(cd "$APP" && pwd -P)" ]
+  [ -z "$(ls -A "$(cat "$BATS_TEST_TMPDIR/claude.cwd")" 2>/dev/null)" ] || [ ! -d "$(cat "$BATS_TEST_TMPDIR/claude.cwd")" ]
+  grep -q 'FILE: server.js' "$BATS_TEST_TMPDIR/claude.stdin"
+}
+
+@test "provider codex: read-only sandbox, ephemeral, prompt on stdin, effort as config" {
+  fake_cli codex
+  cli_run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"provider: codex"* ]] || false
+  argv_has codex exec
+  grep -A1 -xF -- '--sandbox' "$BATS_TEST_TMPDIR/codex.argv" | grep -qx 'read-only'
+  argv_has codex --ephemeral
+  argv_has codex --skip-git-repo-check
+  argv_has codex 'model_reasoning_effort="high"'
+  argv_has codex -
+  ! argv_has codex --model
+  grep -q 'FILE: server.js' "$BATS_TEST_TMPDIR/codex.stdin"
+}
+
+@test "provider gemini: plan (read-only) approval mode, JSON envelope parsed, effort noted as ignored" {
+  fake_cli gemini
+  cli_run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"provider: gemini"*"not supported by gemini; ignored"* ]] || false
+  [[ "$output" == *"no findings survived refutation"* ]] || false
+  grep -A1 -xF -- '--approval-mode' "$BATS_TEST_TMPDIR/gemini.argv" | grep -qx plan
+  grep -A1 -xF -- '--output-format' "$BATS_TEST_TMPDIR/gemini.argv" | grep -qx json
+}
+
+@test "provider: --review-model is passed through to the CLI" {
+  fake_cli codex
+  cli_run --review-model gpt-test-1
+  [ "$status" -eq 0 ]
+  grep -A1 -xF -- '--model' "$BATS_TEST_TMPDIR/codex.argv" | grep -qx gpt-test-1
+  [[ "$output" == *"model: gpt-test-1"* ]] || false
+}
+
+@test "provider auto: claude before codex before gemini" {
+  fake_cli codex; fake_cli gemini
+  cli_run
+  [[ "$output" == *"provider: codex"* ]] || false
+  fake_cli claude
+  cli_run
+  [[ "$output" == *"provider: claude"* ]] || false
+}
+
+@test "provider pinned: --review-provider gemini is used even when claude is present" {
+  fake_cli claude; fake_cli gemini
+  cli_run --review-provider gemini
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"provider: gemini"* ]] || false
+  [ ! -e "$BATS_TEST_TMPDIR/claude.argv" ]
+}
+
+@test "provider pinned but missing fails closed, never falls back (exit 3)" {
+  fake_cli claude
+  cli_run --review-provider codex
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"--review-provider codex is not available"* ]] || false
+  [ ! -e "$BATS_TEST_TMPDIR/claude.argv" ]
+}
+
+@test "provider: a CLI that exits non-zero with no output fails closed and names the error" {
+  printf '#!/bin/sh\necho "not logged in" >&2\nexit 1\n' > "$BIN/codex"; chmod +x "$BIN/codex"
+  cli_run
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"codex exited 1: not logged in"* ]] || false
+}
+
+@test "provider: unknown --review-provider is a usage error (exit 2)" {
+  cli_run --review-provider bard
+  [ "$status" -eq 2 ]
 }

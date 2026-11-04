@@ -66,7 +66,22 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
 
 ### Changed
 
-- **Default review model moves to the current Opus generation** (see `--review-model`
+- **The review pass works with any AI CLI, not one vendor's model.** New
+  `--review-provider` (values in `--help` / the README); `auto` (default) uses the
+  first available: `--review-cmd`, the HTTP API key, then whichever coding CLI is on
+  PATH — OpenAI **Codex** and Google **Gemini** are now first-class alongside the
+  existing CLI provider. `--review-model` is now passed to every provider (previously
+  the CLI path ignored it while the console claimed otherwise); left unset, each CLI
+  uses its own default model. Effort maps to each CLI's native setting (ignored, and
+  said so, where unsupported). A pinned provider that is missing is an ERROR and never
+  falls back.
+- **AI CLIs run locked down.** They are agents and the code under review may carry a
+  prompt injection, so each runs from an empty scratch directory with tools disabled or
+  its strictest read-only mode (no tools / no MCP; read-only sandbox, ephemeral; plan
+  approval mode). Previously the CLI provider ran with its default tool set in the
+  caller's working directory. CLI failures (not signed in, bad model) fail closed and
+  name the error.
+- **Default HTTP-API review model moves to the current Opus generation** (see `--review-model`
   in `--help` / the README options table) — ~20% cheaper per token. Effort is still sent
   explicitly (`high`), so the new model's lower built-in default (`medium`) does not
   apply. `--review-model` restores the previous model.
@@ -75,7 +90,7 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
 
 ### Added (tests)
 
-- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract (30 with the KEV, `--help` and review-coverage tests): coverage
+- **`tests/vibecheck.bats`** — 17 behaviour tests for the fail-closed contract (39 with the KEV, `--help`, review-coverage and provider tests): coverage
   guard, review parse/empty/refusal/no-provider paths, refutation, `--fail-on-review`,
   and HTTP API error/retry handling (provider and API faked; no network or key).
 - CI: a `script-tests` job runs `shellcheck -S warning` and the bats suite.
