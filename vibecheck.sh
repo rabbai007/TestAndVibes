@@ -1314,6 +1314,7 @@ if [ "$DO_REVIEW" = 1 ]; then
   RV_RETRY_DELAY="${VIBECHECK_REVIEW_RETRY_DELAY:-15}"   # seconds x attempt, capped at 60
   rv_cli() {  # prompt on stdin -> model text on stdout; records the final error
     local pf of attempt=1 wait_s
+    RV_QUOTA=0
     pf="$(mktemp)"; of="$(mktemp)"; cat > "$pf"
     while :; do
       : > "$RV_CLI_ERR_ONE"; RV_RC=0
@@ -1322,9 +1323,18 @@ if [ "$DO_REVIEW" = 1 ]; then
       [ -s "$RV_ERR" ] && break                       # terminal (e.g. lock-down not held)
       [ "$RV_RC" -eq 0 ] && break
       grep -qiE '401|403|unauthori|authenticat|IneligibleTier|not logged in|api key|usage:|invalid (flag|arg|model)' "$RV_CLI_ERR_ONE" && break
+      # Quota/billing, not load: a model with no quota on this tier ("limit: 0"),
+      # an exhausted daily quota, or a billing problem will not clear in a minute.
+      if grep -qiE 'limit: ?0([^0-9]|$)|per ?day|PerDay|daily|check your plan and billing|billing (details|account|is not enabled)|insufficient.{0,20}(credit|quota|balance)|credit balance' "$RV_CLI_ERR_ONE"; then
+        RV_QUOTA=1; break
+      fi
       grep -qiE 'HTTP status: (429|5[0-9][0-9])|(^|[^0-9])(429|500|502|503|504|529)([^0-9]|$)|high demand|overloaded|rate.?limit|RESOURCE_EXHAUSTED|UNAVAILABLE|try again later|timed? ?out|ETIMEDOUT|ECONNRESET' "$RV_CLI_ERR_ONE" || break
       [ "$attempt" -ge "$RV_RETRIES" ] && break
       wait_s=$((attempt * RV_RETRY_DELAY)); [ "$wait_s" -gt 60 ] && wait_s=60
+      # Per-minute rate limits say when to come back ("Please retry in 23.4s" /
+      # retryDelay "23s"); honour that instead of guessing, up to 90 s.
+      local hinted; hinted="$(grep -oiE 'retry in [0-9]+(\.[0-9]+)?s|retryDelay"?: ?"?[0-9]+s' "$RV_CLI_ERR_ONE" | head -1 | grep -oE '[0-9]+' | head -1)"
+      if [ -n "$hinted" ]; then wait_s=$((hinted + 1)); [ "$wait_s" -gt 90 ] && wait_s=90; fi
       warn "review: $RV_MODE call failed transiently (exit $RV_RC) - retry $attempt/$((RV_RETRIES - 1)) in ${wait_s}s" >&4
       sleep "$wait_s"; attempt=$((attempt + 1))
     done
@@ -1335,7 +1345,10 @@ if [ "$DO_REVIEW" = 1 ]; then
       # Since 2026-06-18 the Gemini CLI serves enterprise Code Assist only.
       grep -q 'IneligibleTierError' "$RV_CLI_ERR_ONE" 2>/dev/null && \
         hint=" [individual Google accounts can no longer use the Gemini CLI - use --review-provider gemini-api with GEMINI_API_KEY]"
-      printf '%s exited %s%s: %s%s\n' "$RV_MODE" "$RV_RC" "$tries" "$(grep -v 'Approval mode overridden' "$RV_CLI_ERR_ONE" | tr '\n' ' ' | cut -c1-200)" "$hint" > "$RV_ERR"
+      [ "$RV_QUOTA" = 1 ] && \
+        hint=" [QUOTA/BILLING, not retried: this key has no quota left for ${REVIEW_MODEL:-the default model} (free tier, daily cap, or billing not enabled). Enable billing for the key's project, or pick a model your tier includes with --review-model]"
+      # hint first: the reported line is truncated, the hint is the actionable part
+      printf '%s exited %s%s:%s %s\n' "$RV_MODE" "$RV_RC" "$tries" "$hint" "$(grep -v 'Approval mode overridden' "$RV_CLI_ERR_ONE" | tr '\n' ' ' | cut -c1-200)" > "$RV_ERR"
     fi
     return 0
   }

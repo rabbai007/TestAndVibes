@@ -575,3 +575,19 @@ retry_run() { VIBECHECK_REVIEW_RETRY_DELAY=0 cli_run --review-provider gemini-ap
   [ "$status" -eq 3 ]
   [ "$(cat "$BATS_TEST_TMPDIR/calls")" -eq 1 ]
 }
+
+@test "cli quota: a model with no quota on this tier (limit: 0) is not retried and says billing" {
+  flaky_gemini_api 1 'Error (resource_exhausted): You exceeded your current quota, please check your plan and billing details. Quota exceeded for metric: generate_content_free_tier_input_token_count, limit: 0, model: gemini-4-argon. HTTP status: 429'
+  FAKE_FAILS=99 retry_run --review-model gemini-4-argon
+  [ "$status" -eq 3 ]
+  [ "$(cat "$BATS_TEST_TMPDIR/calls")" -eq 1 ]
+  [[ "$output" == *"QUOTA/BILLING, not retried"*"gemini-4-argon"* ]] || false
+}
+
+@test "cli quota: a per-minute rate limit is retried after the delay the API asks for" {
+  flaky_gemini_api 1 'Error (resource_exhausted): Quota exceeded for metric: input_token_count per minute. Please retry in 1.2s. HTTP status: 429'
+  FAKE_FAILS=1 retry_run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"retry 1/2 in 2s"* ]] || false        # 1.2s hinted -> 1 + 1 s
+  [ "$(cat "$BATS_TEST_TMPDIR/calls")" -eq 2 ]
+}

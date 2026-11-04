@@ -93,6 +93,10 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
   backoff (`VIBECHECK_REVIEW_RETRIES`, default 3 attempts); auth and usage errors are
   not. Found in a real run: a `gemini-api` 503 on a busy model failed the whole review.
   Retry notices now reach the console for both paths (they were swallowed before).
+- **Quota and billing errors are told apart from load.** A model with no quota on the
+  key's tier (`limit: 0`), an exhausted daily quota, or a billing problem fails at once
+  with a `QUOTA/BILLING` hint naming the model, instead of being retried. Per-minute
+  rate limits are still retried, now after the delay the API asks for ("retry in 23s").
 - **Default HTTP-API review model moves to the current Opus generation** (see `--review-model`
   in `--help` / the README options table) — ~20% cheaper per token. Effort is still sent
   explicitly (`high`), so the new model's lower built-in default (`medium`) does not
