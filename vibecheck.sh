@@ -853,12 +853,17 @@ else
     gr="$OUTDIR/grype.json"; rm -f "$gr"
     grype "dir:$TARGET" -o json --file "$gr" >/dev/null 2>&1; gr_rc=$?
     if [ -s "$gr" ] && jq -e . "$gr" >/dev/null 2>&1; then
-      while IFS=$'\x1f' read -r sev id pkg url; do
+      # .file is the lockfile grype read (locations are relative to the scan
+      # root, "/package-lock.json"). It used to be the placeholder
+      # "dependencies", which can never match a path - so under --diff every
+      # grype-only CVE, KEV-listed or not, silently dropped out of the gate.
+      while IFS=$'\x1f' read -r sev id pkg url loc; do
         [ -z "${id:-}" ] && continue
         case "$sev" in Critical) vs=critical;; High) vs=high;; Medium) vs=medium;; *) vs=low;; esac
-        dep_row 4 "$vs" "$id" "dependencies" "$pkg" "known vulnerability" "$url" grype
+        dep_row 4 "$vs" "$id" "${loc:-dependencies}" "$pkg" "known vulnerability" "$url" grype
       done < <(jq -r '.matches[]? | [ (.vulnerability.severity//"Unknown"), (.vulnerability.id//""),
-                        (.artifact.name+"@"+(.artifact.version//"?")), (.vulnerability.dataSource//"") ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$gr" 2>/dev/null)
+                        (.artifact.name+"@"+(.artifact.version//"?")), (.vulnerability.dataSource//""),
+                        ((.artifact.locations[0].path // "dependencies") | ltrimstr("/")) ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$gr" 2>/dev/null)
       DEP_SRC_OK="$DEP_SRC_OK grype"
     else
       deps_error "grype exited $gr_rc and produced no parseable JSON"
@@ -902,6 +907,22 @@ else
   else
     deps_error "no dependency scanner available (trivy, osv-scanner, npm, or grype) — dependencies NOT scanned"
   fi
+fi
+
+# ── --diff: the changed-file list, computed once, early ──
+# The review pass (6) puts changed files first in its budget, and the Diff
+# scope step gates on them. It used to be written only in the Diff scope step,
+# AFTER the review had looked for it, so the review never prioritised a PR's
+# own files. Validation and errors stay in the Diff scope step.
+diff_changed_files() {
+  local prefix
+  prefix="$(git -C "$TARGET" rev-parse --show-prefix 2>/dev/null)"
+  { git -C "$TARGET" diff --name-only "$DIFF_REF...HEAD" 2>/dev/null
+    git -C "$TARGET" diff --name-only HEAD 2>/dev/null; } \
+    | sed "s|^$prefix||" | sed '/^$/d' | sort -u > "$OUTDIR/.changed-files"
+}
+if [ -n "$DIFF_REF" ] && git -C "$TARGET" rev-parse --verify --quiet "$DIFF_REF" >/dev/null 2>&1; then
+  diff_changed_files
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1881,22 +1902,20 @@ if [ -n "$DIFF_REF" ]; then
     pass_error diff "git ref '$DIFF_REF' not found — cannot determine what changed (fetch it, or drop --diff)"
   else
     CHANGED="$OUTDIR/.changed-files"
-    prefix="$(git -C "$TARGET" rev-parse --show-prefix 2>/dev/null)"
-    { git -C "$TARGET" diff --name-only "$DIFF_REF...HEAD" 2>/dev/null
-      git -C "$TARGET" diff --name-only HEAD 2>/dev/null; } \
-      | sed "s|^$prefix||" | sed '/^$/d' | sort -u > "$CHANGED"
+    diff_changed_files
     n_changed=$(wc -l < "$CHANGED" | tr -d ' ')
     say "  ${C_D}$n_changed file(s) changed vs $DIFF_REF${C_0}"
     if [ "$n_changed" -eq 0 ]; then
       ok "no files changed — nothing to gate on"
     fi
     OUTSCOPE="$OUTDIR/.outscope.jsonl"
-    # Dynamic findings describe the running application, not a file in the diff,
-    # so they always stay in scope.
+    # Dynamic and MCP findings describe the running application / server, not a
+    # file in the diff (their .file is a URL or command), so they always stay in
+    # scope - otherwise --diff would silently never gate on them.
     jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
-      'select(.tool=="dynamic" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
+      'select(.tool=="dynamic" or .tool=="mcp" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
     jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
-      'select(.tool!="dynamic" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
+      'select(.tool!="dynamic" and .tool!="mcp" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
     DIFF_N=$(jq -s 'length' "$OUTSCOPE")
     mv "$OUTDIR/.inscope.jsonl" "$ACTIVE"
     [ "$DIFF_N" -gt 0 ] && warn "$DIFF_N pre-existing finding(s) outside the diff — reported, not gated" \

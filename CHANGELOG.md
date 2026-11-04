@@ -32,6 +32,20 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
 
 ### Fixed
 
+Two of these were found by VibeCheck's own review pass, run against this repository
+through the new `gemini-api` provider before release:
+
+- **`--diff` never gated grype-only CVEs or MCP findings.** The PR gate keeps findings
+  whose file is in the diff, but grype findings carried the placeholder path
+  `dependencies` and MCP findings carry the server URL/command — neither can match, so
+  both were silently moved out of scope (a KEV-listed CVE seen only by grype included).
+  grype findings now carry the lockfile grype read; MCP findings, like dynamic ones,
+  describe the running target and always stay in scope. *Baseline note:* a grype-only
+  finding's identity changes with its path, so re-accept it once with `--write-baseline`.
+- **`--diff` never prioritised the PR's own files in the review.** The review reads the
+  changed-file list to put those files first in its budget, but the list was written
+  only later, in the Diff scope step. It is now computed before the review; on a repo
+  larger than `--review-budget`, unchanged files no longer crowd out the PR's changes.
 - **`--help` executed an external program.** The help text is an unquoted heredoc and
   contained a tool name in backticks, which the shell ran as a command substitution
   every time help was printed (present since the review pass shipped). Escaped; a test

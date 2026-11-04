@@ -591,3 +591,53 @@ retry_run() { VIBECHECK_REVIEW_RETRY_DELAY=0 cli_run --review-provider gemini-ap
   [[ "$output" == *"retry 1/2 in 2s"* ]] || false        # 1.2s hinted -> 1 + 1 s
   [ "$(cat "$BATS_TEST_TMPDIR/calls")" -eq 2 ]
 }
+
+# ── --diff: what a pull request changed must be what gets reviewed and gated ─
+
+# A git repo where server.js (name-prioritised) is unchanged and zzz.js is the
+# file the "PR" changed, plus a lockfile the PR also changed.
+diff_repo() {
+  git -C "$APP" init -q -b main
+  git -C "$APP" -c user.email=t@t -c user.name=t add -A
+  git -C "$APP" -c user.email=t@t -c user.name=t commit -q -m base
+  git -C "$APP" checkout -q -b pr
+  printf 'export const x = req.query.id\n' > "$APP/zzz.js"
+  printf 'demo==1.0\n' > "$APP/requirements.txt"
+  git -C "$APP" -c user.email=t@t -c user.name=t add -A
+  git -C "$APP" -c user.email=t@t -c user.name=t commit -q -m pr
+}
+
+@test "diff: the review puts the PR's changed files first in its budget (regression)" {
+  # Order decides what fits: server.js (~100 B, name-prioritised) and zzz.js
+  # (~150 B, changed by the PR) cannot both fit in 200 B. Before the fix the
+  # changed list did not exist yet, so server.js won and the PR's file was cut.
+  head -c 40 /dev/zero | tr '\0' 'x' >> "$APP/server.js"
+  diff_repo
+  head -c 120 /dev/zero | tr '\0' 'x' >> "$APP/zzz.js"
+  git -C "$APP" -c user.email=t@t -c user.name=t commit -qam grow
+  run "$VC" "${REVIEW_ONLY[@]}" --review --review-budget 200 --review-cmd 'echo "[]"' --diff main
+  grep -qx 'zzz.js' "$OUT/.review-files"                    # the PR's file is reviewed...
+  ! grep -qx 'server.js' "$OUT/.review-files"               # ...ahead of the name-prioritised one
+  [ "$(grep -c . "$OUT/.review-files")" -eq "$(sort -u "$OUT/.review-files" | grep -c .)" ]   # no duplicates
+  [[ "$output" == *"server.js"*"bytes"* ]] || false          # the unchanged one is listed as skipped
+}
+
+@test "diff: a grype-only CVE in a changed lockfile gates the PR (regression: placeholder file path)" {
+  kev_setup
+  printf '{"Results":[{"Target":"requirements.txt","Vulnerabilities":[]}]}' > "$FAKE_TRIVY_JSON"
+  cat > "$BIN/grype" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = version ] && { echo "Version: 0.0.0-fake"; exit 0; }
+out=""; while [ $# -gt 0 ]; do [ "$1" = "--file" ] && out="$2"; shift; done
+cat > "$out" <<'JSON'
+{"matches":[{"vulnerability":{"id":"CVE-2099-0002","severity":"High","dataSource":""},
+  "artifact":{"name":"demo","version":"1.0","locations":[{"path":"/requirements.txt"}]}}]}
+JSON
+SH
+  chmod +x "$BIN/grype"
+  rm -f "$APP/requirements.txt"; diff_repo
+  kev_run --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --no-kev \
+          --skip-secrets --skip-sast --skip-iac --diff main
+  [ "$status" -eq 1 ]
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0002") | .file' "$OUT/findings.json")" = "requirements.txt" ]
+}
