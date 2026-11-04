@@ -238,7 +238,10 @@ hostile: a prompt injection in a scanned file could otherwise steer the CLI
 into reading secrets or running commands. Each one runs from an **empty scratch
 directory** with the strictest mode it has — `claude -p --tools ""
 --strict-mcp-config`, `codex exec --sandbox read-only --ephemeral`, `gemini
---approval-mode plan` (headless Gemini also denies anything needing approval);
+--skip-trust --approval-mode plan` (headless Gemini also denies anything needing
+approval; `--skip-trust` stops it silently downgrading `plan` in an untrusted
+folder, and is safe because that folder is the empty scratch dir — if Gemini
+still reports a downgrade, the review is discarded and the pass fails closed);
 `gemini-api` has no tools to begin with. The
 prompt carries all the code the review needs, so nothing is lost.
 

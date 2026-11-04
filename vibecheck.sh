@@ -1281,18 +1281,31 @@ if [ "$DO_REVIEW" = 1 ]; then
         # and legacy paid keys only; other accounts moved to agy (see README).
         # plan = read-only approval mode; headless mode also turns every
         # ask-the-user decision into DENY. JSON output separates the answer
-        # from any error.
-        a=(--approval-mode plan --output-format json -p "Follow the instructions given on standard input exactly.")
+        # from any error. The CLI silently downgrades plan to "default" in an
+        # untrusted folder, so --skip-trust trusts the cwd for this session -
+        # safe only because the cwd is our EMPTY scratch dir (no settings,
+        # hooks, extensions or context files for trust to enable).
+        a=(--skip-trust --approval-mode plan --output-format json -p "Follow the instructions given on standard input exactly.")
         [ -n "$REVIEW_MODEL" ] && a+=(--model "$REVIEW_MODEL")
         local gout; gout="$( (cd "$RV_JAIL" && gemini "${a[@]}") 2>>"$RV_CLI_ERR")" || rc=$?
+        if grep -q 'Approval mode overridden' "$RV_CLI_ERR" 2>/dev/null; then
+          # The read-only lock-down did not hold. Discard the answer: a review
+          # that ran with weaker isolation than documented is not delivered.
+          printf 'gemini overrode the read-only approval mode (plan) - lock-down not in effect, review discarded\n' > "$RV_ERR"
+          return 0
+        fi
         if printf '%s' "$gout" | jq -e 'has("response")' >/dev/null 2>&1; then
           printf '%s' "$gout" | jq -r '.response // ""'
         else
           printf '%s' "$gout" | jq -r '.error.message // empty' 2>/dev/null >> "$RV_CLI_ERR"
         fi;;
     esac
-    if [ "$rc" -ne 0 ]; then
-      printf '%s exited %s: %s\n' "$RV_MODE" "$rc" "$(tr '\n' ' ' < "$RV_CLI_ERR" | cut -c1-200)" > "$RV_ERR"
+    if [ "$rc" -ne 0 ] && [ ! -s "$RV_ERR" ]; then
+      local hint=""
+      # Since 2026-06-18 the Gemini CLI serves enterprise Code Assist only.
+      grep -q 'IneligibleTierError' "$RV_CLI_ERR" 2>/dev/null && \
+        hint=" [individual Google accounts can no longer use the Gemini CLI - use --review-provider gemini-api with GEMINI_API_KEY]"
+      printf '%s exited %s: %s%s\n' "$RV_MODE" "$rc" "$(grep -v 'Approval mode overridden' "$RV_CLI_ERR" | tr '\n' ' ' | cut -c1-200)" "$hint" > "$RV_ERR"
     fi
     return 0
   }
@@ -1506,7 +1519,7 @@ PROMPT_TAIL
         pass_error review "the model declined the review request ($(head -1 "$RV_OUT")) - NOT reviewed"
       elif [ ! -s "$RV_OUT" ]; then
         if [ -s "$RV_ERR" ]; then
-          pass_error review "review provider call failed ($(head -1 "$RV_ERR" | cut -c1-240)) - NOT reviewed"
+          pass_error review "review provider call failed ($(head -1 "$RV_ERR" | cut -c1-400)) - NOT reviewed"
         else
           pass_error review "review provider returned nothing - NOT reviewed"
         fi

@@ -432,6 +432,7 @@ argv_has() { grep -qxF -- "$2" "$BATS_TEST_TMPDIR/$1.argv"; }
   [[ "$output" == *"provider: gemini"*"not supported by gemini; ignored"* ]] || false
   [[ "$output" == *"no findings survived refutation"* ]] || false
   grep -A1 -xF -- '--approval-mode' "$BATS_TEST_TMPDIR/gemini.argv" | grep -qx plan
+  argv_has gemini --skip-trust     # without it, plan is silently downgraded in an untrusted cwd
   grep -A1 -xF -- '--output-format' "$BATS_TEST_TMPDIR/gemini.argv" | grep -qx json
 }
 
@@ -498,4 +499,31 @@ argv_has() { grep -qxF -- "$2" "$BATS_TEST_TMPDIR/$1.argv"; }
   cli_run
   [[ "$output" == *"provider: gemini-api"* ]] || false
   [ ! -e "$BATS_TEST_TMPDIR/gemini.argv" ]
+}
+
+@test "provider gemini: if the CLI downgrades the read-only approval mode, the review is discarded (exit 3)" {
+  cat > "$BIN/gemini" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+echo 'Approval mode overridden to "default" because the current folder is not trusted.' >&2
+echo '{"response":"[]"}'
+SH
+  chmod +x "$BIN/gemini"
+  cli_run --review-provider gemini
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"overrode the read-only approval mode"*"review discarded"* ]] || false
+  [[ "$output" != *"no findings survived"* ]] || false
+}
+
+@test "provider gemini: an individual account (IneligibleTierError) points at gemini-api" {
+  cat > "$BIN/gemini" <<'SH'
+#!/usr/bin/env bash
+cat >/dev/null
+echo 'Error authenticating: IneligibleTierError: This client is no longer supported for Gemini Code Assist for individuals.' >&2
+exit 55
+SH
+  chmod +x "$BIN/gemini"
+  cli_run --review-provider gemini
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"gemini exited 55"*"use --review-provider gemini-api with GEMINI_API_KEY"* ]] || false
 }

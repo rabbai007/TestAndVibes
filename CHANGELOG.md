@@ -84,7 +84,10 @@ review pass. (Supersedes the unreleased 0.9.1; everything below ships together.)
   its strictest read-only mode (no tools / no MCP; read-only sandbox, ephemeral; plan
   approval mode). Previously the CLI provider ran with its default tool set in the
   caller's working directory. CLI failures (not signed in, bad model) fail closed and
-  name the error.
+  name the error. The Gemini CLI silently downgrades its read-only approval mode in an
+  untrusted folder; VibeCheck trusts only its empty scratch dir for the session, and
+  discards the review (exit 3) if a downgrade is still reported. An individual Google
+  account rejected by the enterprise-only Gemini CLI gets a pointer to `gemini-api`.
 - **Default HTTP-API review model moves to the current Opus generation** (see `--review-model`
   in `--help` / the README options table) — ~20% cheaper per token. Effort is still sent
   explicitly (`high`), so the new model's lower built-in default (`medium`) does not
