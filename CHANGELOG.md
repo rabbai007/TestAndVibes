@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.11.0] — 2026-11-05
+
+Closes most of the gap between an automated scan and the automated half of a
+pentest: exploit likelihood (EPSS), built container images, licences and an SBOM,
+the CI/CD pipeline, and a deeper but still non-destructive scan of the running app.
+A new detection benchmark proves VibeCheck still **finds** known flaws, not just
+that it fails closed; its first runs found four bugs that made scans silently
+incomplete, all fixed below.
+
 ### Added
 
 - **VibeCheck inside the coding assistant.** `AGENTS.md`'s *When you finish a
@@ -21,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Both forbid making a scan pass by hiding findings (baseline or ignore-file
   edits, inline suppressions, skipped passes) without the user's approval.
 - Tests: the skill's frontmatter is checked, and every flag the skill or
-  `AGENTS.md` tells an assistant to use must exist in `--help` (58 tests).
+  `AGENTS.md` tells an assistant to use must exist in `--help`. 86 bats tests in total at release.
 - **EPSS exploit probability** (step 3c, on by default). Dependency CVEs, and the
   CVE aliases of GHSA ids, are annotated with FIRST's EPSS score and percentile
   (`epss` in `findings.json`, the score in the title, top five in the console).
@@ -825,7 +836,8 @@ consolidated report plus a CI-friendly exit code.
 - Complementary to [benavlabs/vibe-check](https://github.com/benavlabs/vibe-check)
   (a checklist + AI-rules approach); VibeCheck adds the executable automation layer.
 
-[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.0...v0.10.0
 [0.2.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rabbai007/TestAndVibes/releases/tag/v0.1.0
