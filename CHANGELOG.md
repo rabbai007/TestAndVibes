@@ -78,6 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `target/` pruned the whole tree: no lockfile, IaC file or workflow was found, and
   IaC/CI reported "no files" instead of scanning. Found by the new detection
   benchmark on its first run.
+- **trivy excludes covered only the top level, and could prune the root.**
+  `--skip-dirs node_modules` skipped `./node_modules` but scanned
+  `packages/*/node_modules`, and a scan root named like an exclude returned no
+  results. trivy now runs from inside the root with `**/NAME` patterns.
+- osv-scanner errors now show the error line, not its leading deprecation warning.
 
 ## [0.10.0] — 2026-11-04
 

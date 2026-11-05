@@ -103,3 +103,4 @@ jobs:
         with:
           name: benchmark-report
           path: vibecheck-report/
+          include-hidden-files: true   # the .*.err scanner logs explain a failed pass

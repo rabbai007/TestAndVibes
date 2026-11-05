@@ -589,6 +589,12 @@ PRUNE=(); for e in "${EXCLUDES[@]}"; do PRUNE+=(-name "$e" -prune -o); done
 # scanning a directory that is itself called build/, dist/, target/, vendor/...
 # pruned the whole tree: no lockfile, IaC or workflow was ever found.
 findx() { find "$TARGET" -mindepth 1 "${PRUNE[@]}" -type f \( "$@" \) -print 2>/dev/null; }
+# trivy: same rule, different mechanism. Plain `--skip-dirs NAME` matched only a
+# top-level NAME/ (nested node_modules, build... were scanned) and, matched
+# against a path that includes the root, also pruned a root called NAME. Run
+# from inside the root on "." with "**/NAME": relative paths, every depth.
+trivy_t() { (cd "$TARGET" && trivy "$@" .); }
+trivy_skips() { local e; for e in "${EXCLUDES[@]}"; do printf '%s\0%s\0' --skip-dirs "**/$e"; done; }
 
 [ -n "$(findx -name '*.tf' | head -1)" ]        && { STACK="$STACK terraform"; ok "terraform (*.tf, recursive)"; }
 [ -n "$(findx -name '*.csproj' -o -name '*.fsproj' | head -1)" ] && { STACK="$STACK dotnet"; ok "dotnet (*.csproj)"; }
@@ -830,8 +836,8 @@ else
   if have trivy; then
     tv="$OUTDIR/trivy-deps.json"; rm -f "$tv"
     tv_args=(fs --scanners vuln --severity 'MEDIUM,HIGH,CRITICAL' --quiet --format json --output "$tv")
-    for e in "${EXCLUDES[@]}"; do tv_args+=(--skip-dirs "$e"); done
-    trivy "${tv_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.trivy.err"; tv_rc=$?
+    while IFS= read -r -d '' a; do tv_args+=("$a"); done < <(trivy_skips)
+    trivy_t "${tv_args[@]}" >/dev/null 2>"$OUTDIR/.trivy.err"; tv_rc=$?
     if [ ! -f "$tv" ] || ! jq -e . "$tv" >/dev/null 2>&1; then
       deps_error "trivy exited $tv_rc and produced no parseable JSON — $(head -c 200 "$OUTDIR/.trivy.err" 2>/dev/null | tr '\n' ' ')"
     elif ! jq -e 'has("Results")' "$tv" >/dev/null 2>&1; then
@@ -883,7 +889,9 @@ else
                         ("https://osv.dev/vulnerability/" + $v.id) ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$ov" 2>/dev/null)
       DEP_SRC_OK="$DEP_SRC_OK osv-scanner"
     else
-      deps_error "osv-scanner is installed but produced no parseable JSON — $(head -c 160 "$OUTDIR/.osv.err" 2>/dev/null | tr '\n' ' ')"
+      # Show the error, not the first line: osv-scanner leads with deprecation
+      # warnings and progress lines.
+      deps_error "osv-scanner is installed but produced no parseable JSON — $( { grep -viE 'deprecated|^Scann|walk|End status|^Filtered' "$OUTDIR/.osv.err" 2>/dev/null || true; } | tail -3 | tr '\n' ' ' | head -c 240)"
     fi
   fi
 
@@ -1336,8 +1344,8 @@ if [ "$DO_SBOM" = 1 ]; then
   else
     sb_fail=""
     sb_args=(fs --format cyclonedx --quiet --output "$OUTDIR/sbom.cdx.json")
-    for e in "${EXCLUDES[@]}"; do sb_args+=(--skip-dirs "$e"); done
-    trivy "${sb_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.sbom.err" \
+    while IFS= read -r -d '' a; do sb_args+=("$a"); done < <(trivy_skips)
+    trivy_t "${sb_args[@]}" >/dev/null 2>"$OUTDIR/.sbom.err" \
       && jq -e '.bomFormat == "CycloneDX"' "$OUTDIR/sbom.cdx.json" >/dev/null 2>&1 \
       || sb_fail="$sb_fail source"
     sb_i=0
@@ -1373,8 +1381,8 @@ elif ! have trivy; then
 else
   ti="$OUTDIR/trivy-iac.json"; rm -f "$ti"
   ti_args=(config --severity 'MEDIUM,HIGH,CRITICAL' --quiet --format json --output "$ti")
-  for e in "${EXCLUDES[@]}"; do ti_args+=(--skip-dirs "$e"); done
-  trivy "${ti_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.trivy-iac.err"; ti_rc=$?
+  while IFS= read -r -d '' a; do ti_args+=("$a"); done < <(trivy_skips)
+  trivy_t "${ti_args[@]}" >/dev/null 2>"$OUTDIR/.trivy-iac.err"; ti_rc=$?
   if [ ! -f "$ti" ] || ! jq -e . "$ti" >/dev/null 2>&1; then
     pass_error iac "trivy config exited $ti_rc and produced no parseable JSON"
   elif pe="$(trivy_parse_errors "$OUTDIR/.trivy-iac.err")" && [ -n "$pe" ]; then
