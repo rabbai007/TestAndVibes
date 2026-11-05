@@ -487,6 +487,33 @@ The AI/SSRF rules are deterministic and provider-anchored (Anthropic / OpenAI sh
 
 It completes the JSON-RPC handshake, enumerates the server's **tools, resources, and prompts**, and flags **tool-description poisoning** (instruction text that could steer a calling model), **unconstrained dangerous arguments** (a `command`/`url`/`path` arg with no allowed-values constraint that could reach a shell/SQL/SSRF sink), **secrets in metadata**, and — over HTTP — a server that accepts an **unauthenticated** session. It **never invokes a tool** — listing metadata only — so it stays non-destructive. A missing/unreachable server is an ERROR (exit 3), not a clean pass.
 
+## Compliance mapping: CWE, OWASP Top 10, ASVS
+
+Every finding carries a `taxonomy` object in `findings.json`, so it can be filed
+against the control an auditor asks about:
+
+```json
+"taxonomy": { "cwe": ["CWE-89"], "owasp": ["A03:2021 - Injection", "A05:2025 - Injection"], "asvs": [] }
+```
+
+- **CWE** comes from the scanner where it says (semgrep rule metadata, ZAP, nuclei,
+  testssl.sh), else from VibeCheck's own mapping for its own checks: dependency and
+  image CVEs → CWE-1395, end-of-life OS → CWE-1104, secrets → CWE-798, missing
+  headers, cookie flags and TLS problems → their specific CWE.
+- **OWASP Top 10**: semgrep's own labels (any year), plus the **2021** category
+  derived from the CWE through the official 2021 category lists. One label per
+  category; spellings are normalised.
+- **ASVS 4.0.3**: only where a check corresponds to one requirement (cookie flags
+  V3.4.1-3, TLS V9.1.x, security headers V14.4.x, CORS V14.5.3, components V14.2.1,
+  secrets V2.10.4).
+- Anything VibeCheck cannot map stays empty. Nothing is guessed, and licence
+  findings (legal, not security) carry none.
+
+`report.md` adds a CWE column and a findings-per-OWASP-category table (unmapped
+ones are counted); SARIF rules carry `external/cwe/cwe-N` tags, which GitHub Code
+Scanning shows and filters by. This is evidence for an audit, not a compliance
+certification.
+
 ## What this scan cannot see
 
 Every report ends with the classes of flaw pattern scanning cannot detect at all —

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Compliance mapping.** Every finding carries `taxonomy` (`cwe`, `owasp`,
+  `asvs`) in `findings.json`: CWE from the scanner's own metadata where it gives
+  one (semgrep, ZAP, nuclei, testssl.sh), else VibeCheck's mapping for its own
+  checks; OWASP Top 10 from semgrep's labels plus the 2021 category derived from the
+  CWE, normalised to one label per category; ASVS 4.0.3 only where a check maps to
+  one requirement. Unknown stays empty. `report.md` gains a CWE column and a
+  per-OWASP-category table; SARIF rules gain `external/cwe/cwe-N` tags for GitHub
+  Code Scanning. A mapping failure warns and keeps the findings.
+
 ### Fixed
 
 - **grype ignored the exclude list.** Its `--exclude` globs do not reliably skip
