@@ -52,6 +52,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `security-events: write` moved from the workflow to the one job that uploads
   SARIF, trivy pinned in `setup-trivy`, and zizmor installed so the self-scan
   audits its own pipeline.
+- **`--dast`: deeper, still non-destructive dynamic scan** (pass 5b). testssl.sh
+  (all protocols/ciphers, certificate chain, known TLS attacks), ZAP baseline (one
+  minute of spidering, passive rules only) and nuclei (exposure and misconfiguration
+  templates; intrusive, DoS, fuzz, brute-force and default-login excluded; no
+  out-of-band callbacks; rate-limited; system DNS so internal names resolve). Native
+  tools if installed, else Docker images pinned by digest; `localhost` is mapped
+  for the container. Fail-closed: a missing or failed tool is an ERROR, and so is a
+  target that stops answering during the scan (partial findings are kept). nuclei's
+  host-dropping is disabled because malformed templates trigger it against healthy
+  servers and the rest of the scan is then silently skipped. Pass-5 duplicates are
+  not counted twice. The nuclei template release is recorded.
+- **Detection benchmark** (`.github/workflows/vibecheck-benchmark.yml`, weekly and on
+  scanner/rule changes). Scans OWASP Juice Shop (pinned release: source + running
+  container with `--dast`) and asserts 15 documented vulnerabilities are still
+  detected (`tests/benchmark/expected.json`, checked by `tests/benchmark/check.sh`).
+  Catches the regression the fail-closed tests cannot: a scanner or ruleset change
+  that silently stops finding a class of bug. A pass that does not complete fails it.
 
 ## [0.10.0] — 2026-11-04
 

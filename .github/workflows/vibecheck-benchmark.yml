@@ -1,0 +1,103 @@
+# Detection benchmark: does VibeCheck still FIND what it must find?
+#
+# tests/vibecheck.bats proves the script fails closed. It cannot prove detection:
+# a scanner upgrade, a registry ruleset change or a parsing bug can quietly stop a
+# whole class of finding while every test stays green. This job scans a
+# deliberately vulnerable app with known, documented flaws - OWASP Juice Shop,
+# source and running container - and asserts each one is still detected
+# (tests/benchmark/expected.json).
+#
+# Weekly, because scanners and rulesets change underneath us without a commit
+# here; and on any change to the scanner or its rules. ~15 minutes.
+name: VibeCheck Detection Benchmark
+
+on:
+  schedule:
+    - cron: "41 4 * * 1"      # Mondays 04:41 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - vibecheck.sh
+      - rules/**
+      - tests/benchmark/**
+      - .github/workflows/vibecheck-benchmark.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vibecheck-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned: the benchmark is only meaningful if the target does not move.
+  JUICE_SHOP_REF: v20.3.0
+  JUICE_SHOP_IMAGE: bkimminich/juice-shop@sha256:cea5a4af4aacee498c491491af0408934ec81d004035c0a02ef3e54395e3bf27  # v20.3.0
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0   # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567   # v0.3.1
+        with:
+          version: v0.69.3
+
+      - name: Install scanners (semgrep, zizmor, gitleaks, osv-scanner, jq)
+        run: |
+          pipx install semgrep && pipx install zizmor==1.32.0
+          sudo apt-get update -qq && sudo apt-get install -y -qq jq
+          v=8.30.1
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${v}/gitleaks_${v}_linux_x64.tar.gz"
+          sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+          o=2.5.1
+          curl -sSfL -o /tmp/osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/v${o}/osv-scanner_linux_amd64"
+          sudo install -m 0755 /tmp/osv-scanner /usr/local/bin/osv-scanner
+
+      - name: Fetch the target (source + container)
+        run: |
+          git clone -q --depth 1 --branch "$JUICE_SHOP_REF" https://github.com/juice-shop/juice-shop.git target
+          # Juice Shop commits no lockfile; VibeCheck rightly refuses to call an
+          # unlocked tree scanned. --package-lock-only installs nothing and
+          # --ignore-scripts runs no package code.
+          for d in target target/frontend; do
+            (cd "$d" && npm i --package-lock-only --ignore-scripts --no-audit --no-fund --legacy-peer-deps)
+          done
+          docker run -d --name juice -p 3000:3000 "$JUICE_SHOP_IMAGE"
+          for _ in $(seq 60); do curl -sf -o /dev/null http://localhost:3000/ && break; sleep 2; done
+          curl -sf -o /dev/null http://localhost:3000/
+
+      # --fail-on never: this job asks "was it detected", not "is it clean"
+      # (Juice Shop is meant to fail). Exit 3 is still a failure: a pass that
+      # did not complete makes its checks meaningless (check.sh reports it).
+      - name: Scan (source + running app)
+        run: |
+          rc=0
+          ./vibecheck.sh --dir target --url http://localhost:3000 --dast \
+            --semgrep-config p/ci --fail-on never --no-review --no-pdf --no-baseline || rc=$?
+          echo "vibecheck exit $rc"
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]   # 3 is judged by check.sh, with the reason
+
+      - name: Check expected detections
+        run: |
+          rc=0
+          tests/benchmark/check.sh vibecheck-report/findings.json > benchmark.txt || rc=$?
+          cat benchmark.txt
+          { echo '```'; cat benchmark.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
+        if: always()
+        with:
+          name: benchmark-report
+          path: vibecheck-report/

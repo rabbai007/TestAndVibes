@@ -22,6 +22,7 @@ read-only dynamic** checks against a URL you control, and an optional
 | ⚙️ CI/CD | GitHub Actions: script injection, fork-code triggers, unpinned actions/tools, over-broad tokens, credential persistence | [zizmor](https://docs.zizmor.sh) |
 | 🖼️ Images *(opt-in)* | Built container images: OS + package CVEs (with KEV/EPSS), secrets in layers, end-of-life base OS | trivy image |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
+| 🕷️ Deep DAST *(opt-in, `--dast`)* | Every TLS protocol/cipher and known TLS attack; crawl + passive web-app rules; exposed files, panels and misconfigurations | testssl.sh, ZAP baseline, nuclei |
 | 🧭 Review *(default; needs a provider)* | Access control, tenant isolation, lifecycle, races, missing controls, prompt injection | an LLM |
 
 > **Not a replacement for a professional penetration test.** This is automated
@@ -76,6 +77,7 @@ targets). No config required.
 | `--dir PATH` | `.` | Directory to scan |
 | `--url URL` | — | Enable dynamic checks against this URL (implies `--dynamic`) |
 | `--all` | — | Static + dynamic |
+| `--dast` | — | Deeper, still non-destructive scan of `--url`: testssl.sh + ZAP baseline + nuclei (safe templates). Native tools, else pinned Docker images |
 | `--image REF` | — | Scan a built container image (repeatable): CVEs with KEV/EPSS, secrets in layers, end-of-life base OS |
 | `--fail-on LEVEL` | `high` | Exit 1 at/above `never\|low\|medium\|high\|critical\|any` |
 | `--no-fail-on-error` | — | Don't exit 3 on an incomplete pass (**unsafe** — see above) |
@@ -250,6 +252,41 @@ runs [zizmor](https://docs.zizmor.sh) on every `.github/workflows/*.yml` and
 
 This repository's own workflows were fixed for what it found (token persistence,
 workflow-wide `security-events: write`, an unpinned trivy).
+
+## Deep DAST: crawl and probe the running app
+
+```bash
+./vibecheck.sh --url https://staging.my-app.com --dast
+```
+
+Pass 5 checks one response. `--dast` does what a pentest starts with: crawl the
+app and probe what it exposes. It stays **non-destructive**; only scan targets you
+own or are authorised to test.
+
+| Tool | What it adds | Kept safe by |
+|---|---|---|
+| [testssl.sh](https://testssl.sh) | Every protocol and cipher, certificate chain/SAN/revocation, known TLS attacks (LUCKY13, ROBOT, Heartbleed...) | Handshakes only |
+| [ZAP](https://www.zaproxy.org/docs/docker/baseline-scan/) baseline | Spiders the app for a minute and applies ZAP's passive rules to every page: CSRF tokens, information leaks, insecure forms... | No active scan, so no attack payloads |
+| [nuclei](https://github.com/projectdiscovery/nuclei) | ~6,000 templates for exposed `.git`/`.env`/backups, admin panels, misconfigurations, known CVEs | `intrusive`, `dos`, `fuzz`, `brute-force` and `default-login` templates excluded; no out-of-band callbacks (`-ni`), so target data is not sent to a third-party service; rate-limited |
+
+Each tool runs natively if installed, otherwise from its **Docker image, pinned by
+digest** (override with `VIBECHECK_IMG_TESTSSL` / `_ZAP` / `_NUCLEI`). A
+`localhost` target is mapped for the container (`host.docker.internal` on macOS,
+`--network host` on Linux). The nuclei template release is recorded in the report.
+
+Fail-closed, as everywhere:
+
+- A tool that is missing (and no Docker), or cannot complete, is an **ERROR**.
+- **The target must still be answering when nuclei finishes.** nuclei's own
+  "skip unresponsive hosts" logic was turned off (`-nmhe`): a few malformed
+  templates trip it against a healthy server, after which nuclei silently skips
+  the remaining thousands and reports nothing. If the target did go down, the
+  findings so far are kept and the pass is an ERROR, never "0 findings".
+- Findings already reported by pass 5 (headers, cookies, HSTS, legacy TLS, expiry)
+  are not counted twice.
+
+A full run takes about 5 minutes. Active scanning (ZAP's attack mode) is
+deliberately not offered: it sends payloads that can change data.
 
 ## Licences and the SBOM
 
@@ -624,6 +661,29 @@ bats tests/vibecheck.bats                           # the fail-closed contract
 path where a pass cannot complete must exit 3, not 0. It needs only bash, jq and
 [bats](https://github.com/bats-core/bats-core): no scanners, network, or API key
 (the model provider and the HTTP API are faked). All three run in CI.
+
+### Detection benchmark: does it still find things?
+
+The tests prove VibeCheck fails closed; they cannot prove it **detects**. A scanner
+upgrade, a registry ruleset change or a parsing bug can silently stop a whole class
+of finding with every test green. The
+[benchmark workflow](.github/workflows/vibecheck-benchmark.yml) scans
+[OWASP Juice Shop](https://github.com/juice-shop/juice-shop) (pinned release, source
+and running container, `--dast`) and asserts each of its documented flaws is still
+found: SQL injection in login and search, SSRF, code injection, reflected XSS, an
+open redirect, a hard-coded JWT secret and RSA key, the deliberately outdated
+`jsonwebtoken` / `express-jwt` / `sanitize-html`, a workflow template injection, and
+ZAP / nuclei / header findings on the live app. It runs weekly and on any change to
+the scanner or its rules.
+
+```bash
+tests/benchmark/check.sh vibecheck-report/findings.json                # all checks
+tests/benchmark/check.sh vibecheck-report/findings.json "" sast,secrets   # source-only run
+```
+
+The expectations live in [`tests/benchmark/expected.json`](tests/benchmark/expected.json),
+one `jq` selector per known vulnerability. A pass that did not complete fails the
+benchmark too: its checks would mean nothing.
 
 ## Philosophy
 
