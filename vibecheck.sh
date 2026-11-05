@@ -65,6 +65,11 @@ LICENSE_ALLOW=""        # comma list of SPDX ids; when set, any other licence is
 DO_SBOM=0               # opt-in: write a CycloneDX SBOM of the source tree (and of each --image)
 DO_CI=1                 # default ON when CI workflows exist: audit them with zizmor
 CI_EXPLICIT=0           # 1 = user passed --ci-audit (then a missing zizmor fails closed)
+DO_DAST=0               # opt-in (--dast): testssl.sh + ZAP baseline + nuclei (safe templates) against --url
+# Pinned by digest: a moving tag would change what "clean" means without a commit.
+DAST_IMG_TESTSSL="${VIBECHECK_IMG_TESTSSL:-ghcr.io/testssl/testssl.sh@sha256:53766ec224a2d841b5516bc3923a8586379069ad01c65bbae9244aa24d72a18d}"  # 3.2.5
+DAST_IMG_ZAP="${VIBECHECK_IMG_ZAP:-ghcr.io/zaproxy/zaproxy@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af}"            # 2.17.0
+DAST_IMG_NUCLEI="${VIBECHECK_IMG_NUCLEI:-projectdiscovery/nuclei@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb}"     # v3.11.1
 MCP_TARGET=""           # opt-in MCP server probe: URL (http/https) or a command to spawn (stdio)
 MCP_TIMEOUT=20          # seconds for the MCP handshake/list calls
 MCP_HEADER=""           # optional single HTTP header for an authed MCP endpoint (e.g. "Authorization: Bearer …")
@@ -101,6 +106,13 @@ OPTIONS
   --dir PATH           Directory to scan (default: .)
   --url URL            Enable read-only dynamic checks against URL (implies --dynamic)
   --dynamic            Enable dynamic checks (requires --url)
+  --dast               Deeper dynamic scan of --url (implies --dynamic), still
+                       non-destructive: testssl.sh (ciphers, protocols, TLS
+                       attacks), ZAP baseline (spider + passive rules, no attack
+                       payloads), nuclei (exposures/misconfig; intrusive, DoS,
+                       fuzz and brute-force templates excluded; no OOB callbacks).
+                       Native tools if installed, else their pinned Docker images.
+                       Only scan targets you own or are authorised to test.
   --all                Static + dynamic
   --image REF          Scan a built container image (repeatable): OS + language
                        package CVEs, secrets baked into layers, end-of-life base
@@ -308,6 +320,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dir) TARGET="${2:?--dir needs a path}"; shift 2;;
     --url) URL="${2:?--url needs a URL}"; DYNAMIC=1; shift 2;;
+    --dast) DO_DAST=1; DYNAMIC=1; shift;;
     --image) IMAGES+=("${2:?--image needs an image reference}"); shift 2;;
     --dynamic) DYNAMIC=1; shift;;
     --all) DYNAMIC=1; shift;;
@@ -1607,6 +1620,170 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# 5b. deeper DAST (opt-in: --dast) - still non-destructive
+# ═══════════════════════════════════════════════════════════════════
+# Pass 5 checks one response. A pentest starts by crawling the app and probing
+# what it exposes. These three tools do that without attack payloads:
+#   testssl.sh  every protocol/cipher and the known TLS attacks (5 only probes 1.0/1.1)
+#   ZAP         baseline: spider + PASSIVE rules (no active scan - that sends attacks)
+#   nuclei      exposure/misconfig templates; intrusive, dos, fuzz, brute-force
+#               excluded; -ni so no out-of-band callbacks leave target data with a third party
+# Each runs natively if installed, else from its pinned Docker image. A tool
+# that cannot run is an ERROR: "deep scan requested" must not degrade quietly.
+# Findings use tool "dynamic" (file = the URL), so --diff always keeps them.
+dast_docker_ok() { have docker && docker info >/dev/null 2>&1; }
+if [ "$DO_DAST" = 0 ]; then
+  set_status dast skipped "not requested (--dast)"
+elif [ -z "$URL" ]; then
+  head2 "5b. Deep DAST"; pass_error dast "--dast needs --url - nothing was scanned"
+else
+  head2 "5b. Deep DAST (non-destructive) - $URL"
+  say "  ${C_D}only scan targets you own or are authorised to test${C_0}"
+  dast_fail=""; dast_n=0; dast_tools=""
+  # A container cannot reach the host's "localhost": map it.
+  D_URL="$URL"; D_NET=()
+  case "$URL" in
+    *://localhost*|*://127.0.0.1*|*://\[::1\]*)
+      if [ "$(uname -s)" = Darwin ]; then
+        D_URL="$(printf '%s' "$URL" | sed -E 's#://(localhost|127\.0\.0\.1|\[::1\])#://host.docker.internal#')"
+      else D_NET=(--network host); fi;;
+  esac
+  dast_add() {  # severity rule title help source
+    dast_n=$((dast_n+1)); add_finding dynamic "$1" "$2" "$URL" 0 "$3" "$4" "$5"
+  }
+
+  # ── testssl.sh ──
+  if printf '%s' "$URL" | grep -q '^https://'; then
+    tj="$OUTDIR/testssl.json"; rm -f "$tj"
+    t_args=(--quiet --warnings off --color 0 --severity LOW --ip one --connect-timeout 10 --openssl-timeout 10)
+    if have testssl.sh || have testssl; then
+      t_bin="$(command -v testssl.sh || command -v testssl)"
+      "$t_bin" "${t_args[@]}" --jsonfile "$tj" "$URL" >/dev/null 2>"$OUTDIR/.testssl.err"; t_rc=$?; dast_tools="$dast_tools testssl.sh"
+    elif dast_docker_ok; then
+      docker run --rm "${D_NET[@]+"${D_NET[@]}"}" -v "$OUTDIR:/out" "$DAST_IMG_TESTSSL" \
+        "${t_args[@]}" --jsonfile /out/testssl.json "$D_URL" >/dev/null 2>"$OUTDIR/.testssl.err"; t_rc=$?; dast_tools="$dast_tools testssl.sh(docker)"
+    else t_rc=127; echo "testssl.sh not installed and Docker unavailable" > "$OUTDIR/.testssl.err"; fi
+    # testssl's exit code is the number of findings-ish; only the JSON tells.
+    if ! jq -e 'type == "array" and length > 0' "$tj" >/dev/null 2>&1; then
+      dast_fail="$dast_fail testssl.sh(exit $t_rc: $(tail -c 140 "$OUTDIR/.testssl.err" | tr '\n' ' '))"
+    elif jq -e 'any(.[]; .id == "scanProblem" and .severity == "FATAL")' "$tj" >/dev/null 2>&1; then
+      dast_fail="$dast_fail testssl.sh($(jq -r 'map(select(.id=="scanProblem"))[0].finding' "$tj" | head -c 140))"
+    else
+      while IFS=$'\x1f' read -r sev id fnd cve; do
+        [ -z "${id:-}" ] && continue
+        dast_add "$sev" "testssl.$id" "TLS: $id - $fnd$([ -n "$cve" ] && echo " ($cve)")" "https://testssl.sh/" testssl
+      # Dropped: one row per offered cipher (cipherlist_* already summarises
+      # them), the letter grade (a summary of the rows), and what pass 5 already
+      # reports from its own probe (HSTS, headers, TLS 1.0/1.1, expiry).
+      done < <(jq -r '.[] | select(.severity | IN("LOW","MEDIUM","HIGH","CRITICAL"))
+                 | select(.id | test("^(cipher-tls|cipher_order-tls|overall_grade$|HSTS|security_headers$|TLS1$|TLS1_1$|cert_notAfter$|cert_expirationStatus$)") | not) |
+                 [ (.severity|ascii_downcase), .id, (.finding|.[0:160]), (.cve // "") ]
+                 | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$tj" 2>/dev/null | sort -u)
+    fi
+  else
+    say "  ${C_D}testssl.sh: target is not https - TLS covered by pass 5 (no-tls finding)${C_0}"
+  fi
+
+  # ── ZAP baseline (spider + passive scan) ──
+  zj="$OUTDIR/zap.json"; rm -f "$zj"
+  # -I: do not fail on warnings (we gate); -m 1: one minute of spidering.
+  if have zap-baseline.py; then
+    (cd "$OUTDIR" && zap-baseline.py -t "$URL" -J zap.json -I -m 1 >/dev/null 2>"$OUTDIR/.zap.err"); z_rc=$?; dast_tools="$dast_tools zap"
+  elif dast_docker_ok; then
+    # The image writes reports to /zap/wrk as the zap user (uid 1000).
+    chmod 777 "$OUTDIR" 2>/dev/null
+    docker run --rm "${D_NET[@]+"${D_NET[@]}"}" -v "$OUTDIR:/zap/wrk:rw" "$DAST_IMG_ZAP" \
+      zap-baseline.py -t "$D_URL" -J zap.json -I -m 1 >/dev/null 2>"$OUTDIR/.zap.err"; z_rc=$?; dast_tools="$dast_tools zap(docker)"
+  else z_rc=127; echo "ZAP (zap-baseline.py) not installed and Docker unavailable" > "$OUTDIR/.zap.err"; fi
+  # zap-baseline exits 0/1/2 for pass/fail/warn and 3 for "could not scan".
+  if [ "$z_rc" -ge 3 ] || ! jq -e '.site | type == "array"' "$zj" >/dev/null 2>&1; then
+    dast_fail="$dast_fail zap(exit $z_rc: $(grep -m1 -iE 'error|fail|unable' "$OUTDIR/.zap.err" | head -c 140))"
+  else
+    while IFS=$'\x1f' read -r sev pid name n ref; do
+      [ -z "${pid:-}" ] && continue
+      dast_add "$sev" "zap.$pid" "ZAP: $name ($n URL(s))" "$ref" zap
+    # Rules pass 5 already reports from the same response are skipped, so one
+    # missing header is one finding: 10010/10011/10054 cookie flags, 10020
+    # framing, 10021 nosniff, 10035 HSTS, 10036 server banner, 10038 CSP, 10063
+    # Permissions-Policy.
+    done < <(jq -r '.site[].alerts[]? | select((.riskcode|tonumber) >= 1)
+               | select(.pluginid | IN("10010","10011","10054","10020","10021","10035","10036","10038","10063") | not) |
+               [ ({"1":"low","2":"medium","3":"high"}[.riskcode]), .pluginid, .alert,
+                 ((.instances // []) | length), ((.reference // "") | split("<p>")[1] // "" | sub("</p>.*"; "")) ]
+               | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$zj" 2>/dev/null | sort -u)
+  fi
+
+  # ── nuclei (safe templates) ──
+  nj="$OUTDIR/nuclei.jsonl"; : > "$nj"
+  # Not -silent: its log is how we know the scan happened (see below). -c 10 /
+  # -rl 50 keep the load modest so a small server is not knocked over.
+  # -sr: system DNS as fallback, for internal/staging names.
+  # -nmhe: never drop the host. By default nuclei skips a host after 30 errors,
+  # and a handful of malformed templates (encoded traversal paths) produce
+  # those errors against a perfectly healthy server - the other ~6,000
+  # templates are then skipped and the scan "finds nothing". Whether the target
+  # really died is checked by us after the scan instead.
+  n_args=(-nc -jsonl -ni -duc -sr -nmhe -c 10 -rl 50 -timeout 10 -severity "low,medium,high,critical"
+          -etags "intrusive,dos,fuzz,fuzzing,brute-force,bruteforce,default-login")
+  # Templates are fetched explicitly (-ut) and then the scan runs with update
+  # checks off (-duc). The template release is recorded in the report: it is the
+  # ruleset, and it changes what "clean" means.
+  n_tv=""
+  if have nuclei; then
+    nuclei -ut -silent >/dev/null 2>"$OUTDIR/.nuclei.err"
+    nuclei "${n_args[@]}" -u "$URL" -o "$nj" >/dev/null 2>>"$OUTDIR/.nuclei.err"; n_rc=$?; dast_tools="$dast_tools nuclei"
+    n_tv="$(nuclei -tv 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | tail -1)"
+  elif dast_docker_ok; then
+    # Templates are cached in a named volume, not re-downloaded per run.
+    # Templates AND nuclei's config (which records the template release) are
+    # kept in named volumes, so updates are incremental and -tv can answer.
+    n_docker=(docker run --rm "${D_NET[@]+"${D_NET[@]}"}" -v "$OUTDIR:/out" -v vibecheck-nuclei-templates:/root/nuclei-templates
+              -v vibecheck-nuclei-config:/root/.config/nuclei "$DAST_IMG_NUCLEI")
+    "${n_docker[@]}" -ut -silent >/dev/null 2>"$OUTDIR/.nuclei.err"
+    "${n_docker[@]}" "${n_args[@]}" -u "$D_URL" -o /out/nuclei.jsonl >/dev/null 2>>"$OUTDIR/.nuclei.err"; n_rc=$?; dast_tools="$dast_tools nuclei(docker)"
+    n_tv="$("${n_docker[@]}" -tv 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | tail -1)"
+  else n_rc=127; echo "nuclei not installed and Docker unavailable" > "$OUTDIR/.nuclei.err"; fi
+  [ -n "$n_tv" ] && printf '%s\n' "$(jq -cn --arg v "$n_tv" '{tool:"nuclei-templates", pass:"dast", version:$v, installed:true}')" >> "$TOOLING"
+  # nuclei exits 0 even when it scanned nothing: when the target stops
+  # answering it drops the host ("unresponsive permanently") and finishes
+  # clean. Both that and "no templates ran" are failures, not zero findings.
+  n_tpl="$(grep -oE 'Executing [0-9]+ (signed )?templates' "$OUTDIR/.nuclei.err" | grep -oE '[0-9]+' | head -1)"
+  # Only the TARGET being dropped counts: some templates probe other ports
+  # (e.g. :4040), and nuclei logs those closed ports the same way.
+  n_hp="${D_URL#*://}"; n_hp="${n_hp%%/*}"; n_hp="${n_hp##*@}"
+  case "$n_hp" in *:[0-9]*) ;; *) case "$D_URL" in https://*) n_hp="$n_hp:443";; *) n_hp="$n_hp:80";; esac;; esac
+  if [ "$n_rc" != 0 ] || { [ -s "$nj" ] && ! jq -e . "$nj" >/dev/null 2>&1; }; then
+    dast_fail="$dast_fail nuclei(exit $n_rc: $(grep -m1 -iE 'FTL|ERR|error' "$OUTDIR/.nuclei.err" | head -c 140))"
+  else
+    # What nuclei did find before a drop is still real: report it, AND fail.
+    if ! curl -s -o /dev/null --max-time 15 -k "$URL" 2>/dev/null; then
+      dast_fail="$dast_fail nuclei(the target stopped responding during the scan - results are partial)"
+    elif grep -qF "Skipped $n_hp from target list" "$OUTDIR/.nuclei.err"; then
+      dast_fail="$dast_fail nuclei(the target $n_hp stopped responding mid-scan and nuclei dropped it - results are partial)"
+    elif [ "${n_tpl:-0}" -eq 0 ]; then
+      dast_fail="$dast_fail nuclei(no templates were executed)"
+    fi
+    while IFS=$'\x1f' read -r sev tid name at cve ref; do
+      [ -z "${tid:-}" ] && continue
+      dast_add "$sev" "nuclei.$tid" "nuclei: $name at $at$([ -n "$cve" ] && echo " ($cve)")" "$ref" nuclei
+    # matched-at names the address the container used; report the user's URL.
+    done < <(jq -r --arg from "$D_URL" --arg to "$URL" '
+                    ($from | sub("^(?<b>[a-z]+://[^/]+).*"; "\(.b)")) as $f |
+                    ($to   | sub("^(?<b>[a-z]+://[^/]+).*"; "\(.b)")) as $t |
+                    [ .info.severity, ."template-id", .info.name, ((."matched-at" // .host) | if startswith($f) then $t + .[($f|length):] else . end),
+                      ((.info.classification."cve-id" // []) | if type=="array" then join(",") else . end),
+                      ((.info.reference // []) | if type=="array" then (.[0] // "") else . end) ]
+                    | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$nj" 2>/dev/null | sort -u)
+  fi
+
+  say "  ${C_D}tools:$dast_tools${C_0}"
+  if [ -n "$dast_fail" ]; then
+    pass_error dast "could not complete:$dast_fail - the deep scan is NOT complete"
+  elif [ "$dast_n" -gt 0 ]; then warn "deep DAST: $dast_n finding(s)"; set_status dast findings "$dast_n finding(s) from$dast_tools"
+  else ok "deep DAST: 0 findings from$dast_tools"; set_status dast ok "0 findings from$dast_tools"; fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # 6. adversarial review (opt-in, report-only by default)
 # ═══════════════════════════════════════════════════════════════════
 # Everything above matches patterns. This pass reasons: it is given the code and
@@ -2317,7 +2494,7 @@ fi
 # A3: "no pass examined anything" is not a clean result. Disabling every scanner
 # — by flag or by config — used to yield 0 findings and exit 0, which is
 # indistinguishable from a repo with nothing wrong. An empty scan is unknown.
-EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","license","iac","ci","dynamic","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
+EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","license","iac","ci","dynamic","dast","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
 if [ "${EXECUTED:-0}" -eq 0 ]; then
   pass_error coverage "no scan pass examined anything (all were skipped, disabled, or failed) — this result is unknown, not clean"
 fi
