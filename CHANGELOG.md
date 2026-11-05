@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **VibeCheck inside the coding assistant.** `AGENTS.md`'s *When you finish a
+  feature* section now tells the assistant to run VibeCheck before saying it is
+  done, fix what it finds, re-scan, and treat exit 3 as not clean.
+- **`vibecheck` Agent Skill** (`.agents/skills/vibecheck/SKILL.md`): the full
+  procedure, covering locating the script, scanning (review pass only on
+  request, since it is paid), reading `findings.json`, fixing in priority order
+  (verified secrets to rotate, CISA KEV, critical, high), re-scanning and
+  reporting with the coverage caveat. Works in any assistant that reads Agent
+  Skills; README lists where to install it.
+- Both forbid making a scan pass by hiding findings (baseline or ignore-file
+  edits, inline suppressions, skipped passes) without the user's approval.
+- Tests: the skill's frontmatter is checked, and every flag the skill or
+  `AGENTS.md` tells an assistant to use must exist in `--help` (58 tests).
 
 ## [0.10.0] — 2026-11-04
 

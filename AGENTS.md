@@ -85,9 +85,24 @@ human). Keep all three.
   ones behind explicit confirmation.
 
 ## When you finish a feature
-Before saying it's done, self-review against the rules above and note any you
-could not satisfy. If the change touches auth, tenancy, data access, uploads,
-or external calls, say so explicitly so a human can review it.
+Before saying it's done:
+
+1. Self-review against the rules above and note any you could not satisfy.
+2. Run VibeCheck and fix what it finds:
+   `./vibecheck.sh --dir . --no-review --no-pdf` (add `--diff <base-branch>`
+   on a branch). Exit 0 is clean, 1 means findings to fix, and **3 means a scan
+   could not run: that is not clean**, so say which one. Findings are in
+   `vibecheck-report/findings.json` (`.active`). Re-run until it exits 0 or
+   every remaining finding is explained. If a secret is reported as verified,
+   tell the user to rotate it now.
+3. Never make the scan pass by hiding findings: do not edit the baseline,
+   `.vibecheckignore` or `vibecheck.yml`, add inline suppressions, or skip a
+   pass unless the user explicitly approves it. Never commit a report.
+4. If the change touches auth, tenancy, data access, uploads, or external
+   calls, say so explicitly so a human can review it. A clean scan cannot see
+   those flaws.
+
+The full procedure is the `vibecheck` skill in `.agents/skills/vibecheck/`.
 
 ---
 *Part of [VibeCheck](README.md). Detection: run `./vibecheck.sh`. Verification:

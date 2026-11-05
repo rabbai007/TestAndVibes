@@ -709,3 +709,23 @@ SH
   [ "$status" -eq 3 ]
   [[ "$output" == *"trufflehog scan failed: filesystem(exit 1)"* ]] || false
 }
+
+# ── assistant guidance: AGENTS.md and the skill must not drift from the CLI ──
+
+@test "skill: frontmatter has the name and description Agent Skills requires" {
+  local s="$BATS_TEST_DIRNAME/../.agents/skills/vibecheck/SKILL.md"
+  [ "$(sed -n 1p "$s")" = "---" ]
+  sed -n '2,/^---$/p' "$s" | grep -qx 'name: vibecheck'
+  sed -n '2,/^---$/p' "$s" | grep -q '^description: .\{40,\}'
+}
+
+@test "skill + AGENTS.md: every vibecheck flag they tell an assistant to use exists" {
+  local help flag missing=""
+  help="$("$VC" --help)"
+  for flag in $(grep -ohE -- '--[a-z][a-z-]*[a-z*]' \
+                  "$BATS_TEST_DIRNAME/../.agents/skills/vibecheck/SKILL.md" \
+                  "$BATS_TEST_DIRNAME/../AGENTS.md" | sed 's/\*$//' | sort -u); do
+    printf '%s\n' "$help" | grep -qF -- "$flag" || missing="$missing $flag"
+  done
+  [ -z "$missing" ] || { echo "not in --help:$missing"; false; }
+}

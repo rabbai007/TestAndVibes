@@ -475,6 +475,30 @@ Treat an **exit 3 as a real failure**, not noise: it means an area wasn't
 scanned. The usual causes are an uncommitted lockfile or a scanner missing from
 the runner image — both worth fixing rather than suppressing.
 
+## In your AI coding assistant
+
+CI catches problems after a push; the assistant writing the code can catch them
+before it says "done". Two files make it do that. Both are plain text, free, and
+cover the default scan only: the paid review pass runs only when you ask.
+
+- **[`AGENTS.md`](AGENTS.md)**: copy it to your project root. Besides the secure
+  coding rules, its *When you finish a feature* section tells the assistant to
+  run VibeCheck, fix what it finds, and treat exit 3 as not clean.
+- **[`.agents/skills/vibecheck/`](.agents/skills/vibecheck/SKILL.md)**: the full
+  procedure as an [Agent Skill](https://agentskills.io): locate the script,
+  scan, read `findings.json`, fix in priority order (verified secrets and CISA KEV
+  first), re-scan, and report. Copy the `vibecheck` folder into your assistant's
+  skills directory:
+
+  | Assistant | Project | User (all projects) |
+  |---|---|---|
+  | Codex | `.agents/skills/` | `~/.agents/skills/` |
+  | Any other assistant that reads Agent Skills | see your tool's docs | see your tool's docs |
+
+Both forbid the assistant from making a scan pass by hiding findings (editing the
+baseline or ignore files, inline suppressions, skipping a pass) without your
+explicit approval. The decision to accept a finding stays with you.
+
 ## Hardening checklist
 
 [`hardening/CHECKLIST.md`](hardening/CHECKLIST.md) is a manual review companion —
