@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   edits, inline suppressions, skipped passes) without the user's approval.
 - Tests: the skill's frontmatter is checked, and every flag the skill or
   `AGENTS.md` tells an assistant to use must exist in `--help` (58 tests).
+- **EPSS exploit probability** (step 3c, on by default). Dependency CVEs, and the
+  CVE aliases of GHSA ids, are annotated with FIRST's EPSS score and percentile
+  (`epss` in `findings.json`, the score in the title, top five in the console).
+  Annotation only: severity, the gate and fingerprints are unchanged; an unscored
+  CVE is left unannotated rather than shown as 0%. Same failure contract as KEV:
+  unreachable API warns, `--epss` makes it an ERROR, `--epss-file` takes the daily
+  CSV (`.csv`/`.csv.gz`) for air-gapped runners. `--no-epss` turns it off.
 
 ## [0.10.0] — 2026-11-04
 

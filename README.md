@@ -84,6 +84,9 @@ targets). No config required.
 | `--kev` | **on** | Match dependency CVEs against CISA KEV. On by default (warns if the feed is unreachable); passing `--kev` makes an unreachable feed an **ERROR** |
 | `--no-kev` | — | Skip the CISA KEV check |
 | `--kev-file PATH` | — | Use a local copy of the KEV JSON feed (air-gapped CI; implies `--kev`) |
+| `--epss` | **on** | Annotate dependency CVEs with their FIRST EPSS exploit probability. On by default (warns if the API is unreachable); with `--epss` that is an ERROR. Never changes severity |
+| `--no-epss` | — | Skip the EPSS lookup |
+| `--epss-file PATH` | — | Use a local copy of the daily EPSS CSV (`.csv`/`.csv.gz`; implies `--epss`) |
 | `--review` | **on** | Adversarial reasoning pass (report-only). Runs by default when a provider exists; **skips** if none. |
 | `--no-review` | — | Turn the review pass off |
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
@@ -180,7 +183,25 @@ without KEV it passes a `--fail-on high` gate.
 - **Scope, honestly:** KEV is weighted toward vendor products (VPNs, firewalls,
   Windows), so hits on application dependencies are rare — but when one fires,
   it is the finding to fix today. Matching is by CVE id: an advisory with no CVE
-  alias cannot match. EPSS (exploit *probability*) is not yet used.
+  alias cannot match.
+
+### Likely to be exploited: EPSS
+
+KEV says a CVE is exploited **now**; [FIRST EPSS](https://www.first.org/epss/)
+estimates the probability it will be exploited **in the next 30 days**. That is
+the answer to "which of these 40 mediums first?". Each dependency CVE (and its
+CVE aliases) gets an `epss` object (`score`, `percentile`, `date`) in
+`findings.json`, and the score in its title, e.g. `[EPSS 84.9%, 99.7th pct]`. The
+five highest are listed in the console.
+
+- **Annotation only.** EPSS is a likelihood, not an impact: it never changes a
+  severity, the gate, or a fingerprint. Use it to order the work.
+- **Unscored is unknown, not 0%.** A CVE FIRST has not scored (or an advisory with
+  no CVE id) gets no annotation.
+- **Same failure contract as KEV:** on by default, an unreachable API warns and is
+  recorded as *EPSS NOT checked*; `--epss` makes it an ERROR. Offline, download the
+  [daily CSV](https://epss.empiricalsecurity.com/epss_scores-current.csv.gz) and pass
+  `--epss-file` (`.csv` or `.csv.gz`); a copy older than 14 days warns.
 
 ## The adversarial review pass
 

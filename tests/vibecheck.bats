@@ -19,7 +19,10 @@ setup() {
   BIN="$BATS_TEST_TMPDIR/bin"
   mkdir -p "$APP" "$BIN"
   printf 'app.get("/x", (req, res) => res.send(db.find(req.query.id)))\n' > "$APP/server.js"
-  unset ANTHROPIC_API_KEY VIBECHECK_REVIEW_CMD
+  unset ANTHROPIC_API_KEY VIBECHECK_REVIEW_CMD VIBECHECK_EPSS_FILE VIBECHECK_KEV_FILE
+  # Default-on network lookups must never reach the real service from a test:
+  # a closed local port fails at once (tests that need EPSS use a file or a fake).
+  export VIBECHECK_EPSS_URL="http://127.0.0.1:9/epss"
   # Review-only run: every pattern pass skipped explicitly, no PDF, no baseline.
   REVIEW_ONLY=(--dir "$APP" --out "$OUT" --no-baseline --no-pdf
                --skip-secrets --skip-sast --skip-deps --skip-iac)
@@ -728,4 +731,73 @@ SH
     printf '%s\n' "$help" | grep -qF -- "$flag" || missing="$missing $flag"
   done
   [ -z "$missing" ] || { echo "not in --help:$missing"; false; }
+}
+
+# ── EPSS: exploit probability annotates, never changes severity ────────────
+
+epss_csv() {  # the FIRST daily CSV shape; CVE-2099-0002 deliberately unscored
+  printf '#model_version:v2099.01.01,score_date:%sT00:00:00Z\ncve,epss,percentile\nCVE-2099-0001,0.84887,0.99712\nCVE-1999-0001,0.01,0.5\n' \
+    "$(date -u +%Y-%m-%d)" > "$BATS_TEST_TMPDIR/epss.csv"
+}
+
+@test "epss: a CVE is annotated with score and percentile; severity and the gate are unchanged" {
+  kev_setup; epss_csv
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss-file "$BATS_TEST_TMPDIR/epss.csv"
+  [ "$status" -eq 0 ]                                   # two mediums, --fail-on high: still passes
+  local f="$OUT/findings.json"
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .epss.score' "$f")" = "0.84887" ]
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .severity' "$f")" = "medium" ]
+  [[ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .title' "$f")" == *"[EPSS 84.9%, 99.7th pct]" ]] || false
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="epss") | .status' "$f")" = "ok" ]
+}
+
+@test "epss: a CVE FIRST has not scored gets no annotation (unknown, not 0%)" {
+  kev_setup; epss_csv
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss-file "$BATS_TEST_TMPDIR/epss.csv"
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0002") | has("epss")' "$OUT/findings.json")" = "false" ]
+  [[ "$(jq -r '.active[] | select(.rule=="CVE-2099-0002") | .title' "$OUT/findings.json")" != *EPSS* ]] || false
+}
+
+@test "epss: a gzipped daily file works" {
+  kev_setup; epss_csv; gzip "$BATS_TEST_TMPDIR/epss.csv"
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss-file "$BATS_TEST_TMPDIR/epss.csv.gz"
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .epss.percentile' "$OUT/findings.json")" = "0.99712" ]
+}
+
+@test "epss: --epss-file that does not exist, or is not the FIRST CSV, fails closed (exit 3)" {
+  kev_setup
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss-file "$BATS_TEST_TMPDIR/nope.csv"
+  [ "$status" -eq 3 ]
+  printf 'not,a,feed\n' > "$BATS_TEST_TMPDIR/bad.csv"
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss-file "$BATS_TEST_TMPDIR/bad.csv"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"not the FIRST CSV"* ]] || false
+}
+
+@test "epss: default-on with the API unreachable warns and records 'NOT checked'; explicit --epss fails closed" {
+  kev_setup
+  kev_run "${DEPS_ONLY[@]}" --no-kev
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"EPSS NOT checked"* ]] || false
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="epss") | .status' "$OUT/findings.json")" = "skipped" ]
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss
+  [ "$status" -eq 3 ]
+}
+
+@test "epss: API path batches CVEs and parses FIRST's response" {
+  kev_setup
+  cat > "$BIN/curl" <<'SH'
+#!/usr/bin/env bash
+out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -w|--max-time|--retry|--retry-delay) shift 2;; -*) shift;; *) url="$1"; shift;; esac; done
+echo "$url" >> "$FAKE_CURL_LOG"
+printf '{"status":"OK","status-code":200,"data":[{"cve":"CVE-2099-0002","epss":"0.5","percentile":"0.9","date":"2099-01-01"}]}' > "$out"
+printf 200
+SH
+  chmod +x "$BIN/curl"; export FAKE_CURL_LOG="$BATS_TEST_TMPDIR/curl.log"
+  VIBECHECK_EPSS_URL="https://epss.invalid/v1" kev_run "${DEPS_ONLY[@]}" --no-kev --epss
+  [ "$status" -eq 0 ]
+  grep -qx 'https://epss.invalid/v1?cve=CVE-2099-0001,CVE-2099-0002' "$FAKE_CURL_LOG"
+  [ "$(grep -c . "$FAKE_CURL_LOG")" -eq 1 ]               # one batch, no empty trailing request
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0002") | .epss.score' "$OUT/findings.json")" = "0.5" ]
 }

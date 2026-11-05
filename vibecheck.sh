@@ -54,6 +54,11 @@ KEV_EXPLICIT=0          # 1 = user passed --kev / --kev-file (then an unavailabl
 KEV_FILE="${VIBECHECK_KEV_FILE:-}"   # local copy of the KEV JSON feed (air-gapped CI)
 KEV_URL="${VIBECHECK_KEV_URL:-https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json}"
 KEV_STALE_DAYS=14       # warn when a --kev-file catalog is older than this
+DO_EPSS=1               # default ON: annotate dependency CVEs with their FIRST EPSS exploit probability
+EPSS_EXPLICIT=0         # 1 = user passed --epss / --epss-file (then an unavailable feed fails closed)
+EPSS_FILE="${VIBECHECK_EPSS_FILE:-}" # local copy of the daily EPSS CSV (.csv or .csv.gz; air-gapped CI)
+EPSS_URL="${VIBECHECK_EPSS_URL:-https://api.first.org/data/v1/epss}"
+EPSS_STALE_DAYS=14      # warn when an --epss-file is older than this
 MCP_TARGET=""           # opt-in MCP server probe: URL (http/https) or a command to spawn (stdio)
 MCP_TIMEOUT=20          # seconds for the MCP handshake/list calls
 MCP_HEADER=""           # optional single HTTP header for an authed MCP endpoint (e.g. "Authorization: Bearer …")
@@ -107,6 +112,11 @@ OPTIONS
                        A dependency CVE listed in KEV is raised to critical.
   --no-kev             Skip the CISA KEV check
   --kev-file PATH      Use a local copy of the KEV JSON feed (air-gapped CI; implies --kev)
+  --epss               Require FIRST EPSS exploit-probability scores for dependency CVEs
+                       (ON by default; with --epss an unreachable feed is an ERROR).
+                       Annotation only: EPSS is a likelihood, it never changes severity.
+  --no-epss            Skip the EPSS lookup
+  --epss-file PATH     Use a local copy of the daily EPSS CSV (.csv or .csv.gz; implies --epss)
   --review             Adversarial review pass: an LLM reasons about trust
                        boundaries, lifecycle and logic — the classes no scanner
                        can reach. ON BY DEFAULT and REPORT-ONLY. Uses the first
@@ -302,6 +312,9 @@ while [ $# -gt 0 ]; do
     --kev) DO_KEV=1; KEV_EXPLICIT=1; shift;;
     --no-kev) DO_KEV=0; shift;;
     --kev-file) KEV_FILE="${2:?--kev-file needs a path}"; DO_KEV=1; KEV_EXPLICIT=1; shift 2;;
+    --epss) DO_EPSS=1; EPSS_EXPLICIT=1; shift;;
+    --no-epss) DO_EPSS=0; shift;;
+    --epss-file) EPSS_FILE="${2:?--epss-file needs a path}"; DO_EPSS=1; EPSS_EXPLICIT=1; shift 2;;
     --mcp) MCP_TARGET="${2:?--mcp needs a URL or command}"; shift 2;;
     --mcp-timeout) MCP_TIMEOUT="${2:?}"; shift 2;;
     --mcp-header) MCP_HEADER="${2:?}"; shift 2;;
@@ -955,6 +968,16 @@ fi
 # exploited bug". See the baseline split below.
 KEV_N=0; KEV_VERSION=""
 KEV_JSON="$OUTDIR/cisa-kev.json"
+# Candidate CVE ids per finding: the id itself plus every alias we know.
+# OSV's alias table bridges GHSA<->CVE; grype's relatedVulnerabilities adds the
+# same bridge when osv-scanner is absent. Used by the KEV and EPSS lookups only -
+# the dedup merge above is untouched, so fingerprints are stable.
+KEV_ALIASES="$OUTDIR/.kev-aliases.jsonl"; : > "$KEV_ALIASES"
+[ -s "${ALIAS_MAP:-}" ] && awk -F'\037' '{print $1"\t"$2; print $2"\t"$1}' "$ALIAS_MAP" \
+  | jq -R -c 'split("\t") | {id:.[0], alias:.[1]}' >> "$KEV_ALIASES" 2>/dev/null
+[ -s "$OUTDIR/grype.json" ] && jq -c '.matches[]? | .vulnerability.id as $i
+    | (.relatedVulnerabilities // [])[] | {id:$i, alias:.id}, {id:.id, alias:$i}' \
+    "$OUTDIR/grype.json" >> "$KEV_ALIASES" 2>/dev/null
 kev_fail() {  # explicit -> fail closed; default-on -> loud warning, recorded
   if [ "$KEV_EXPLICIT" = 1 ]; then pass_error kev "$1 - CISA KEV NOT checked"
   else warn "$1 - CISA KEV NOT checked (pass --kev to make this an error, --kev-file for offline)"
@@ -991,17 +1014,6 @@ if [ "$DO_KEV" = 1 ] && [ "$DO_DEPS" = 1 ]; then
         printf '%s\n' "$(jq -cn --arg v "CISA KEV $KEV_VERSION ($kev_total entries)" \
           '{tool:"cisa-kev", pass:"deps", version:$v, installed:true}')" >> "$TOOLING"
 
-        # Candidate CVE ids per finding: the id itself plus every alias we know.
-        # OSV's alias table bridges GHSA<->CVE; grype's relatedVulnerabilities
-        # adds the same bridge when osv-scanner is absent. Used for this lookup
-        # only - the dedup merge above is untouched, so fingerprints are stable.
-        KEV_ALIASES="$OUTDIR/.kev-aliases.jsonl"; : > "$KEV_ALIASES"
-        [ -s "${ALIAS_MAP:-}" ] && awk -F'\037' '{print $1"\t"$2; print $2"\t"$1}' "$ALIAS_MAP" \
-          | jq -R -c 'split("\t") | {id:.[0], alias:.[1]}' >> "$KEV_ALIASES" 2>/dev/null
-        [ -s "$OUTDIR/grype.json" ] && jq -c '.matches[]? | .vulnerability.id as $i
-            | (.relatedVulnerabilities // [])[] | {id:$i, alias:.id}, {id:.id, alias:$i}' \
-            "$OUTDIR/grype.json" >> "$KEV_ALIASES" 2>/dev/null
-
         KEV_TMP="$OUTDIR/.findings.kev.jsonl"
         # -s: build the lookup tables once, not once per finding.
         jq -s -c --slurpfile kev "$KEV_JSON" --slurpfile al <(jq -s '.' "$KEV_ALIASES") '
@@ -1035,6 +1047,101 @@ if [ "$DO_KEV" = 1 ] && [ "$DO_DEPS" = 1 ]; then
   fi
 elif [ "$DO_KEV" = 0 ]; then
   set_status kev skipped "disabled by --no-kev"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 3c. FIRST EPSS - probability of exploitation in the next 30 days
+# ═══════════════════════════════════════════════════════════════════
+# KEV says "exploited now"; EPSS says "how likely soon". It answers "which of
+# these 40 mediums first?". It is a likelihood, not an impact, so it NEVER
+# changes severity or the gate: each CVE finding gets an `epss` object
+# (score, percentile, date) and the score in its title. A CVE that FIRST has not
+# scored gets no annotation - that is "unknown", never "0%".
+EPSS_N=0
+epss_fail() {  # explicit -> fail closed; default-on -> loud warning, recorded
+  if [ "$EPSS_EXPLICIT" = 1 ]; then pass_error epss "$1 - EPSS NOT checked"
+  else warn "$1 - EPSS NOT checked (pass --epss to make this an error, --epss-file for offline)"
+       set_status epss skipped "$1"; fi
+}
+if [ "$DO_EPSS" = 1 ] && [ "$DO_DEPS" = 1 ]; then
+  EPSS_CVES="$OUTDIR/.epss-cves.txt"
+  jq -r --slurpfile al <(jq -s '.' "$KEV_ALIASES") '
+      ($al[0] | group_by(.id) | map({key:.[0].id, value:map(.alias)}) | from_entries) as $a
+      | select(.tool=="deps") | [.rule] + ($a[.rule] // []) | .[] | ascii_upcase
+      | select(test("^CVE-[0-9]{4}-[0-9]+$"))' "$FINDINGS" 2>/dev/null | sort -u > "$EPSS_CVES"
+  n_cves=$(wc -l < "$EPSS_CVES" | tr -d ' ')
+  if [ "$n_cves" -eq 0 ]; then
+    set_status epss skipped "no dependency CVE ids to score"
+  else
+    head2 "3c. EPSS exploit probability"
+    EPSS_TSV="$OUTDIR/.epss.tsv"; : > "$EPSS_TSV"; epss_src=""; epss_ok=1
+    if [ -n "$EPSS_FILE" ]; then
+      if [ ! -f "$EPSS_FILE" ]; then epss_ok=0; epss_fail "EPSS file not found: $EPSS_FILE"
+      else
+        case "$EPSS_FILE" in *.gz) epss_cat=(gzip -dc);; *) epss_cat=(cat);; esac
+        # Format: "#model_version:...,score_date:YYYY-MM-DD..." then "cve,epss,percentile".
+        epss_hdr="$("${epss_cat[@]}" "$EPSS_FILE" 2>/dev/null | head -2 | tr '\n' '|')"
+        case "$epss_hdr" in
+          *"cve,epss,percentile"*)
+            epss_date="$(printf '%s' "$epss_hdr" | sed -n 's/.*score_date:\([0-9-]\{10\}\).*/\1/p')"
+            "${epss_cat[@]}" "$EPSS_FILE" 2>/dev/null | awk -F, -v d="${epss_date:-unknown}" '
+                NR==FNR { want[$1]=1; next }
+                ($1 in want) { print $1 "\t" $2 "\t" $3 "\t" d }' "$EPSS_CVES" - > "$EPSS_TSV"
+            epss_src="file $(basename "$EPSS_FILE") (${epss_date:-undated})"
+            e_age="$( [ -n "$epss_date" ] && days_since "$epss_date" )"
+            [ -n "$e_age" ] && [ "$e_age" -gt "$EPSS_STALE_DAYS" ] && \
+              warn "EPSS file is $e_age days old - refresh the --epss-file copy";;
+          *) epss_ok=0; epss_fail "EPSS file is not the FIRST CSV (expected a cve,epss,percentile header)";;
+        esac
+      fi
+    elif have curl; then
+      # The API takes a comma list; 50 per request keeps the URL well under limits.
+      epss_n=0
+      while [ "$epss_ok" = 1 ] && IFS= read -r batch; do
+        epss_n=$((epss_n+1)); ej="$OUTDIR/.epss-$epss_n.json"
+        e_code="$(curl -sS --retry 2 --retry-delay 3 --max-time 60 -o "$ej" -w '%{http_code}' \
+                  "$EPSS_URL?cve=$batch" 2>/dev/null)" || e_code="${e_code:-000}"
+        case "$e_code" in
+          2??) if jq -e '(.status=="OK") and (.data|type=="array")' "$ej" >/dev/null 2>&1; then
+                 jq -r '.data[] | [.cve, .epss, .percentile, .date] | @tsv' "$ej" >> "$EPSS_TSV"
+               else epss_ok=0; epss_fail "EPSS API returned an unexpected document"; fi;;
+          *)   epss_ok=0; epss_fail "EPSS API request failed (HTTP $e_code from $EPSS_URL)";;
+        esac
+      done < <(awk '{ b = b (b == "" ? "" : ",") $0 } NR % 50 == 0 { print b; b = "" }
+                    END { if (b != "") print b }' "$EPSS_CVES")
+      epss_src="FIRST API $(cut -f4 "$EPSS_TSV" | sort -u | tail -1)"
+    else
+      epss_ok=0; epss_fail "curl not installed"
+    fi
+
+    if [ "$epss_ok" = 1 ]; then
+      printf '%s\n' "$(jq -cn --arg v "FIRST EPSS, $epss_src" '{tool:"first-epss", pass:"deps", version:$v, installed:true}')" >> "$TOOLING"
+      EPSS_TMP="$OUTDIR/.findings.epss.jsonl"
+      jq -s -c --slurpfile al <(jq -s '.' "$KEV_ALIASES") \
+               --slurpfile ep <(jq -R -s 'split("\n") | map(select(length>0) | split("\t")
+                                   | {key:.[0], value:{score:(.[1]|tonumber), percentile:(.[2]|tonumber), date:.[3]}})
+                                   | from_entries' "$EPSS_TSV") '
+        ($al[0] | group_by(.id) | map({key:.[0].id, value:map(.alias)}) | from_entries) as $a |
+        .[] |
+        if .tool != "deps" then . else
+          ([.rule] + ($a[.rule] // []) | map(ascii_upcase) | unique
+            | map(select($ep[0][.] != null) | {cve: ., s: $ep[0][.]})
+            | sort_by(-.s.score) | .[0]) as $h |
+          if $h == null then . else
+            . + { epss: ($h.s + {cve: $h.cve}),
+                  title: (.title + " [EPSS \($h.s.score * 1000 | round / 10)%, \($h.s.percentile * 1000 | floor / 10)th pct]") }
+          end
+        end' "$FINDINGS" > "$EPSS_TMP" && mv "$EPSS_TMP" "$FINDINGS"
+      EPSS_N="$(jq -s '[.[] | select(.epss != null)] | length' "$FINDINGS")"
+      dep_n="$(jq -s '[.[] | select(.tool=="deps")] | length' "$FINDINGS")"
+      ok "EPSS: $EPSS_N of $dep_n dependency finding(s) scored ($epss_src)"
+      jq -s -r '[.[] | select(.epss != null)] | sort_by(-.epss.score) | .[0:5][]
+                | "      · \(.epss.cve)  \(.epss.score * 1000 | round / 10)% (\(.epss.percentile * 1000 | floor / 10)th pct)  \(.file)"' "$FINDINGS"
+      set_status epss ok "$EPSS_N of $dep_n dependency finding(s) scored ($epss_src)"
+    fi
+  fi
+elif [ "$DO_EPSS" = 0 ]; then
+  set_status epss skipped "disabled by --no-epss"
 fi
 
 # ═══════════════════════════════════════════════════════════════════
