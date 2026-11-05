@@ -38,7 +38,7 @@ setup_file() {
     [ -d "$d" ] || continue
     for f in "$d"/*; do
       n="${f##*/}"
-      case "$n" in claude|codex|gemini|gemini-api|agy|ant|trivy|osv-scanner|grype|npm|semgrep|trufflehog|gitleaks) continue;; esac
+      case "$n" in claude|codex|gemini|gemini-api|agy|ant|trivy|osv-scanner|grype|npm|semgrep|trufflehog|gitleaks|zizmor|syft|nuclei|testssl.sh|testssl|zap.sh|zap-baseline.py) continue;; esac
       [ -x "$f" ] && [ ! -e "$clean/$n" ] && ln -s "$f" "$clean/$n"
     done
   done
@@ -950,5 +950,68 @@ SH
   [ "$status" -eq 0 ]
   [ "$(jq -r .bomFormat "$OUT/sbom.cdx.json")" = "CycloneDX" ]
   FAKE_TRIVY_FAIL=1 kev_run "${REVIEW_ONLY[@]}" --review --review-cmd 'echo "[]"' --sbom
+  [ "$status" -eq 3 ]
+}
+
+# ── CI/CD workflow audit (zizmor) ──────────────────────────────────────────
+
+zizmor_setup() {  # a workflow, and a fake zizmor that reports a script injection in it
+  mkdir -p "$APP/.github/workflows"
+  printf 'on: pull_request_target\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo "${{ github.event.pull_request.title }}"\n' \
+    > "$APP/.github/workflows/ci.yml"
+  cat > "$BIN/zizmor" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = "--version" ] && { echo "zizmor 0.0.0-fake"; exit 0; }
+printf '%s\n' "$@" > "$FAKE_ZZ_ARGS"; env | grep -q '^GH_TOKEN=' && echo "GH_TOKEN set" >> "$FAKE_ZZ_ARGS"
+[ "${FAKE_ZZ_MODE:-}" = crash ] && { echo "error: boom" >&2; exit 1; }
+[ "${FAKE_ZZ_MODE:-}" = clean ] && { echo '[]'; exit 0; }
+f=""; for a in "$@"; do case "$a" in *.yml) f="$a";; esac; done
+cat <<JSON
+[{"ident":"template-injection","desc":"code injection via template expansion","url":"https://docs.zizmor.sh/audits/#template-injection",
+  "determinations":{"confidence":"High","severity":"High","persona":"Regular"},
+  "locations":[{"symbolic":{"key":{"Local":{"given_path":"$f"}},"annotation":"may expand into attacker-controllable code","kind":"Primary"},
+                "concrete":{"location":{"start_point":{"row":5,"column":0}}}}]},
+ {"ident":"noise","desc":"informational only","url":"","determinations":{"confidence":"High","severity":"Informational"},
+  "locations":[{"symbolic":{"key":{"Local":{"given_path":"$f"}},"annotation":"","kind":"Primary"},"concrete":{"location":{"start_point":{"row":0}}}}]}]
+JSON
+exit 14
+SH
+  chmod +x "$BIN/zizmor"; export FAKE_ZZ_ARGS="$BATS_TEST_TMPDIR/zz.args"
+  CI_ONLY=(--dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review
+           --skip-secrets --skip-sast --skip-deps --skip-iac)
+}
+
+@test "ci: a workflow script injection is reported at its file and line, and gates" {
+  zizmor_setup
+  env -u GH_TOKEN -u GITHUB_TOKEN PATH="$BIN:$CLEAN_PATH" "$VC" "${CI_ONLY[@]}" > "$BATS_TEST_TMPDIR/o" 2>&1 || status=$?
+  [ "${status:-0}" -eq 1 ]
+  local f="$OUT/findings.json"
+  [ "$(jq -r '.active[] | select(.rule=="zizmor.template-injection") | "\(.severity) \(.file):\(.line)"' "$f")" = "high .github/workflows/ci.yml:6" ]
+  [ "$(jq -r '[.active[] | select(.rule=="zizmor.noise")] | length' "$f")" -eq 0 ]   # informational dropped
+  grep -qx -- '--offline' "$FAKE_ZZ_ARGS"                                            # no token: offline
+}
+
+@test "ci: with GH_TOKEN the online audits run and the token is passed" {
+  zizmor_setup
+  GH_TOKEN=t0ken kev_run "${CI_ONLY[@]}"
+  ! grep -qx -- '--offline' "$FAKE_ZZ_ARGS"
+  grep -qx 'GH_TOKEN set' "$FAKE_ZZ_ARGS"
+}
+
+@test "ci: a zizmor crash is an error (exit 3); a clean audit is ok" {
+  zizmor_setup
+  FAKE_ZZ_MODE=crash kev_run "${CI_ONLY[@]}"
+  [ "$status" -eq 3 ]
+  FAKE_ZZ_MODE=clean kev_run "${CI_ONLY[@]}"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="ci") | .status' "$OUT/findings.json")" = "ok" ]
+}
+
+@test "ci: missing zizmor warns by default (recorded NOT audited); --ci-audit makes it an error" {
+  zizmor_setup; rm "$BIN/zizmor"
+  kev_run "${CI_ONLY[@]}" --review --review-cmd 'echo "[]"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CI/CD NOT audited"* ]] || false
+  kev_run "${CI_ONLY[@]}" --ci-audit
   [ "$status" -eq 3 ]
 }

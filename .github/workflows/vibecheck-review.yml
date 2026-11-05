@@ -56,6 +56,8 @@ jobs:
     timeout-minutes: 45          # reasoning passes are slow; do not hang a runner all day
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false   # report-only job; no push
 
       - name: Install jq
         run: jq --version || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }

@@ -63,6 +63,8 @@ EPSS_STALE_DAYS=14      # warn when an --epss-file is older than this
 DO_LICENSES=0           # opt-in: classify dependency licences (osv-scanner + deps.dev; needs network)
 LICENSE_ALLOW=""        # comma list of SPDX ids; when set, any other licence is a high finding
 DO_SBOM=0               # opt-in: write a CycloneDX SBOM of the source tree (and of each --image)
+DO_CI=1                 # default ON when CI workflows exist: audit them with zizmor
+CI_EXPLICIT=0           # 1 = user passed --ci-audit (then a missing zizmor fails closed)
 MCP_TARGET=""           # opt-in MCP server probe: URL (http/https) or a command to spawn (stdio)
 MCP_TIMEOUT=20          # seconds for the MCP handshake/list calls
 MCP_HEADER=""           # optional single HTTP header for an authed MCP endpoint (e.g. "Authorization: Bearer …")
@@ -131,6 +133,10 @@ OPTIONS
   --license-allow LIST Comma list of allowed SPDX ids (implies --licenses); any
                        other licence is high. Replaces the default policy.
   --sbom               Write a CycloneDX SBOM (sbom.cdx.json; one per --image too)
+  --ci-audit           Require the CI/CD workflow audit (zizmor). ON by default when
+                       GitHub Actions workflows exist; with --ci-audit a missing
+                       zizmor is an ERROR. Online checks run when GH_TOKEN is set.
+  --no-ci-audit        Skip the CI/CD workflow audit
   --review             Adversarial review pass: an LLM reasons about trust
                        boundaries, lifecycle and logic — the classes no scanner
                        can reach. ON BY DEFAULT and REPORT-ONLY. Uses the first
@@ -333,6 +339,8 @@ while [ $# -gt 0 ]; do
     --licenses) DO_LICENSES=1; shift;;
     --license-allow) LICENSE_ALLOW="${2:?--license-allow needs a comma list of SPDX ids}"; DO_LICENSES=1; shift 2;;
     --sbom) DO_SBOM=1; shift;;
+    --ci-audit) DO_CI=1; CI_EXPLICIT=1; shift;;
+    --no-ci-audit) DO_CI=0; shift;;
     --mcp) MCP_TARGET="${2:?--mcp needs a URL or command}"; shift 2;;
     --mcp-timeout) MCP_TIMEOUT="${2:?}"; shift 2;;
     --mcp-header) MCP_HEADER="${2:?}"; shift 2;;
@@ -373,9 +381,11 @@ if [ "$SELF_INSTALL" = 1 ]; then
     say "    gitleaks  : https://github.com/gitleaks/gitleaks#installing"
     say "    osv-scanner: https://google.github.io/osv-scanner/installation/"
   fi
-  if have pipx; then pipx install semgrep 2>/dev/null || true
-  elif have pip3; then pip3 install --user semgrep 2>/dev/null || true
-  else say "    semgrep   : pipx install semgrep  (https://semgrep.dev)"; fi
+  # semgrep and zizmor ship as Python wheels; pipx avoids compiling from source.
+  if have pipx; then pipx install semgrep 2>/dev/null || true; pipx install zizmor 2>/dev/null || true
+  elif have pip3; then pip3 install --user semgrep zizmor 2>/dev/null || true
+  else say "    semgrep   : pipx install semgrep  (https://semgrep.dev)"
+       say "    zizmor    : pipx install zizmor   (https://docs.zizmor.sh)"; fi
   ok "install pass complete (re-run without --install to scan)"
   exit 0
 fi
@@ -532,6 +542,7 @@ tool_ver gitleaks   secrets gitleaks version
 tool_ver semgrep    sast    semgrep --version
 tool_ver trivy      deps,iac trivy --version
 tool_ver osv-scanner deps   osv-scanner --version
+tool_ver zizmor      ci     zizmor --version
 tool_ver grype      deps    grype version
 tool_ver npm        deps    npm --version
 tool_ver jq         core    jq --version
@@ -1374,6 +1385,66 @@ else
     [ "$m" -gt 0 ] && say  "  ${C_D}trivy config: $m MEDIUM misconfig(s)${C_0}"
     [ $((c+h+m)) -eq 0 ] && ok "trivy config: 0 MEDIUM+ misconfigs"
     if [ $((c+h+m)) -gt 0 ]; then set_status iac findings "$c critical, $h high, $m medium"; else set_status iac ok "0 misconfigs"; fi
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 4b. CI/CD workflows (GitHub Actions) - zizmor
+# ═══════════════════════════════════════════════════════════════════
+# The pipeline holds the deploy keys. Script injection from a PR title, a
+# pull_request_target job that checks out fork code, a mutable action tag, an
+# over-broad GITHUB_TOKEN: none of these is visible to SAST on the app code.
+# zizmor is new in 0.11, so by default a missing zizmor warns and is recorded
+# as NOT checked rather than turning an upgrade red; --ci-audit makes it an ERROR.
+CI_FILES="$(find "$TARGET" "${PRUNE[@]}" \( -path '*/.github/workflows/*.yml' -o -path '*/.github/workflows/*.yaml' \
+             -o -name 'action.yml' -o -name 'action.yaml' \) -type f -print 2>/dev/null | head -200)"
+if [ "$DO_CI" = 0 ]; then
+  set_status ci skipped "disabled by --no-ci-audit"
+elif [ -z "$CI_FILES" ]; then
+  [ "$CI_EXPLICIT" = 1 ] && { head2 "4b. CI/CD workflows"; skip "CI audit" "no GitHub Actions workflows found"; }
+  set_status ci skipped "no GitHub Actions workflows"
+else
+  head2 "4b. CI/CD workflows (GitHub Actions)"
+  if ! have zizmor; then
+    if [ "$CI_EXPLICIT" = 1 ]; then pass_error ci "workflows present but zizmor is not installed - CI/CD NOT audited"
+    else warn "workflows present but zizmor is not installed - CI/CD NOT audited (pipx install zizmor; --ci-audit makes this an error)"
+         set_status ci skipped "zizmor not installed - NOT audited"; fi
+  else
+    zj="$OUTDIR/zizmor.json"; rm -f "$zj"
+    z_mode="offline"; z_args=(--format json --no-progress)
+    if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then z_mode="online"; else z_args+=(--offline); fi
+    # Paths, not the directory: zizmor's own discovery ignores our excludes.
+    # shellcheck disable=SC2086  # CI_FILES is a newline list of paths
+    # zizmor reads GH_TOKEN; it rejects an empty one, so export only a real token.
+    (IFS=$'\n'; [ "$z_mode" = online ] && export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+     zizmor "${z_args[@]}" $CI_FILES) > "$zj" 2>"$OUTDIR/.zizmor.err"; zr=$?
+    # zizmor exits 0 (clean) or 10 + the highest severity found; anything else is a failure.
+    case "$zr" in 0|1[0-4]) z_rc_ok=1;; *) z_rc_ok=0;; esac
+    if [ "$z_rc_ok" = 0 ] || ! jq -e 'type == "array"' "$zj" >/dev/null 2>&1; then
+      pass_error ci "zizmor exited $zr without a usable report - CI/CD NOT audited: $(grep -m2 -iE 'error|fatal' "$OUTDIR/.zizmor.err" | tr '\n' ' ' | head -c 200)"
+    else
+      z_h=0; z_m=0; z_l=0
+      while IFS=$'\x1f' read -r sev id file line title url; do
+        [ -z "${id:-}" ] && continue
+        case "$sev" in high) z_h=$((z_h+1));; medium) z_m=$((z_m+1));; *) z_l=$((z_l+1));; esac
+        add_finding zizmor "$sev" "zizmor.$id" "$(rel "$file")" "$line" "$title" "$url"
+      done < <(jq -r '.[] | (.locations | map(select(.symbolic.kind == "Primary")) | .[0] // .locations[0]) as $p |
+                 ((.determinations.severity // "Low") | ascii_downcase) as $s |
+                 select($s != "informational" and $s != "unknown") |
+                 [ $s, .ident,
+                   ($p.symbolic.key.Local.given_path // $p.symbolic.key.Local.verbatim_path // ""),
+                   ((($p.concrete.location.start_point.row // -1) + 1) | tostring),
+                   ("\(.desc): \($p.symbolic.annotation // "")"
+                     + (if (.determinations.confidence // "") == "Low" then " (confidence: low)" else "" end)),
+                   (.url // "") ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$zj" 2>/dev/null | sort -u)
+      n_wf="$(printf '%s\n' "$CI_FILES" | grep -c .)"
+      [ "$z_h" -gt 0 ] && bad  "zizmor: $z_h HIGH workflow issue(s)"
+      [ "$z_m" -gt 0 ] && warn "zizmor: $z_m MEDIUM"
+      [ "$z_l" -gt 0 ] && say  "  ${C_D}zizmor: $z_l LOW${C_0}"
+      [ "$z_mode" = offline ] && say "  ${C_D}offline mode: set GH_TOKEN for the online audits (known-vulnerable actions, impostor commits)${C_0}"
+      if [ $((z_h+z_m+z_l)) -gt 0 ]; then set_status ci findings "$z_h high, $z_m medium, $z_l low in $n_wf file(s) ($z_mode)"
+      else ok "zizmor: 0 issues in $n_wf workflow file(s) ($z_mode)"; set_status ci ok "0 issues in $n_wf file(s) ($z_mode)"; fi
+    fi
   fi
 fi
 
@@ -2246,7 +2317,7 @@ fi
 # A3: "no pass examined anything" is not a clean result. Disabling every scanner
 # — by flag or by config — used to yield 0 findings and exit 0, which is
 # indistinguishable from a repo with nothing wrong. An empty scan is unknown.
-EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","license","iac","dynamic","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
+EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","license","iac","ci","dynamic","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
 if [ "${EXECUTED:-0}" -eq 0 ]; then
   pass_error coverage "no scan pass examined anything (all were skipped, disabled, or failed) — this result is unknown, not clean"
 fi

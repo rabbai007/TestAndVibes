@@ -42,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replaces the policy with an allowlist. Runs osv-scanner in allowlist mode, the
   only mode that lists every package (summary mode lists only vulnerable ones).
 - **`--sbom`**: CycloneDX SBOM of the source tree and of each `--image`.
+- **CI/CD workflow audit** (pass 4b, on when GitHub Actions workflows exist):
+  [zizmor](https://docs.zizmor.sh) finds script injection, fork-code triggers,
+  unpinned actions and tools, over-broad tokens and credential persistence, filed on
+  the workflow file and line. A missing zizmor warns (recorded *NOT audited*);
+  `--ci-audit` makes it an ERROR, `--no-ci-audit` skips it. Online audits run when
+  `GH_TOKEN` is set. `--install` adds zizmor.
+- This repository's workflows: `persist-credentials: false` on every checkout,
+  `security-events: write` moved from the workflow to the one job that uploads
+  SARIF, trivy pinned in `setup-trivy`, and zizmor installed so the self-scan
+  audits its own pipeline.
 
 ## [0.10.0] — 2026-11-04
 

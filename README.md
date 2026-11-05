@@ -19,6 +19,7 @@ read-only dynamic** checks against a URL you control, and an optional
 | 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) **+ AI/LLM (OWASP-LLM), SSRF, resource-exhaustion** | semgrep + [`rules/`](rules/) |
 | 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) **+ CISA KEV: actively exploited CVEs raised to critical** | trivy + osv-scanner + npm audit + grype + [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
+| ⚙️ CI/CD | GitHub Actions: script injection, fork-code triggers, unpinned actions/tools, over-broad tokens, credential persistence | [zizmor](https://docs.zizmor.sh) |
 | 🖼️ Images *(opt-in)* | Built container images: OS + package CVEs (with KEV/EPSS), secrets in layers, end-of-life base OS | trivy image |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
 | 🧭 Review *(default; needs a provider)* | Access control, tenant isolation, lifecycle, races, missing controls, prompt injection | an LLM |
@@ -92,6 +93,8 @@ targets). No config required.
 | `--licenses` | — | Check dependency licences from the lockfiles (needs osv-scanner + network) |
 | `--license-allow LIST` | — | Allowed SPDX ids, comma-separated; anything else is high (implies `--licenses`) |
 | `--sbom` | — | Write a CycloneDX SBOM (`sbom.cdx.json`, plus one per `--image`) |
+| `--ci-audit` | **on** | Audit GitHub Actions workflows with zizmor. On when workflows exist (missing zizmor warns); with `--ci-audit` a missing zizmor is an ERROR |
+| `--no-ci-audit` | — | Skip the CI/CD workflow audit |
 | `--review` | **on** | Adversarial reasoning pass (report-only). Runs by default when a provider exists; **skips** if none. |
 | `--no-review` | — | Turn the review pass off |
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
@@ -227,6 +230,26 @@ docker build -t myapp:ci . && ./vibecheck.sh --image myapp:ci
 Repeat `--image` for several images. Each image that cannot be scanned (bad
 reference, no registry access, no daemon) is an **ERROR (exit 3)**. Image
 findings have `file: "image:REF"` and always stay in scope under `--diff`.
+
+## CI/CD workflows
+
+The pipeline holds the deploy keys, and none of its common flaws are visible to SAST
+on the app: a `${{ github.event.pull_request.title }}` expanded into a `run:` script,
+a `pull_request_target` job that checks out fork code, a mutable action tag, a
+workflow-wide `write` token, `actions/checkout` leaving the token on disk. Pass 4b
+runs [zizmor](https://docs.zizmor.sh) on every `.github/workflows/*.yml` and
+`action.yml` (respecting excludes); findings land on the workflow file and line.
+
+- **On by default** when workflows exist. zizmor is new in 0.11, so a missing
+  zizmor **warns** and is recorded as *NOT audited* instead of failing an upgrade;
+  `--ci-audit` makes it an ERROR. `pipx install zizmor` (or `--install`).
+- **Offline unless a token is set.** With `GH_TOKEN` (or `GITHUB_TOKEN`) zizmor also
+  runs its online audits (known-vulnerable actions, impostor commits). In Actions,
+  pass `GH_TOKEN: ${{ github.token }}`; read-only is enough.
+- Informational findings are dropped; low-confidence ones say so in the title.
+
+This repository's own workflows were fixed for what it found (token persistence,
+workflow-wide `security-events: write`, an unpinned trivy).
 
 ## Licences and the SBOM
 
