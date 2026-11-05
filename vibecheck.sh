@@ -797,6 +797,17 @@ lockcheck ruby   "Gemfile.lock"
 lockcheck java   "pom.xml gradle.lockfile"
 lockcheck dotnet "packages.lock.json"
 
+# osv-scanner gets the lockfiles explicitly (-L), from findx. Left to walk the
+# directory itself it skips git-ignored files - and projects that do not commit
+# their lockfile ignore it, so a lockfile generated for the scan was never read
+# ("No package sources found") - and it ignores our excludes (node_modules...).
+OSV_LOCKS=()
+while IFS= read -r f; do OSV_LOCKS+=(-L "$f"); done < <(findx -name package-lock.json -o -name npm-shrinkwrap.json \
+  -o -name yarn.lock -o -name pnpm-lock.yaml -o -name bun.lock -o -name poetry.lock -o -name Pipfile.lock \
+  -o -name uv.lock -o -name 'requirements*.txt' -o -name go.mod -o -name Cargo.lock -o -name composer.lock \
+  -o -name Gemfile.lock -o -name pom.xml -o -name gradle.lockfile -o -name packages.lock.json | sort)
+osv_src() { if [ "${#OSV_LOCKS[@]}" -gt 0 ]; then printf '%s\0' "${OSV_LOCKS[@]}"; else printf '%s\0' "$TARGET"; fi; }
+
 DEP_ANY=0
 DEPS_ERRORED=0
 deps_error() { DEPS_ERRORED=1; pass_error deps "$1"; }
@@ -868,8 +879,9 @@ else
   # recognised as the same vulnerability instead of counted twice.
   if have osv-scanner; then
     ov="$OUTDIR/osv.json"; rm -f "$ov"
-    osv-scanner scan source --format json --output "$ov" "$TARGET" >/dev/null 2>"$OUTDIR/.osv.err" || true
-    [ -s "$ov" ] || osv-scanner --format json --output "$ov" -r "$TARGET" >/dev/null 2>>"$OUTDIR/.osv.err" || true
+    osv_args=(); while IFS= read -r -d '' a; do osv_args+=("$a"); done < <(osv_src)
+    osv-scanner scan source --format json --output "$ov" "${osv_args[@]}" >/dev/null 2>"$OUTDIR/.osv.err" || true
+    [ -s "$ov" ] || osv-scanner --format json --output "$ov" "${osv_args[@]}" >/dev/null 2>>"$OUTDIR/.osv.err" || true
     if [ -s "$ov" ] && jq -e . "$ov" >/dev/null 2>&1; then
       # alias -> canonical (prefer a CVE id as canonical)
       jq -r '.results[]?.packages[]?.groups[]? |
@@ -1307,7 +1319,8 @@ else
     # is passed through; the default policy passes 0BSD - a licence it permits
     # anyway, so omitting those packages changes nothing - and classifies the rest.
     lic_list="$(printf '%s' "${LICENSE_ALLOW:-0BSD}" | tr -d ' ')"
-    osv-scanner scan source --licenses="$lic_list" --format json --output "$lj" "$TARGET" >/dev/null 2>"$OUTDIR/.osv-lic.err"; lr=$?
+    osv_args=(); while IFS= read -r -d '' a; do osv_args+=("$a"); done < <(osv_src)
+    osv-scanner scan source --licenses="$lic_list" --format json --output "$lj" "${osv_args[@]}" >/dev/null 2>"$OUTDIR/.osv-lic.err"; lr=$?
     # osv-scanner: 0 clean, 1 issues found, 128 no packages, anything else an error.
     if [ "$lr" = 128 ]; then
       skip "licence check" "no packages found in any lockfile"; set_status license skipped "no packages found"

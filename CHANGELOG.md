@@ -82,6 +82,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--skip-dirs node_modules` skipped `./node_modules` but scanned
   `packages/*/node_modules`, and a scan root named like an exclude returned no
   results. trivy now runs from inside the root with `**/NAME` patterns.
+- **osv-scanner skipped git-ignored lockfiles and ignored excludes.** Left to walk
+  the tree, it skips files in `.gitignore`, so a project that does not commit its
+  lockfile (and ignores it) was never read by osv, even when a lockfile was
+  generated for the scan; and it walked `node_modules`. It is now given the
+  lockfiles explicitly (`-L`), found with the same exclude-aware search as
+  everything else, for both the dependency and licence checks.
 - osv-scanner errors now show the error line, not its leading deprecation warning.
 
 ## [0.10.0] — 2026-11-04

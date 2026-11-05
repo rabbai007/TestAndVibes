@@ -1135,3 +1135,20 @@ SH
   [ "$status" -eq 0 ]
   [[ "$(jq -r '.coverage.passes[] | select(.pass=="ci") | .detail' "$OUT/findings.json")" == "0 issues in 1 file(s)"* ]] || false
 }
+
+@test "deps: osv-scanner gets the lockfiles explicitly - git-ignored ones included, excluded dirs not (regression)" {
+  kev_setup
+  mkdir -p "$APP/node_modules/x"; printf 'a==1\n' > "$APP/node_modules/x/requirements.txt"
+  cat > "$BIN/osv-scanner" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = "--version" ] && { echo "osv-scanner version: 0.0.0-fake"; exit 0; }
+printf '%s\n' "$@" > "$FAKE_OSV_ARGS"
+out=""; while [ $# -gt 0 ]; do [ "$1" = "--output" ] && out="$2"; shift; done
+echo '{"results":[]}' > "$out"
+SH
+  chmod +x "$BIN/osv-scanner"; export FAKE_OSV_ARGS="$BATS_TEST_TMPDIR/osv.args"
+  kev_run "${DEPS_ONLY[@]}" --no-kev --no-epss
+  grep -qx -- "-L" "$FAKE_OSV_ARGS"
+  grep -qx "$APP/requirements.txt" "$FAKE_OSV_ARGS"
+  ! grep -q "node_modules" "$FAKE_OSV_ARGS"
+}
