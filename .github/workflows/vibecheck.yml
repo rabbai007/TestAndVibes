@@ -16,8 +16,7 @@ on:
   workflow_dispatch:        # manual run
 
 permissions:
-  contents: read
-  security-events: write    # required to upload SARIF to Code Scanning
+  contents: read            # job-level grants below add only what each job needs
 
 jobs:
   # The script's own behaviour: lint + the fail-closed contract (tests/vibecheck.bats).
@@ -27,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
+        with:
+          persist-credentials: false   # nothing here pushes; keep the token off disk
 
       - name: shellcheck (warning and above)
         # Preinstalled on ubuntu-latest.
@@ -40,19 +41,26 @@ jobs:
 
   vibecheck:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write    # required to upload SARIF to Code Scanning (this job only)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
         with:
           fetch-depth: 0    # full history for secret scanning
+          persist-credentials: false   # the scan reads local history only; no push
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0   # v7.1.0
         with:
           python-version: "3.12"
 
-      - name: Install semgrep
-        run: pipx install semgrep
+      - name: Install semgrep + zizmor
+        # zizmor audits this repository's own workflows (pass 4b).
+        run: pipx install semgrep && pipx install zizmor==1.32.0
 
       - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567   # v0.3.1
+        with:
+          version: v0.69.3      # pinned: an unpinned tool changes results without a commit
 
       - name: Install jq
         # Hard requirement: VibeCheck parses all scanner output as JSON.
@@ -99,6 +107,7 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           BASE_REF: ${{ github.base_ref }}
+          GH_TOKEN: ${{ github.token }}   # zizmor online audits (known-vulnerable actions); read-only
         # --diff implies --base, so vibecheck.yml / .vibecheckignore / the
         # baseline are read from the base branch. Without that, a pull request
         # could commit config that suppresses its own findings.
@@ -108,11 +117,13 @@ jobs:
 
       - name: Run VibeCheck on itself (full scan)
         if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}   # zizmor online audits (known-vulnerable actions); read-only
         run: ./vibecheck.sh --fail-on high --semgrep-config p/ci --skip-deps --no-review --no-pdf --exclude tests
 
       # Uploaded even when the gate fails, so findings reach the Security tab.
       - name: Upload SARIF to Code Scanning
-        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63   # v4
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63   # v4.38.0
         if: always()
         with:
           sarif_file: vibecheck-report/vibecheck.sarif

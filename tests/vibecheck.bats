@@ -19,7 +19,10 @@ setup() {
   BIN="$BATS_TEST_TMPDIR/bin"
   mkdir -p "$APP" "$BIN"
   printf 'app.get("/x", (req, res) => res.send(db.find(req.query.id)))\n' > "$APP/server.js"
-  unset ANTHROPIC_API_KEY VIBECHECK_REVIEW_CMD
+  unset ANTHROPIC_API_KEY VIBECHECK_REVIEW_CMD VIBECHECK_EPSS_FILE VIBECHECK_KEV_FILE
+  # Default-on network lookups must never reach the real service from a test:
+  # a closed local port fails at once (tests that need EPSS use a file or a fake).
+  export VIBECHECK_EPSS_URL="http://127.0.0.1:9/epss"
   # Review-only run: every pattern pass skipped explicitly, no PDF, no baseline.
   REVIEW_ONLY=(--dir "$APP" --out "$OUT" --no-baseline --no-pdf
                --skip-secrets --skip-sast --skip-deps --skip-iac)
@@ -35,7 +38,7 @@ setup_file() {
     [ -d "$d" ] || continue
     for f in "$d"/*; do
       n="${f##*/}"
-      case "$n" in claude|codex|gemini|gemini-api|agy|ant|trivy|osv-scanner|grype|npm|semgrep|trufflehog|gitleaks) continue;; esac
+      case "$n" in claude|codex|gemini|gemini-api|agy|ant|trivy|osv-scanner|grype|npm|semgrep|trufflehog|gitleaks|zizmor|syft|nuclei|testssl.sh|testssl|zap.sh|zap-baseline.py|docker) continue;; esac
       [ -x "$f" ] && [ ! -e "$clean/$n" ] && ln -s "$f" "$clean/$n"
     done
   done
@@ -728,4 +731,424 @@ SH
     printf '%s\n' "$help" | grep -qF -- "$flag" || missing="$missing $flag"
   done
   [ -z "$missing" ] || { echo "not in --help:$missing"; false; }
+}
+
+# ── EPSS: exploit probability annotates, never changes severity ────────────
+
+epss_csv() {  # the FIRST daily CSV shape; CVE-2099-0002 deliberately unscored
+  printf '#model_version:v2099.01.01,score_date:%sT00:00:00Z\ncve,epss,percentile\nCVE-2099-0001,0.84887,0.99712\nCVE-1999-0001,0.01,0.5\n' \
+    "$(date -u +%Y-%m-%d)" > "$BATS_TEST_TMPDIR/epss.csv"
+}
+
+@test "epss: a CVE is annotated with score and percentile; severity and the gate are unchanged" {
+  kev_setup; epss_csv
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss-file "$BATS_TEST_TMPDIR/epss.csv"
+  [ "$status" -eq 0 ]                                   # two mediums, --fail-on high: still passes
+  local f="$OUT/findings.json"
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .epss.score' "$f")" = "0.84887" ]
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .severity' "$f")" = "medium" ]
+  [[ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .title' "$f")" == *"[EPSS 84.9%, percentile 99.7]" ]] || false
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="epss") | .status' "$f")" = "ok" ]
+}
+
+@test "epss: a CVE FIRST has not scored gets no annotation (unknown, not 0%)" {
+  kev_setup; epss_csv
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss-file "$BATS_TEST_TMPDIR/epss.csv"
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0002") | has("epss")' "$OUT/findings.json")" = "false" ]
+  [[ "$(jq -r '.active[] | select(.rule=="CVE-2099-0002") | .title' "$OUT/findings.json")" != *EPSS* ]] || false
+}
+
+@test "epss: a gzipped daily file works" {
+  kev_setup; epss_csv; gzip "$BATS_TEST_TMPDIR/epss.csv"
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss-file "$BATS_TEST_TMPDIR/epss.csv.gz"
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .epss.percentile' "$OUT/findings.json")" = "0.99712" ]
+}
+
+@test "epss: --epss-file that does not exist, or is not the FIRST CSV, fails closed (exit 3)" {
+  kev_setup
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss-file "$BATS_TEST_TMPDIR/nope.csv"
+  [ "$status" -eq 3 ]
+  printf 'not,a,feed\n' > "$BATS_TEST_TMPDIR/bad.csv"
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss-file "$BATS_TEST_TMPDIR/bad.csv"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"not the FIRST CSV"* ]] || false
+}
+
+@test "epss: default-on with the API unreachable warns and records 'NOT checked'; explicit --epss fails closed" {
+  kev_setup
+  kev_run "${DEPS_ONLY[@]}" --no-kev
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"EPSS NOT checked"* ]] || false
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="epss") | .status' "$OUT/findings.json")" = "skipped" ]
+  kev_run "${DEPS_ONLY[@]}" --no-kev --epss
+  [ "$status" -eq 3 ]
+}
+
+@test "epss: API path batches CVEs and parses FIRST's response" {
+  kev_setup
+  cat > "$BIN/curl" <<'SH'
+#!/usr/bin/env bash
+out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -w|--max-time|--retry|--retry-delay) shift 2;; -*) shift;; *) url="$1"; shift;; esac; done
+echo "$url" >> "$FAKE_CURL_LOG"
+printf '{"status":"OK","status-code":200,"data":[{"cve":"CVE-2099-0002","epss":"0.5","percentile":"0.9","date":"2099-01-01"}]}' > "$out"
+printf 200
+SH
+  chmod +x "$BIN/curl"; export FAKE_CURL_LOG="$BATS_TEST_TMPDIR/curl.log"
+  VIBECHECK_EPSS_URL="https://epss.invalid/v1" kev_run "${DEPS_ONLY[@]}" --no-kev --epss
+  [ "$status" -eq 0 ]
+  grep -qx 'https://epss.invalid/v1?cve=CVE-2099-0001,CVE-2099-0002' "$FAKE_CURL_LOG"
+  [ "$(grep -c . "$FAKE_CURL_LOG")" -eq 1 ]               # one batch, no empty trailing request
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0002") | .epss.score' "$OUT/findings.json")" = "0.5" ]
+}
+
+# ── --image: what was built, not just the Dockerfile ───────────────────────
+
+image_setup() {  # fake trivy: image "old:1" is EOL with a CVE and a secret; "clean:1" is clean; anything else fails
+  cat > "$BIN/trivy" <<'SH'
+#!/usr/bin/env bash
+case " $* " in *" --version "*) echo "Version: 0.0.0-fake"; exit 0;; esac
+[ "$1" = image ] || exit 0
+out=""; ref=""; while [ $# -gt 0 ]; do case "$1" in --output) out="$2"; shift 2;; --*) [ "$1" = --quiet ] && shift || shift 2;; *) ref="$1"; shift;; esac; done
+case "$ref" in
+  old:1) cat > "$out" <<'JSON'
+{"ArtifactName":"old:1","Metadata":{"ImageID":"sha256:0123456789abcdef","OS":{"Family":"alpine","Name":"3.12.12","EOSL":true}},
+ "Results":[{"Target":"old:1 (alpine 3.12.12)","Vulnerabilities":[
+   {"VulnerabilityID":"CVE-2099-0001","PkgName":"zlib","InstalledVersion":"1.2","FixedVersion":"1.3","Severity":"MEDIUM","Title":"zlib overflow"}]},
+  {"Target":"/app/.env","Class":"secret","Secrets":[{"RuleID":"aws-access-key-id","Severity":"CRITICAL","Title":"AWS Access Key ID","StartLine":3}]}]}
+JSON
+  ;;
+  clean:1) printf '{"ArtifactName":"clean:1","Metadata":{"OS":{"Family":"alpine","Name":"3.22.0"}},"Results":[]}' > "$out";;
+  *) echo "FATAL run error: could not parse reference: $ref" >&2; exit 1;;
+esac
+SH
+  chmod +x "$BIN/trivy"
+  IMG_ONLY=(--dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --no-kev --no-epss
+            --skip-secrets --skip-sast --skip-deps --skip-iac)
+}
+
+@test "image: CVEs, a secret in a layer and an end-of-life base OS are reported against the image" {
+  image_setup
+  kev_run "${IMG_ONLY[@]}" --image old:1
+  [ "$status" -eq 1 ]                                    # the critical secret gates
+  local f="$OUT/findings.json"
+  [ "$(jq -r '[.active[] | select(.file=="image:old:1")] | length' "$f")" -eq 3 ]
+  [ "$(jq -r '.active[] | select(.rule=="image.eol-os") | .severity' "$f")" = "high" ]
+  [ "$(jq -r '.active[] | select(.rule=="image-secret.aws-access-key-id") | .severity' "$f")" = "critical" ]
+  [[ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .title' "$f")" == *"zlib@1.2"*"(fixed in 1.3)"* ]] || false
+  [[ "$output" == *"baked into a layer - rotate them"* ]] || false
+}
+
+@test "image: a clean image passes and records an ok image pass" {
+  image_setup
+  kev_run "${IMG_ONLY[@]}" --image clean:1
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="image") | .status' "$OUT/findings.json")" = "ok" ]
+}
+
+@test "image: one image that cannot be scanned fails closed (exit 3), even if another scanned" {
+  image_setup
+  kev_run "${IMG_ONLY[@]}" --image clean:1 --image missing:9
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"missing:9"*"could not parse reference"* ]] || false
+}
+
+@test "image: --image without trivy is an error (exit 3); no --image is a recorded skip" {
+  PATH="$CLEAN_PATH" run "$VC" --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review \
+     --skip-secrets --skip-sast --skip-deps --skip-iac --image clean:1
+  [ "$status" -eq 3 ]
+  image_setup
+  kev_run "${IMG_ONLY[@]}"
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="image") | .detail' "$OUT/findings.json")" = "no --image" ]
+}
+
+@test "image: a KEV-listed CVE in an image is raised to critical, even with --skip-deps" {
+  kev_setup; image_setup                  # kev_setup writes kev.json; image_setup's trivy wins
+  kev_run --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --no-epss \
+          --skip-secrets --skip-sast --skip-deps --skip-iac \
+          --kev-file "$BATS_TEST_TMPDIR/kev.json" --image old:1
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .severity' "$OUT/findings.json")" = "critical" ]
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .kev.cve' "$OUT/findings.json")" = "CVE-2099-0001" ]
+}
+
+@test "image: --diff never scopes image findings out (they describe the artifact, not a file)" {
+  image_setup; diff_repo
+  kev_run "${IMG_ONLY[@]}" --image old:1 --diff main
+  [ "$status" -eq 1 ]
+  [ "$(jq -r '[.out_of_scope[] | select(.tool=="image")] | length' "$OUT/findings.json")" -eq 0 ]
+}
+
+# ── --licenses / --sbom ────────────────────────────────────────────────────
+
+lic_setup() {  # fake osv-scanner in allowlist mode: lists every package not on the list
+  printf 'a==1\n' > "$APP/requirements.txt"
+  cat > "$BIN/osv-scanner" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = "--version" ] && { echo "osv-scanner version: 0.0.0-fake"; exit 0; }
+out=""; allow=""
+for a in "$@"; do case "$a" in --licenses=*) allow="${a#--licenses=}";; esac; done
+while [ $# -gt 0 ]; do [ "$1" = "--output" ] && out="$2"; shift; done
+echo "$allow" > "$FAKE_OSV_ALLOW"
+[ "${FAKE_OSV_MODE:-}" = crash ] && { echo "boom" >&2; exit 127; }
+cat > "$out" <<JSON
+{"results":[{"source":{"path":"$FAKE_APP/requirements.txt"},"packages":[
+  {"package":{"name":"agpl-lib","version":"1.0"},"licenses":["AGPL-3.0-only"]},
+  {"package":{"name":"gpl-lib","version":"2.0"},"licenses":["GPL-3.0-or-later"]},
+  {"package":{"name":"dual","version":"3.0"},"licenses":["MIT OR GPL-3.0-only"]},
+  {"package":{"name":"custom","version":"4.0"},"licenses":["non-standard"]},
+  {"package":{"name":"fine","version":"5.0"},"licenses":["Apache-2.0"]}]}],
+ "license_summary":[{"name":"x","count":6}]}
+JSON
+exit 1
+SH
+  chmod +x "$BIN/osv-scanner"
+  export FAKE_APP="$APP" FAKE_OSV_ALLOW="$BATS_TEST_TMPDIR/allow"
+  LIC_ONLY=(--dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review
+            --skip-secrets --skip-sast --skip-deps --skip-iac)
+}
+
+@test "licenses: default policy - AGPL high, GPL and custom medium, permissive and MIT-OR-GPL pass" {
+  lic_setup
+  kev_run "${LIC_ONLY[@]}" --licenses
+  [ "$status" -eq 1 ]                                         # AGPL is high: gates
+  local f="$OUT/findings.json"
+  [ "$(jq -r '.active[] | select(.title|startswith("agpl-lib")) | .severity' "$f")" = "high" ]
+  [ "$(jq -r '.active[] | select(.title|startswith("gpl-lib")) | .severity' "$f")" = "medium" ]
+  [ "$(jq -r '.active[] | select(.title|startswith("custom")) | .severity' "$f")" = "medium" ]
+  [ "$(jq -r '[.active[] | select(.title|startswith("dual") or startswith("fine"))] | length' "$f")" -eq 0 ]
+  [ "$(jq -r '.active[] | select(.title|startswith("agpl-lib")) | .file' "$f")" = "requirements.txt" ]
+  [ "$(cat "$FAKE_OSV_ALLOW")" = "0BSD" ]                    # allowlist mode: every package listed
+}
+
+@test "licenses: --license-allow replaces the policy and is passed to osv-scanner" {
+  lic_setup
+  kev_run "${LIC_ONLY[@]}" --license-allow 'MIT, Apache-2.0'
+  [ "$(cat "$FAKE_OSV_ALLOW")" = "MIT,Apache-2.0" ]
+  [ "$(jq -r '[.active[] | select(.tool=="license" and .severity=="high")] | length' "$OUT/findings.json")" -eq 3 ]  # agpl, gpl, custom
+}
+
+@test "licenses: an osv-scanner failure, or no osv-scanner, is an error (exit 3)" {
+  lic_setup
+  FAKE_OSV_MODE=crash kev_run "${LIC_ONLY[@]}" --licenses
+  [ "$status" -eq 3 ]
+  rm "$BIN/osv-scanner"
+  kev_run "${LIC_ONLY[@]}" --licenses
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"--licenses needs osv-scanner"* ]] || false
+}
+
+@test "sbom: --sbom writes a CycloneDX file; a trivy failure is an error (exit 3)" {
+  cat > "$BIN/trivy" <<'SH'
+#!/usr/bin/env bash
+case " $* " in *" --version "*) echo "Version: 0.0.0-fake"; exit 0;; esac
+out=""; while [ $# -gt 0 ]; do [ "$1" = "--output" ] && out="$2"; shift; done
+[ -n "${FAKE_TRIVY_FAIL:-}" ] && exit 1
+printf '{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"a"}]}' > "$out"
+SH
+  chmod +x "$BIN/trivy"
+  kev_run "${REVIEW_ONLY[@]}" --review --review-cmd 'echo "[]"' --sbom
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .bomFormat "$OUT/sbom.cdx.json")" = "CycloneDX" ]
+  FAKE_TRIVY_FAIL=1 kev_run "${REVIEW_ONLY[@]}" --review --review-cmd 'echo "[]"' --sbom
+  [ "$status" -eq 3 ]
+}
+
+# ── CI/CD workflow audit (zizmor) ──────────────────────────────────────────
+
+zizmor_setup() {  # a workflow, and a fake zizmor that reports a script injection in it
+  mkdir -p "$APP/.github/workflows"
+  printf 'on: pull_request_target\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo "${{ github.event.pull_request.title }}"\n' \
+    > "$APP/.github/workflows/ci.yml"
+  cat > "$BIN/zizmor" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = "--version" ] && { echo "zizmor 0.0.0-fake"; exit 0; }
+printf '%s\n' "$@" > "$FAKE_ZZ_ARGS"; env | grep -q '^GH_TOKEN=' && echo "GH_TOKEN set" >> "$FAKE_ZZ_ARGS"
+[ "${FAKE_ZZ_MODE:-}" = crash ] && { echo "error: boom" >&2; exit 1; }
+[ "${FAKE_ZZ_MODE:-}" = clean ] && { echo '[]'; exit 0; }
+f=""; for a in "$@"; do case "$a" in *.yml) f="$a";; esac; done
+cat <<JSON
+[{"ident":"template-injection","desc":"code injection via template expansion","url":"https://docs.zizmor.sh/audits/#template-injection",
+  "determinations":{"confidence":"High","severity":"High","persona":"Regular"},
+  "locations":[{"symbolic":{"key":{"Local":{"given_path":"$f"}},"annotation":"may expand into attacker-controllable code","kind":"Primary"},
+                "concrete":{"location":{"start_point":{"row":5,"column":0}}}}]},
+ {"ident":"noise","desc":"informational only","url":"","determinations":{"confidence":"High","severity":"Informational"},
+  "locations":[{"symbolic":{"key":{"Local":{"given_path":"$f"}},"annotation":"","kind":"Primary"},"concrete":{"location":{"start_point":{"row":0}}}}]}]
+JSON
+exit 14
+SH
+  chmod +x "$BIN/zizmor"; export FAKE_ZZ_ARGS="$BATS_TEST_TMPDIR/zz.args"
+  CI_ONLY=(--dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review
+           --skip-secrets --skip-sast --skip-deps --skip-iac)
+}
+
+@test "ci: a workflow script injection is reported at its file and line, and gates" {
+  zizmor_setup
+  env -u GH_TOKEN -u GITHUB_TOKEN PATH="$BIN:$CLEAN_PATH" "$VC" "${CI_ONLY[@]}" > "$BATS_TEST_TMPDIR/o" 2>&1 || status=$?
+  [ "${status:-0}" -eq 1 ]
+  local f="$OUT/findings.json"
+  [ "$(jq -r '.active[] | select(.rule=="zizmor.template-injection") | "\(.severity) \(.file):\(.line)"' "$f")" = "high .github/workflows/ci.yml:6" ]
+  [ "$(jq -r '[.active[] | select(.rule=="zizmor.noise")] | length' "$f")" -eq 0 ]   # informational dropped
+  grep -qx -- '--offline' "$FAKE_ZZ_ARGS"                                            # no token: offline
+}
+
+@test "ci: with GH_TOKEN the online audits run and the token is passed" {
+  zizmor_setup
+  GH_TOKEN=t0ken kev_run "${CI_ONLY[@]}"
+  ! grep -qx -- '--offline' "$FAKE_ZZ_ARGS"
+  grep -qx 'GH_TOKEN set' "$FAKE_ZZ_ARGS"
+}
+
+@test "ci: a zizmor crash is an error (exit 3); a clean audit is ok" {
+  zizmor_setup
+  FAKE_ZZ_MODE=crash kev_run "${CI_ONLY[@]}"
+  [ "$status" -eq 3 ]
+  FAKE_ZZ_MODE=clean kev_run "${CI_ONLY[@]}"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="ci") | .status' "$OUT/findings.json")" = "ok" ]
+}
+
+@test "ci: missing zizmor warns by default (recorded NOT audited); --ci-audit makes it an error" {
+  zizmor_setup; rm "$BIN/zizmor"
+  kev_run "${CI_ONLY[@]}" --review --review-cmd 'echo "[]"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"CI/CD NOT audited"* ]] || false
+  kev_run "${CI_ONLY[@]}" --ci-audit
+  [ "$status" -eq 3 ]
+}
+
+# ── --dast: testssl.sh + ZAP baseline + nuclei ─────────────────────────────
+
+dast_setup() {  # fakes for all three tools, and a curl whose response passes pass 5
+  cat > "$BIN/curl" <<'SH'
+#!/usr/bin/env bash
+[ -f "${FAKE_TARGET_DEAD:-/nonexistent}" ] && exit 7     # the target died mid-scan
+hdr=""; while [ $# -gt 0 ]; do [ "$1" = "-D" ] && hdr="$2"; shift; done
+[ -n "$hdr" ] && printf 'HTTP/1.1 200 OK\r\nstrict-transport-security: max-age=31536000\r\ncontent-security-policy: default-src self\r\nx-content-type-options: nosniff\r\nreferrer-policy: no-referrer\r\npermissions-policy: camera=()\r\nx-frame-options: DENY\r\n\r\n' > "$hdr"
+exit 0
+SH
+  cat > "$BIN/testssl.sh" <<'SH'
+#!/usr/bin/env bash
+out=""; while [ $# -gt 0 ]; do [ "$1" = "--jsonfile" ] && out="$2"; shift; done
+cat > "$out" <<'JSON'
+[{"id":"cert_chain_of_trust","severity":"CRITICAL","finding":"failed (self signed)."},
+ {"id":"LUCKY13","severity":"LOW","finding":"potentially vulnerable","cve":"CVE-2013-0169"},
+ {"id":"cipher-tls1_2_x2f","severity":"LOW","finding":"one cipher row"},
+ {"id":"HSTS","severity":"LOW","finding":"not offered"},
+ {"id":"service","severity":"INFO","finding":"HTTP"}]
+JSON
+SH
+  cat > "$BIN/zap-baseline.py" <<'SH'
+#!/usr/bin/env bash
+[ -n "${FAKE_ZAP_RC:-}" ] && exit "$FAKE_ZAP_RC"
+cat > zap.json <<'JSON'
+{"site":[{"alerts":[
+  {"pluginid":"10202","alert":"Absence of Anti-CSRF Tokens","riskcode":"2","instances":[{},{}],"reference":"<p>https://owasp.org/csrf</p>"},
+  {"pluginid":"10021","alert":"X-Content-Type-Options Header Missing","riskcode":"1","instances":[{}],"reference":""},
+  {"pluginid":"10096","alert":"Timestamp Disclosure","riskcode":"0","instances":[{}],"reference":""}]}]}
+JSON
+exit 2
+SH
+  cat > "$BIN/nuclei" <<'SH'
+#!/usr/bin/env bash
+for a in "$@"; do [ "$a" = -ut ] && exit 0; [ "$a" = -tv ] && { echo "[INF] Public nuclei-templates version: v10.9.9"; exit 0; }; done
+out=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
+echo "[INF] Executing 6000 signed templates from projectdiscovery/nuclei-templates" >&2
+printf '%s\n' '{"template-id":"git-config","info":{"name":"Git Configuration - Detect","severity":"medium","reference":["https://x"]},"matched-at":"https://app.test/.git/config"}' > "$out"
+[ "${FAKE_NUCLEI_DROP:-}" = 1 ] && echo "[INF] Skipped app.test:443 from target list as found unresponsive permanently: i/o timeout" >&2
+[ "${FAKE_NUCLEI_KILL:-}" = 1 ] && touch "$FAKE_TARGET_DEAD"
+exit 0
+SH
+  chmod +x "$BIN/curl" "$BIN/testssl.sh" "$BIN/zap-baseline.py" "$BIN/nuclei"
+  DAST_ONLY=(--dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review
+             --skip-secrets --skip-sast --skip-deps --skip-iac --url https://app.test/ --dast)
+}
+
+@test "dast: all three tools run; findings are filed on the URL with their source; noise and pass-5 duplicates dropped" {
+  dast_setup
+  kev_run "${DAST_ONLY[@]}"
+  [ "$status" -eq 1 ]                                       # the critical TLS chain gates
+  local f="$OUT/findings.json"
+  [ "$(jq -r '.active[] | select(.rule=="testssl.cert_chain_of_trust") | "\(.severity) \(.file) \(.sources[0])"' "$f")" = "critical https://app.test/ testssl" ]
+  [[ "$(jq -r '.active[] | select(.rule=="testssl.LUCKY13") | .title' "$f")" == *"(CVE-2013-0169)"* ]] || false
+  [ "$(jq -r '.active[] | select(.rule=="zap.10202") | .severity' "$f")" = "medium" ]
+  [ "$(jq -r '.active[] | select(.rule=="nuclei.git-config") | .sources[0]' "$f")" = "nuclei" ]
+  # per-cipher rows, HSTS (pass 5), ZAP 10021 (pass 5) and informational alerts are not findings
+  [ "$(jq -r '[.active[] | select(.rule | IN("testssl.cipher-tls1_2_x2f","testssl.HSTS","zap.10021","zap.10096"))] | length' "$f")" -eq 0 ]
+  [ "$(jq -r '.coverage.tooling[] | select(.tool=="nuclei-templates") | .version' "$f")" = "v10.9.9" ]
+}
+
+@test "dast: nuclei dropping the target mid-scan fails closed (exit 3) and keeps what it found" {
+  dast_setup
+  FAKE_NUCLEI_DROP=1 kev_run "${DAST_ONLY[@]}"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"app.test:443 stopped responding mid-scan"* ]] || false
+  [ "$(jq -r '[.active[] | select(.rule=="nuclei.git-config")] | length' "$OUT/findings.json")" -eq 1 ]
+}
+
+@test "dast: ZAP unable to scan (exit 3) is an error" {
+  dast_setup
+  FAKE_ZAP_RC=3 kev_run "${DAST_ONLY[@]}"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"zap(exit 3"* ]] || false
+}
+
+@test "dast: no tools and no Docker is an error naming each tool; --dast without --url is an error" {
+  dast_setup; rm "$BIN/testssl.sh" "$BIN/zap-baseline.py" "$BIN/nuclei"
+  kev_run "${DAST_ONLY[@]}"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"testssl.sh"*"zap"*"nuclei"* ]] || false
+  kev_run --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --skip-secrets --skip-sast --skip-deps --skip-iac --dast
+  [ "$status" -eq 3 ]
+}
+
+@test "dast: with only Docker, the pinned images are used and localhost is mapped for the container" {
+  dast_setup; rm "$BIN/testssl.sh" "$BIN/zap-baseline.py" "$BIN/nuclei"
+  cat > "$BIN/docker" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = info ] && exit 0
+printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+exit 1
+SH
+  chmod +x "$BIN/docker"; export FAKE_DOCKER_LOG="$BATS_TEST_TMPDIR/docker.log"
+  kev_run "${DAST_ONLY[@]/https:\/\/app.test\//https://localhost:8443/}"
+  [ "$status" -eq 3 ]                                       # the fake images produce nothing
+  grep -q 'testssl.sh@sha256:' "$FAKE_DOCKER_LOG"
+  grep -q 'zaproxy@sha256:' "$FAKE_DOCKER_LOG"
+  grep -q 'nuclei@sha256:' "$FAKE_DOCKER_LOG"
+  if [ "$(uname -s)" = Darwin ]; then grep -q 'https://host.docker.internal:8443/' "$FAKE_DOCKER_LOG"
+  else grep -q -- '--network host' "$FAKE_DOCKER_LOG"; fi
+}
+
+@test "dast: a target that stops answering during the nuclei scan fails closed (exit 3)" {
+  dast_setup; export FAKE_TARGET_DEAD="$BATS_TEST_TMPDIR/dead"
+  FAKE_NUCLEI_KILL=1 kev_run "${DAST_ONLY[@]}"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"stopped responding during the scan"* ]] || false
+}
+
+@test "a scan root whose own name is a default exclude (build/, target/...) is still scanned (regression)" {
+  local R="$BATS_TEST_TMPDIR/target"; mkdir -p "$R/.github/workflows"
+  printf 'on: push\njobs: {}\n' > "$R/.github/workflows/ci.yml"
+  zizmor_setup                                   # provides the fake zizmor
+  FAKE_ZZ_MODE=clean kev_run --dir "$R" --out "$OUT" --no-baseline --no-pdf --no-review \
+     --skip-secrets --skip-sast --skip-deps --skip-iac --ci-audit
+  [ "$status" -eq 0 ]
+  [[ "$(jq -r '.coverage.passes[] | select(.pass=="ci") | .detail' "$OUT/findings.json")" == "0 issues in 1 file(s)"* ]] || false
+}
+
+@test "deps: osv-scanner gets the lockfiles explicitly - git-ignored ones included, excluded dirs not (regression)" {
+  kev_setup
+  mkdir -p "$APP/node_modules/x"; printf 'a==1\n' > "$APP/node_modules/x/requirements.txt"
+  cat > "$BIN/osv-scanner" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = "--version" ] && { echo "osv-scanner version: 0.0.0-fake"; exit 0; }
+printf '%s\n' "$@" > "$FAKE_OSV_ARGS"
+out=""; while [ $# -gt 0 ]; do [ "$1" = "--output" ] && out="$2"; shift; done
+echo '{"results":[]}' > "$out"
+SH
+  chmod +x "$BIN/osv-scanner"; export FAKE_OSV_ARGS="$BATS_TEST_TMPDIR/osv.args"
+  kev_run "${DEPS_ONLY[@]}" --no-kev --no-epss
+  grep -qx -- "-L" "$FAKE_OSV_ARGS"
+  grep -qx "$APP/requirements.txt" "$FAKE_OSV_ARGS"
+  ! grep -q "node_modules" "$FAKE_OSV_ARGS"
 }

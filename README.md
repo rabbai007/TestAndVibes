@@ -19,7 +19,10 @@ read-only dynamic** checks against a URL you control, and an optional
 | 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) **+ AI/LLM (OWASP-LLM), SSRF, resource-exhaustion** | semgrep + [`rules/`](rules/) |
 | 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) **+ CISA KEV: actively exploited CVEs raised to critical** | trivy + osv-scanner + npm audit + grype + [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
+| ⚙️ CI/CD | GitHub Actions: script injection, fork-code triggers, unpinned actions/tools, over-broad tokens, credential persistence | [zizmor](https://docs.zizmor.sh) |
+| 🖼️ Images *(opt-in)* | Built container images: OS + package CVEs (with KEV/EPSS), secrets in layers, end-of-life base OS | trivy image |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
+| 🕷️ Deep DAST *(opt-in, `--dast`)* | Every TLS protocol/cipher and known TLS attack; crawl + passive web-app rules; exposed files, panels and misconfigurations | testssl.sh, ZAP baseline, nuclei |
 | 🧭 Review *(default; needs a provider)* | Access control, tenant isolation, lifecycle, races, missing controls, prompt injection | an LLM |
 
 > **Not a replacement for a professional penetration test.** This is automated
@@ -74,6 +77,8 @@ targets). No config required.
 | `--dir PATH` | `.` | Directory to scan |
 | `--url URL` | — | Enable dynamic checks against this URL (implies `--dynamic`) |
 | `--all` | — | Static + dynamic |
+| `--dast` | — | Deeper, still non-destructive scan of `--url`: testssl.sh + ZAP baseline + nuclei (safe templates). Native tools, else pinned Docker images |
+| `--image REF` | — | Scan a built container image (repeatable): CVEs with KEV/EPSS, secrets in layers, end-of-life base OS |
 | `--fail-on LEVEL` | `high` | Exit 1 at/above `never\|low\|medium\|high\|critical\|any` |
 | `--no-fail-on-error` | — | Don't exit 3 on an incomplete pass (**unsafe** — see above) |
 | `--out DIR` | `vibecheck-report` | Where to write the report + raw tool output |
@@ -84,6 +89,14 @@ targets). No config required.
 | `--kev` | **on** | Match dependency CVEs against CISA KEV. On by default (warns if the feed is unreachable); passing `--kev` makes an unreachable feed an **ERROR** |
 | `--no-kev` | — | Skip the CISA KEV check |
 | `--kev-file PATH` | — | Use a local copy of the KEV JSON feed (air-gapped CI; implies `--kev`) |
+| `--epss` | **on** | Annotate dependency CVEs with their FIRST EPSS exploit probability. On by default (warns if the API is unreachable); with `--epss` that is an ERROR. Never changes severity |
+| `--no-epss` | — | Skip the EPSS lookup |
+| `--epss-file PATH` | — | Use a local copy of the daily EPSS CSV (`.csv`/`.csv.gz`; implies `--epss`) |
+| `--licenses` | — | Check dependency licences from the lockfiles (needs osv-scanner + network) |
+| `--license-allow LIST` | — | Allowed SPDX ids, comma-separated; anything else is high (implies `--licenses`) |
+| `--sbom` | — | Write a CycloneDX SBOM (`sbom.cdx.json`, plus one per `--image`) |
+| `--ci-audit` | **on** | Audit GitHub Actions workflows with zizmor. On when workflows exist (missing zizmor warns); with `--ci-audit` a missing zizmor is an ERROR |
+| `--no-ci-audit` | — | Skip the CI/CD workflow audit |
 | `--review` | **on** | Adversarial reasoning pass (report-only). Runs by default when a provider exists; **skips** if none. |
 | `--no-review` | — | Turn the review pass off |
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
@@ -180,7 +193,122 @@ without KEV it passes a `--fail-on high` gate.
 - **Scope, honestly:** KEV is weighted toward vendor products (VPNs, firewalls,
   Windows), so hits on application dependencies are rare — but when one fires,
   it is the finding to fix today. Matching is by CVE id: an advisory with no CVE
-  alias cannot match. EPSS (exploit *probability*) is not yet used.
+  alias cannot match.
+
+### Likely to be exploited: EPSS
+
+KEV says a CVE is exploited **now**; [FIRST EPSS](https://www.first.org/epss/)
+estimates the probability it will be exploited **in the next 30 days**. That is
+the answer to "which of these 40 mediums first?". Each dependency CVE (and its
+CVE aliases) gets an `epss` object (`score`, `percentile`, `date`) in
+`findings.json`, and the score in its title, e.g. `[EPSS 84.9%, percentile 99.7]`. The
+five highest are listed in the console.
+
+- **Annotation only.** EPSS is a likelihood, not an impact: it never changes a
+  severity, the gate, or a fingerprint. Use it to order the work.
+- **Unscored is unknown, not 0%.** A CVE FIRST has not scored (or an advisory with
+  no CVE id) gets no annotation.
+- **Same failure contract as KEV:** on by default, an unreachable API warns and is
+  recorded as *EPSS NOT checked*; `--epss` makes it an ERROR. Offline, download the
+  [daily CSV](https://epss.empiricalsecurity.com/epss_scores-current.csv.gz) and pass
+  `--epss-file` (`.csv` or `.csv.gz`); a copy older than 14 days warns.
+
+## Container images: what was built, not just the Dockerfile
+
+The IaC pass reads the Dockerfile; `--image` scans the image it produced:
+
+```bash
+docker build -t myapp:ci . && ./vibecheck.sh --image myapp:ci
+```
+
+- **OS and language-package CVEs** in every layer, base image included. They go
+  through CISA KEV and EPSS like dependency CVEs (base images are where most
+  KEV-listed CVEs, such as OpenSSL or glibc, actually sit), even with `--skip-deps`.
+- **Secrets baked into a layer.** Deleting a file in a later layer does not remove
+  it from the image: rotate it.
+- **End-of-life base OS** (high): it no longer gets security fixes, so "0 CVEs" on
+  it means nothing.
+
+Repeat `--image` for several images. Each image that cannot be scanned (bad
+reference, no registry access, no daemon) is an **ERROR (exit 3)**. Image
+findings have `file: "image:REF"` and always stay in scope under `--diff`.
+
+## CI/CD workflows
+
+The pipeline holds the deploy keys, and none of its common flaws are visible to SAST
+on the app: a `${{ github.event.pull_request.title }}` expanded into a `run:` script,
+a `pull_request_target` job that checks out fork code, a mutable action tag, a
+workflow-wide `write` token, `actions/checkout` leaving the token on disk. Pass 4b
+runs [zizmor](https://docs.zizmor.sh) on every `.github/workflows/*.yml` and
+`action.yml` (respecting excludes); findings land on the workflow file and line.
+
+- **On by default** when workflows exist. zizmor is new in 0.11, so a missing
+  zizmor **warns** and is recorded as *NOT audited* instead of failing an upgrade;
+  `--ci-audit` makes it an ERROR. `pipx install zizmor` (or `--install`).
+- **Offline unless a token is set.** With `GH_TOKEN` (or `GITHUB_TOKEN`) zizmor also
+  runs its online audits (known-vulnerable actions, impostor commits). In Actions,
+  pass `GH_TOKEN: ${{ github.token }}`; read-only is enough.
+- Informational findings are dropped; low-confidence ones say so in the title.
+
+This repository's own workflows were fixed for what it found (token persistence,
+workflow-wide `security-events: write`, an unpinned trivy).
+
+## Deep DAST: crawl and probe the running app
+
+```bash
+./vibecheck.sh --url https://staging.my-app.com --dast
+```
+
+Pass 5 checks one response. `--dast` does what a pentest starts with: crawl the
+app and probe what it exposes. It stays **non-destructive**; only scan targets you
+own or are authorised to test.
+
+| Tool | What it adds | Kept safe by |
+|---|---|---|
+| [testssl.sh](https://testssl.sh) | Every protocol and cipher, certificate chain/SAN/revocation, known TLS attacks (LUCKY13, ROBOT, Heartbleed...) | Handshakes only |
+| [ZAP](https://www.zaproxy.org/docs/docker/baseline-scan/) baseline | Spiders the app for a minute and applies ZAP's passive rules to every page: CSRF tokens, information leaks, insecure forms... | No active scan, so no attack payloads |
+| [nuclei](https://github.com/projectdiscovery/nuclei) | ~6,000 templates for exposed `.git`/`.env`/backups, admin panels, misconfigurations, known CVEs | `intrusive`, `dos`, `fuzz`, `brute-force` and `default-login` templates excluded; no out-of-band callbacks (`-ni`), so target data is not sent to a third-party service; rate-limited |
+
+Each tool runs natively if installed, otherwise from its **Docker image, pinned by
+digest** (override with `VIBECHECK_IMG_TESTSSL` / `_ZAP` / `_NUCLEI`). A
+`localhost` target is mapped for the container (`host.docker.internal` on macOS,
+`--network host` on Linux). The nuclei template release is recorded in the report.
+
+Fail-closed, as everywhere:
+
+- A tool that is missing (and no Docker), or cannot complete, is an **ERROR**.
+- **The target must still be answering when nuclei finishes.** nuclei's own
+  "skip unresponsive hosts" logic was turned off (`-nmhe`): a few malformed
+  templates trip it against a healthy server, after which nuclei silently skips
+  the remaining thousands and reports nothing. If the target did go down, the
+  findings so far are kept and the pass is an ERROR, never "0 findings".
+- Findings already reported by pass 5 (headers, cookies, HSTS, legacy TLS, expiry)
+  are not counted twice.
+
+A full run takes about 5 minutes. Active scanning (ZAP's attack mode) is
+deliberately not offered: it sends payloads that can change data.
+
+## Licences and the SBOM
+
+**`--licenses`** classifies every dependency's licence, read from the lockfiles
+(osv-scanner with deps.dev data, so no `npm install` is needed; it needs network).
+Default policy:
+
+| Severity | Licences | Why |
+|---|---|---|
+| high | AGPL, SSPL, BUSL, Elastic-2.0, Commons Clause, CC-BY-NC, PolyForm | Network copyleft or source-available: running it in a hosted service can oblige you to publish your source, or is not permitted |
+| medium | GPL, EUPL, OSL and other strong copyleft | Distributing your software can oblige you to release its source |
+| medium | `non-standard`, no licence | Custom terms, or all rights reserved: read them |
+| — | MIT, Apache, BSD, ISC, MPL, LGPL, EPL and other permissive / weak copyleft | |
+
+An `OR` expression passes if any side is acceptable (`MIT OR GPL-3.0` passes).
+**`--license-allow MIT,Apache-2.0,...`** replaces the policy with your own
+allowlist: anything else is high. Findings are filed against the lockfile, so
+`--diff` and the baseline work as usual. This is engineering triage, not legal
+advice.
+
+**`--sbom`** writes `sbom.cdx.json` (CycloneDX) for the source tree, plus
+`sbom-image-N.cdx.json` for each `--image`. A failed SBOM is an ERROR.
 
 ## The adversarial review pass
 
@@ -533,6 +661,29 @@ bats tests/vibecheck.bats                           # the fail-closed contract
 path where a pass cannot complete must exit 3, not 0. It needs only bash, jq and
 [bats](https://github.com/bats-core/bats-core): no scanners, network, or API key
 (the model provider and the HTTP API are faked). All three run in CI.
+
+### Detection benchmark: does it still find things?
+
+The tests prove VibeCheck fails closed; they cannot prove it **detects**. A scanner
+upgrade, a registry ruleset change or a parsing bug can silently stop a whole class
+of finding with every test green. The
+[benchmark workflow](.github/workflows/vibecheck-benchmark.yml) scans
+[OWASP Juice Shop](https://github.com/juice-shop/juice-shop) (pinned release, source
+and running container, `--dast`) and asserts each of its documented flaws is still
+found: SQL injection in login and search, SSRF, code injection, reflected XSS, an
+open redirect, a hard-coded JWT secret and RSA key, the deliberately outdated
+`jsonwebtoken` / `express-jwt` / `sanitize-html`, a workflow template injection, and
+ZAP / nuclei / header findings on the live app. It runs weekly and on any change to
+the scanner or its rules.
+
+```bash
+tests/benchmark/check.sh vibecheck-report/findings.json                # all checks
+tests/benchmark/check.sh vibecheck-report/findings.json "" sast,secrets   # source-only run
+```
+
+The expectations live in [`tests/benchmark/expected.json`](tests/benchmark/expected.json),
+one `jq` selector per known vulnerability. A pass that did not complete fails the
+benchmark too: its checks would mean nothing.
 
 ## Philosophy
 

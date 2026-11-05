@@ -1,0 +1,21 @@
+{
+  "target": "OWASP Juice Shop v20.3.0 (https://github.com/juice-shop/juice-shop), source + running container",
+  "note": "Each check is a known, documented Juice Shop vulnerability. A check that stops matching means VibeCheck (or a scanner it drives) stopped detecting it: a detection regression.",
+  "checks": [
+    {"id": "sqli-login",        "pass": "sast",    "why": "SQL injection: login query built from req.body.email",       "select": ".tool == \"semgrep\" and .file == \"routes/login.ts\" and (.rule | test(\"injection|sqli\"; \"i\"))"},
+    {"id": "sqli-search",       "pass": "sast",    "why": "SQL injection: product search query from req.query.q",       "select": ".tool == \"semgrep\" and .file == \"routes/search.ts\" and (.rule | test(\"injection|sqli\"; \"i\"))"},
+    {"id": "ssrf-image-url",    "pass": "sast",    "why": "SSRF: profile image fetched from a user-supplied URL",       "select": ".tool == \"semgrep\" and .file == \"routes/profileImageUrlUpload.ts\" and (.rule | test(\"ssrf\"; \"i\"))"},
+    {"id": "code-injection",    "pass": "sast",    "why": "Code injection: username evaluated in userProfile",          "select": ".tool == \"semgrep\" and .file == \"routes/userProfile.ts\""},
+    {"id": "xss-video",         "pass": "sast",    "why": "Reflected XSS: request data written into the video page",    "select": ".tool == \"semgrep\" and .file == \"routes/videoHandler.ts\""},
+    {"id": "open-redirect",     "pass": "sast",    "why": "Open redirect in routes/redirect.ts",                         "select": ".tool == \"semgrep\" and .file == \"routes/redirect.ts\" and (.rule | test(\"redirect\"; \"i\"))"},
+    {"id": "jwt-secret",        "pass": "sast",    "why": "Hard-coded JWT signing secret",                               "select": ".file == \"lib/insecurity.ts\" and (.rule | test(\"jwt\"; \"i\"))"},
+    {"id": "private-key",       "pass": "secrets", "why": "Hard-coded RSA private key in lib/insecurity.ts",             "select": "(.tool == \"trufflehog\" or .tool == \"gitleaks\") and .file == \"lib/insecurity.ts\""},
+    {"id": "dep-jsonwebtoken",  "pass": "deps",    "why": "jsonwebtoken 0.4.0 (signature-bypass CVEs)",                  "select": ".tool == \"deps\" and (.title | startswith(\"jsonwebtoken\"))"},
+    {"id": "dep-express-jwt",   "pass": "deps",    "why": "express-jwt 0.1.3 (authorisation-bypass CVE)",                "select": ".tool == \"deps\" and (.title | startswith(\"express-jwt\"))"},
+    {"id": "dep-sanitize-html", "pass": "deps",    "why": "sanitize-html 1.4.2 (XSS-bypass CVEs)",                       "select": ".tool == \"deps\" and (.title | startswith(\"sanitize-html\"))"},
+    {"id": "ci-injection",      "pass": "ci",      "why": "GitHub Actions template injection in update-challenges workflows", "select": ".tool == \"zizmor\" and (.file | test(\"update-challenges\")) and (.rule | test(\"template-injection\"))"},
+    {"id": "dast-zap",          "pass": "dast",    "why": "ZAP passive rules fire on the running app",                   "select": ".tool == \"dynamic\" and .sources[0] == \"zap\""},
+    {"id": "dast-nuclei",       "pass": "dast",    "why": "nuclei finds an exposure on the running app",                 "select": ".tool == \"dynamic\" and .sources[0] == \"nuclei\""},
+    {"id": "dast-headers",      "pass": "dynamic", "why": "Missing security headers on the running app (pass 5)",        "select": ".tool == \"dynamic\" and (.rule | startswith(\"missing-\"))"}
+  ]
+}

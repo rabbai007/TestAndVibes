@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.10.0"
+VERSION="0.11.0"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -29,6 +29,7 @@ TOOL_URL="https://github.com/rabbai007/TestAndVibes"
 # ── defaults (overridable by vibecheck.yml, then CLI flags) ──
 TARGET="."
 URL=""
+IMAGES=()               # --image REF (repeatable): container images to scan for CVEs, secrets, EOL OS
 DYNAMIC=0
 FAIL_ON="high"          # never | low | medium | high | critical | any
 FAIL_ON_ERROR=1         # 1 = a pass that cannot run exits 3 (fail closed)
@@ -54,6 +55,21 @@ KEV_EXPLICIT=0          # 1 = user passed --kev / --kev-file (then an unavailabl
 KEV_FILE="${VIBECHECK_KEV_FILE:-}"   # local copy of the KEV JSON feed (air-gapped CI)
 KEV_URL="${VIBECHECK_KEV_URL:-https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json}"
 KEV_STALE_DAYS=14       # warn when a --kev-file catalog is older than this
+DO_EPSS=1               # default ON: annotate dependency CVEs with their FIRST EPSS exploit probability
+EPSS_EXPLICIT=0         # 1 = user passed --epss / --epss-file (then an unavailable feed fails closed)
+EPSS_FILE="${VIBECHECK_EPSS_FILE:-}" # local copy of the daily EPSS CSV (.csv or .csv.gz; air-gapped CI)
+EPSS_URL="${VIBECHECK_EPSS_URL:-https://api.first.org/data/v1/epss}"
+EPSS_STALE_DAYS=14      # warn when an --epss-file is older than this
+DO_LICENSES=0           # opt-in: classify dependency licences (osv-scanner + deps.dev; needs network)
+LICENSE_ALLOW=""        # comma list of SPDX ids; when set, any other licence is a high finding
+DO_SBOM=0               # opt-in: write a CycloneDX SBOM of the source tree (and of each --image)
+DO_CI=1                 # default ON when CI workflows exist: audit them with zizmor
+CI_EXPLICIT=0           # 1 = user passed --ci-audit (then a missing zizmor fails closed)
+DO_DAST=0               # opt-in (--dast): testssl.sh + ZAP baseline + nuclei (safe templates) against --url
+# Pinned by digest: a moving tag would change what "clean" means without a commit.
+DAST_IMG_TESTSSL="${VIBECHECK_IMG_TESTSSL:-ghcr.io/testssl/testssl.sh@sha256:53766ec224a2d841b5516bc3923a8586379069ad01c65bbae9244aa24d72a18d}"  # 3.2.5
+DAST_IMG_ZAP="${VIBECHECK_IMG_ZAP:-ghcr.io/zaproxy/zaproxy@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af}"            # 2.17.0
+DAST_IMG_NUCLEI="${VIBECHECK_IMG_NUCLEI:-projectdiscovery/nuclei@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb}"     # v3.11.1
 MCP_TARGET=""           # opt-in MCP server probe: URL (http/https) or a command to spawn (stdio)
 MCP_TIMEOUT=20          # seconds for the MCP handshake/list calls
 MCP_HEADER=""           # optional single HTTP header for an authed MCP endpoint (e.g. "Authorization: Bearer …")
@@ -90,7 +106,17 @@ OPTIONS
   --dir PATH           Directory to scan (default: .)
   --url URL            Enable read-only dynamic checks against URL (implies --dynamic)
   --dynamic            Enable dynamic checks (requires --url)
+  --dast               Deeper dynamic scan of --url (implies --dynamic), still
+                       non-destructive: testssl.sh (ciphers, protocols, TLS
+                       attacks), ZAP baseline (spider + passive rules, no attack
+                       payloads), nuclei (exposures/misconfig; intrusive, DoS,
+                       fuzz and brute-force templates excluded; no OOB callbacks).
+                       Native tools if installed, else their pinned Docker images.
+                       Only scan targets you own or are authorised to test.
   --all                Static + dynamic
+  --image REF          Scan a built container image (repeatable): OS + language
+                       package CVEs, secrets baked into layers, end-of-life base
+                       OS. Local image or registry ref (e.g. myapp:latest).
   --fail-on LEVEL      Gate threshold: never|low|medium|high|critical|any (default: high)
   --no-fail-on-error   Do NOT exit 3 when a pass cannot complete (unsafe; opts out
                        of fail-closed behavior)
@@ -107,6 +133,22 @@ OPTIONS
                        A dependency CVE listed in KEV is raised to critical.
   --no-kev             Skip the CISA KEV check
   --kev-file PATH      Use a local copy of the KEV JSON feed (air-gapped CI; implies --kev)
+  --epss               Require FIRST EPSS exploit-probability scores for dependency CVEs
+                       (ON by default; with --epss an unreachable feed is an ERROR).
+                       Annotation only: EPSS is a likelihood, it never changes severity.
+  --no-epss            Skip the EPSS lookup
+  --epss-file PATH     Use a local copy of the daily EPSS CSV (.csv or .csv.gz; implies --epss)
+  --licenses           Check dependency licences from the lockfiles (osv-scanner,
+                       deps.dev data; needs network). Default policy: AGPL/SSPL/BUSL
+                       and other source-available licences high; GPL and
+                       unknown/no licence medium.
+  --license-allow LIST Comma list of allowed SPDX ids (implies --licenses); any
+                       other licence is high. Replaces the default policy.
+  --sbom               Write a CycloneDX SBOM (sbom.cdx.json; one per --image too)
+  --ci-audit           Require the CI/CD workflow audit (zizmor). ON by default when
+                       GitHub Actions workflows exist; with --ci-audit a missing
+                       zizmor is an ERROR. Online checks run when GH_TOKEN is set.
+  --no-ci-audit        Skip the CI/CD workflow audit
   --review             Adversarial review pass: an LLM reasons about trust
                        boundaries, lifecycle and logic — the classes no scanner
                        can reach. ON BY DEFAULT and REPORT-ONLY. Uses the first
@@ -278,6 +320,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dir) TARGET="${2:?--dir needs a path}"; shift 2;;
     --url) URL="${2:?--url needs a URL}"; DYNAMIC=1; shift 2;;
+    --dast) DO_DAST=1; DYNAMIC=1; shift;;
+    --image) IMAGES+=("${2:?--image needs an image reference}"); shift 2;;
     --dynamic) DYNAMIC=1; shift;;
     --all) DYNAMIC=1; shift;;
     --fail-on) FAIL_ON="${2:?--fail-on needs a level}"; shift 2;;
@@ -302,6 +346,14 @@ while [ $# -gt 0 ]; do
     --kev) DO_KEV=1; KEV_EXPLICIT=1; shift;;
     --no-kev) DO_KEV=0; shift;;
     --kev-file) KEV_FILE="${2:?--kev-file needs a path}"; DO_KEV=1; KEV_EXPLICIT=1; shift 2;;
+    --epss) DO_EPSS=1; EPSS_EXPLICIT=1; shift;;
+    --no-epss) DO_EPSS=0; shift;;
+    --epss-file) EPSS_FILE="${2:?--epss-file needs a path}"; DO_EPSS=1; EPSS_EXPLICIT=1; shift 2;;
+    --licenses) DO_LICENSES=1; shift;;
+    --license-allow) LICENSE_ALLOW="${2:?--license-allow needs a comma list of SPDX ids}"; DO_LICENSES=1; shift 2;;
+    --sbom) DO_SBOM=1; shift;;
+    --ci-audit) DO_CI=1; CI_EXPLICIT=1; shift;;
+    --no-ci-audit) DO_CI=0; shift;;
     --mcp) MCP_TARGET="${2:?--mcp needs a URL or command}"; shift 2;;
     --mcp-timeout) MCP_TIMEOUT="${2:?}"; shift 2;;
     --mcp-header) MCP_HEADER="${2:?}"; shift 2;;
@@ -342,9 +394,11 @@ if [ "$SELF_INSTALL" = 1 ]; then
     say "    gitleaks  : https://github.com/gitleaks/gitleaks#installing"
     say "    osv-scanner: https://google.github.io/osv-scanner/installation/"
   fi
-  if have pipx; then pipx install semgrep 2>/dev/null || true
-  elif have pip3; then pip3 install --user semgrep 2>/dev/null || true
-  else say "    semgrep   : pipx install semgrep  (https://semgrep.dev)"; fi
+  # semgrep and zizmor ship as Python wheels; pipx avoids compiling from source.
+  if have pipx; then pipx install semgrep 2>/dev/null || true; pipx install zizmor 2>/dev/null || true
+  elif have pip3; then pip3 install --user semgrep zizmor 2>/dev/null || true
+  else say "    semgrep   : pipx install semgrep  (https://semgrep.dev)"
+       say "    zizmor    : pipx install zizmor   (https://docs.zizmor.sh)"; fi
   ok "install pass complete (re-run without --install to scan)"
   exit 0
 fi
@@ -501,6 +555,7 @@ tool_ver gitleaks   secrets gitleaks version
 tool_ver semgrep    sast    semgrep --version
 tool_ver trivy      deps,iac trivy --version
 tool_ver osv-scanner deps   osv-scanner --version
+tool_ver zizmor      ci     zizmor --version
 tool_ver grype      deps    grype version
 tool_ver npm        deps    npm --version
 tool_ver jq         core    jq --version
@@ -530,7 +585,16 @@ PRUNE=(); for e in "${EXCLUDES[@]}"; do PRUNE+=(-name "$e" -prune -o); done
 # implicit -a, so `-type f -name a -o -name b -print` attaches -print to the last
 # term only: with several -o alternatives, every branch but the last silently
 # printed nothing. That quietly broke *.csproj, *.gradle and *.yaml detection.
-findx() { find "$TARGET" "${PRUNE[@]}" -type f \( "$@" \) -print 2>/dev/null; }
+# -mindepth 1: the exclude names must never match the scan ROOT. Without it,
+# scanning a directory that is itself called build/, dist/, target/, vendor/...
+# pruned the whole tree: no lockfile, IaC or workflow was ever found.
+findx() { find "$TARGET" -mindepth 1 "${PRUNE[@]}" -type f \( "$@" \) -print 2>/dev/null; }
+# trivy: same rule, different mechanism. Plain `--skip-dirs NAME` matched only a
+# top-level NAME/ (nested node_modules, build... were scanned) and, matched
+# against a path that includes the root, also pruned a root called NAME. Run
+# from inside the root on "." with "**/NAME": relative paths, every depth.
+trivy_t() { (cd "$TARGET" && trivy "$@" .); }
+trivy_skips() { local e; for e in "${EXCLUDES[@]}"; do printf '%s\0%s\0' --skip-dirs "**/$e"; done; }
 
 [ -n "$(findx -name '*.tf' | head -1)" ]        && { STACK="$STACK terraform"; ok "terraform (*.tf, recursive)"; }
 [ -n "$(findx -name '*.csproj' -o -name '*.fsproj' | head -1)" ] && { STACK="$STACK dotnet"; ok "dotnet (*.csproj)"; }
@@ -733,6 +797,17 @@ lockcheck ruby   "Gemfile.lock"
 lockcheck java   "pom.xml gradle.lockfile"
 lockcheck dotnet "packages.lock.json"
 
+# osv-scanner gets the lockfiles explicitly (-L), from findx. Left to walk the
+# directory itself it skips git-ignored files - and projects that do not commit
+# their lockfile ignore it, so a lockfile generated for the scan was never read
+# ("No package sources found") - and it ignores our excludes (node_modules...).
+OSV_LOCKS=()
+while IFS= read -r f; do OSV_LOCKS+=(-L "$f"); done < <(findx -name package-lock.json -o -name npm-shrinkwrap.json \
+  -o -name yarn.lock -o -name pnpm-lock.yaml -o -name bun.lock -o -name poetry.lock -o -name Pipfile.lock \
+  -o -name uv.lock -o -name 'requirements*.txt' -o -name go.mod -o -name Cargo.lock -o -name composer.lock \
+  -o -name Gemfile.lock -o -name pom.xml -o -name gradle.lockfile -o -name packages.lock.json | sort)
+osv_src() { if [ "${#OSV_LOCKS[@]}" -gt 0 ]; then printf '%s\0' "${OSV_LOCKS[@]}"; else printf '%s\0' "$TARGET"; fi; }
+
 DEP_ANY=0
 DEPS_ERRORED=0
 deps_error() { DEPS_ERRORED=1; pass_error deps "$1"; }
@@ -772,8 +847,8 @@ else
   if have trivy; then
     tv="$OUTDIR/trivy-deps.json"; rm -f "$tv"
     tv_args=(fs --scanners vuln --severity 'MEDIUM,HIGH,CRITICAL' --quiet --format json --output "$tv")
-    for e in "${EXCLUDES[@]}"; do tv_args+=(--skip-dirs "$e"); done
-    trivy "${tv_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.trivy.err"; tv_rc=$?
+    while IFS= read -r -d '' a; do tv_args+=("$a"); done < <(trivy_skips)
+    trivy_t "${tv_args[@]}" >/dev/null 2>"$OUTDIR/.trivy.err"; tv_rc=$?
     if [ ! -f "$tv" ] || ! jq -e . "$tv" >/dev/null 2>&1; then
       deps_error "trivy exited $tv_rc and produced no parseable JSON — $(head -c 200 "$OUTDIR/.trivy.err" 2>/dev/null | tr '\n' ' ')"
     elif ! jq -e 'has("Results")' "$tv" >/dev/null 2>&1; then
@@ -804,8 +879,9 @@ else
   # recognised as the same vulnerability instead of counted twice.
   if have osv-scanner; then
     ov="$OUTDIR/osv.json"; rm -f "$ov"
-    osv-scanner scan source --format json --output "$ov" "$TARGET" >/dev/null 2>"$OUTDIR/.osv.err" || true
-    [ -s "$ov" ] || osv-scanner --format json --output "$ov" -r "$TARGET" >/dev/null 2>>"$OUTDIR/.osv.err" || true
+    osv_args=(); while IFS= read -r -d '' a; do osv_args+=("$a"); done < <(osv_src)
+    osv-scanner scan source --format json --output "$ov" "${osv_args[@]}" >/dev/null 2>"$OUTDIR/.osv.err" || true
+    [ -s "$ov" ] || osv-scanner --format json --output "$ov" "${osv_args[@]}" >/dev/null 2>>"$OUTDIR/.osv.err" || true
     if [ -s "$ov" ] && jq -e . "$ov" >/dev/null 2>&1; then
       # alias -> canonical (prefer a CVE id as canonical)
       jq -r '.results[]?.packages[]?.groups[]? |
@@ -825,7 +901,9 @@ else
                         ("https://osv.dev/vulnerability/" + $v.id) ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$ov" 2>/dev/null)
       DEP_SRC_OK="$DEP_SRC_OK osv-scanner"
     else
-      deps_error "osv-scanner is installed but produced no parseable JSON — $(head -c 160 "$OUTDIR/.osv.err" 2>/dev/null | tr '\n' ' ')"
+      # Show the error, not the first line: osv-scanner leads with deprecation
+      # warnings and progress lines.
+      deps_error "osv-scanner is installed but produced no parseable JSON — $( { grep -viE 'deprecated|^Scann|walk|End status|^Filtered' "$OUTDIR/.osv.err" 2>/dev/null || true; } | tail -3 | tr '\n' ' ' | head -c 240)"
     fi
   fi
 
@@ -922,6 +1000,70 @@ else
   fi
 fi
 
+# ═══════════════════════════════════════════════════════════════════
+# 3a. container images (opt-in: --image REF)
+# ═══════════════════════════════════════════════════════════════════
+# The Dockerfile check (pass 4) reads the recipe; this reads what was built.
+# Base-image CVEs, secrets left in a layer, and an end-of-life OS that no longer
+# gets security fixes are invisible from the source tree. Image CVEs go through
+# KEV and EPSS like dependency CVEs. Findings carry file "image:REF": they
+# describe the artifact, not a changed file, so --diff never scopes them out.
+if [ "${#IMAGES[@]}" -eq 0 ]; then
+  set_status image skipped "no --image"
+else
+  head2 "3a. Container images"
+  if ! have trivy; then
+    pass_error image "--image given but trivy is not installed - images NOT scanned"
+  else
+    img_c=0; img_h=0; img_m=0; img_s=0; img_eol=0; img_fail=""; img_i=0
+    for img in "${IMAGES[@]}"; do
+      img_i=$((img_i+1)); ij="$OUTDIR/trivy-image-$img_i.json"; rm -f "$ij"
+      trivy image --scanners vuln,secret --severity 'MEDIUM,HIGH,CRITICAL' --quiet \
+        --format json --output "$ij" "$img" >/dev/null 2>"$OUTDIR/.trivy-image-$img_i.err"; ir=$?
+      if [ ! -f "$ij" ] || ! jq -e 'has("Results") or has("ArtifactName")' "$ij" >/dev/null 2>&1; then
+        img_fail="$img_fail $img(exit $ir: $(grep -m1 -E 'FATAL|ERROR' "$OUTDIR/.trivy-image-$img_i.err" | tr '\t' ' ' | tail -c 160))"
+        continue
+      fi
+      loc="image:$img"
+      if [ "$(jq -r '.Metadata.OS.EOSL // false' "$ij")" = "true" ]; then
+        img_eol=$((img_eol+1))
+        add_finding image high "image.eol-os" "$loc" 0 \
+          "Base OS $(jq -r '"\(.Metadata.OS.Family) \(.Metadata.OS.Name)"' "$ij") is end-of-life - it no longer receives security fixes; rebuild on a supported base" \
+          "https://endoflife.date/$(jq -r '.Metadata.OS.Family' "$ij")"
+      fi
+      while IFS=$'\x1f' read -r kind sev id pkg title url; do
+        [ -z "${id:-}" ] && continue
+        case "$sev" in CRITICAL) vs=critical; img_c=$((img_c+1));; HIGH) vs=high; img_h=$((img_h+1));; *) vs=medium; img_m=$((img_m+1));; esac
+        if [ "$kind" = secret ]; then
+          img_s=$((img_s+1)); add_finding image "$vs" "image-secret.$id" "$loc" 0 "Secret in image layer: $title" ""
+        else
+          add_finding image "$vs" "$id" "$loc" 0 "$pkg: $title" "$url"
+        fi
+      done < <(jq -r '.Results[]? | .Target as $t |
+                 ((.Vulnerabilities // [])[] | ["vuln", .Severity, .VulnerabilityID,
+                    "\(.PkgName)@\(.InstalledVersion)",
+                    (((.Title // .Description // "known vulnerability") | .[0:150])
+                      + (if .FixedVersion then " (fixed in \(.FixedVersion))" else " (no fix yet)" end)),
+                    (.PrimaryURL // "")]),
+                 ((.Secrets // [])[] | ["secret", .Severity, (.RuleID // "secret"), "",
+                    "\(.Title // .RuleID) in \($t)" + (if .StartLine then ":\(.StartLine)" else "" end), ""])
+                 | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$ij" 2>/dev/null | sort -u)
+      printf '%s\n' "$(jq -cn --arg v "$(jq -r '.Metadata.ImageID // "unknown id"' "$ij" | cut -c1-19)" --arg t "image $img" \
+        '{tool:$t, pass:"image", version:$v, installed:true}')" >> "$TOOLING"
+    done
+    img_total=$((img_c+img_h+img_m+img_eol))
+    [ "$img_c" -gt 0 ] && bad  "images: $img_c CRITICAL"
+    [ "$img_h" -gt 0 ] && warn "images: $img_h HIGH"
+    [ "$img_m" -gt 0 ] && say  "  ${C_D}images: $img_m MEDIUM${C_0}"
+    [ "$img_s" -gt 0 ] && bad  "images: $img_s secret(s) baked into a layer - rotate them; deleting in a later layer does not remove them"
+    [ "$img_eol" -gt 0 ] && bad "images: $img_eol end-of-life base OS"
+    if [ -n "$img_fail" ]; then
+      pass_error image "could not scan:$img_fail - image(s) NOT scanned"
+    elif [ "$img_total" -gt 0 ]; then set_status image findings "$img_total finding(s) in ${#IMAGES[@]} image(s)"
+    else ok "images: 0 MEDIUM+ findings in ${#IMAGES[@]} image(s)"; set_status image ok "0 findings in ${#IMAGES[@]} image(s)"; fi
+  fi
+fi
+
 # ── --diff: the changed-file list, computed once, early ──
 # The review pass (6) puts changed files first in its budget, and the Diff
 # scope step gates on them. It used to be written only in the Diff scope step,
@@ -955,13 +1097,23 @@ fi
 # exploited bug". See the baseline split below.
 KEV_N=0; KEV_VERSION=""
 KEV_JSON="$OUTDIR/cisa-kev.json"
+# Candidate CVE ids per finding: the id itself plus every alias we know.
+# OSV's alias table bridges GHSA<->CVE; grype's relatedVulnerabilities adds the
+# same bridge when osv-scanner is absent. Used by the KEV and EPSS lookups only -
+# the dedup merge above is untouched, so fingerprints are stable.
+KEV_ALIASES="$OUTDIR/.kev-aliases.jsonl"; : > "$KEV_ALIASES"
+[ -s "${ALIAS_MAP:-}" ] && awk -F'\037' '{print $1"\t"$2; print $2"\t"$1}' "$ALIAS_MAP" \
+  | jq -R -c 'split("\t") | {id:.[0], alias:.[1]}' >> "$KEV_ALIASES" 2>/dev/null
+[ -s "$OUTDIR/grype.json" ] && jq -c '.matches[]? | .vulnerability.id as $i
+    | (.relatedVulnerabilities // [])[] | {id:$i, alias:.id}, {id:.id, alias:$i}' \
+    "$OUTDIR/grype.json" >> "$KEV_ALIASES" 2>/dev/null
 kev_fail() {  # explicit -> fail closed; default-on -> loud warning, recorded
   if [ "$KEV_EXPLICIT" = 1 ]; then pass_error kev "$1 - CISA KEV NOT checked"
   else warn "$1 - CISA KEV NOT checked (pass --kev to make this an error, --kev-file for offline)"
        set_status kev skipped "$1"; fi
 }
-if [ "$DO_KEV" = 1 ] && [ "$DO_DEPS" = 1 ]; then
-  DEP_CVES="$(jq -s '[.[] | select(.tool=="deps")] | length' "$FINDINGS")"
+if [ "$DO_KEV" = 1 ] && { [ "$DO_DEPS" = 1 ] || [ "${#IMAGES[@]}" -gt 0 ]; }; then
+  DEP_CVES="$(jq -s '[.[] | select(.tool=="deps" or (.tool=="image" and (.rule|startswith("image")|not)))] | length' "$FINDINGS")"
   if [ "${DEP_CVES:-0}" -eq 0 ]; then
     set_status kev skipped "no dependency CVEs to check"
   else
@@ -991,24 +1143,13 @@ if [ "$DO_KEV" = 1 ] && [ "$DO_DEPS" = 1 ]; then
         printf '%s\n' "$(jq -cn --arg v "CISA KEV $KEV_VERSION ($kev_total entries)" \
           '{tool:"cisa-kev", pass:"deps", version:$v, installed:true}')" >> "$TOOLING"
 
-        # Candidate CVE ids per finding: the id itself plus every alias we know.
-        # OSV's alias table bridges GHSA<->CVE; grype's relatedVulnerabilities
-        # adds the same bridge when osv-scanner is absent. Used for this lookup
-        # only - the dedup merge above is untouched, so fingerprints are stable.
-        KEV_ALIASES="$OUTDIR/.kev-aliases.jsonl"; : > "$KEV_ALIASES"
-        [ -s "${ALIAS_MAP:-}" ] && awk -F'\037' '{print $1"\t"$2; print $2"\t"$1}' "$ALIAS_MAP" \
-          | jq -R -c 'split("\t") | {id:.[0], alias:.[1]}' >> "$KEV_ALIASES" 2>/dev/null
-        [ -s "$OUTDIR/grype.json" ] && jq -c '.matches[]? | .vulnerability.id as $i
-            | (.relatedVulnerabilities // [])[] | {id:$i, alias:.id}, {id:.id, alias:$i}' \
-            "$OUTDIR/grype.json" >> "$KEV_ALIASES" 2>/dev/null
-
         KEV_TMP="$OUTDIR/.findings.kev.jsonl"
         # -s: build the lookup tables once, not once per finding.
         jq -s -c --slurpfile kev "$KEV_JSON" --slurpfile al <(jq -s '.' "$KEV_ALIASES") '
           ($kev[0].vulnerabilities | map({key:.cveID, value:.}) | from_entries) as $k |
           ($al[0] | group_by(.id) | map({key:.[0].id, value:map(.alias)}) | from_entries) as $a |
           .[] |
-          if .tool != "deps" then . else
+          if (.tool != "deps" and .tool != "image") then . else
             ([.rule] + ($a[.rule] // []) | map(ascii_upcase) | unique
               | map(select(startswith("CVE-") and ($k[.] != null)))) as $hits |
             if ($hits|length) == 0 then . else
@@ -1038,6 +1179,206 @@ elif [ "$DO_KEV" = 0 ]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# 3c. FIRST EPSS - probability of exploitation in the next 30 days
+# ═══════════════════════════════════════════════════════════════════
+# KEV says "exploited now"; EPSS says "how likely soon". It answers "which of
+# these 40 mediums first?". It is a likelihood, not an impact, so it NEVER
+# changes severity or the gate: each CVE finding gets an `epss` object
+# (score, percentile, date) and the score in its title. A CVE that FIRST has not
+# scored gets no annotation - that is "unknown", never "0%".
+EPSS_N=0
+epss_fail() {  # explicit -> fail closed; default-on -> loud warning, recorded
+  if [ "$EPSS_EXPLICIT" = 1 ]; then pass_error epss "$1 - EPSS NOT checked"
+  else warn "$1 - EPSS NOT checked (pass --epss to make this an error, --epss-file for offline)"
+       set_status epss skipped "$1"; fi
+}
+if [ "$DO_EPSS" = 1 ] && { [ "$DO_DEPS" = 1 ] || [ "${#IMAGES[@]}" -gt 0 ]; }; then
+  EPSS_CVES="$OUTDIR/.epss-cves.txt"
+  jq -r --slurpfile al <(jq -s '.' "$KEV_ALIASES") '
+      ($al[0] | group_by(.id) | map({key:.[0].id, value:map(.alias)}) | from_entries) as $a
+      | select(.tool=="deps" or .tool=="image") | [.rule] + ($a[.rule] // []) | .[] | ascii_upcase
+      | select(test("^CVE-[0-9]{4}-[0-9]+$"))' "$FINDINGS" 2>/dev/null | sort -u > "$EPSS_CVES"
+  n_cves=$(wc -l < "$EPSS_CVES" | tr -d ' ')
+  if [ "$n_cves" -eq 0 ]; then
+    set_status epss skipped "no dependency CVE ids to score"
+  else
+    head2 "3c. EPSS exploit probability"
+    EPSS_TSV="$OUTDIR/.epss.tsv"; : > "$EPSS_TSV"; epss_src=""; epss_ok=1
+    if [ -n "$EPSS_FILE" ]; then
+      if [ ! -f "$EPSS_FILE" ]; then epss_ok=0; epss_fail "EPSS file not found: $EPSS_FILE"
+      else
+        case "$EPSS_FILE" in *.gz) epss_cat=(gzip -dc);; *) epss_cat=(cat);; esac
+        # Format: "#model_version:...,score_date:YYYY-MM-DD..." then "cve,epss,percentile".
+        epss_hdr="$("${epss_cat[@]}" "$EPSS_FILE" 2>/dev/null | head -2 | tr '\n' '|')"
+        case "$epss_hdr" in
+          *"cve,epss,percentile"*)
+            epss_date="$(printf '%s' "$epss_hdr" | sed -n 's/.*score_date:\([0-9-]\{10\}\).*/\1/p')"
+            "${epss_cat[@]}" "$EPSS_FILE" 2>/dev/null | awk -F, -v d="${epss_date:-unknown}" '
+                NR==FNR { want[$1]=1; next }
+                ($1 in want) { print $1 "\t" $2 "\t" $3 "\t" d }' "$EPSS_CVES" - > "$EPSS_TSV"
+            epss_src="file $(basename "$EPSS_FILE") (${epss_date:-undated})"
+            e_age="$( [ -n "$epss_date" ] && days_since "$epss_date" )"
+            [ -n "$e_age" ] && [ "$e_age" -gt "$EPSS_STALE_DAYS" ] && \
+              warn "EPSS file is $e_age days old - refresh the --epss-file copy";;
+          *) epss_ok=0; epss_fail "EPSS file is not the FIRST CSV (expected a cve,epss,percentile header)";;
+        esac
+      fi
+    elif have curl; then
+      # The API takes a comma list; 50 per request keeps the URL well under limits.
+      epss_n=0
+      while [ "$epss_ok" = 1 ] && IFS= read -r batch; do
+        epss_n=$((epss_n+1)); ej="$OUTDIR/.epss-$epss_n.json"
+        e_code="$(curl -sS --retry 2 --retry-delay 3 --max-time 60 -o "$ej" -w '%{http_code}' \
+                  "$EPSS_URL?cve=$batch" 2>/dev/null)" || e_code="${e_code:-000}"
+        case "$e_code" in
+          2??) if jq -e '(.status=="OK") and (.data|type=="array")' "$ej" >/dev/null 2>&1; then
+                 jq -r '.data[] | [.cve, .epss, .percentile, .date] | @tsv' "$ej" >> "$EPSS_TSV"
+               else epss_ok=0; epss_fail "EPSS API returned an unexpected document"; fi;;
+          *)   epss_ok=0; epss_fail "EPSS API request failed (HTTP $e_code from $EPSS_URL)";;
+        esac
+      done < <(awk '{ b = b (b == "" ? "" : ",") $0 } NR % 50 == 0 { print b; b = "" }
+                    END { if (b != "") print b }' "$EPSS_CVES")
+      epss_src="FIRST API $(cut -f4 "$EPSS_TSV" | sort -u | tail -1)"
+    else
+      epss_ok=0; epss_fail "curl not installed"
+    fi
+
+    if [ "$epss_ok" = 1 ]; then
+      printf '%s\n' "$(jq -cn --arg v "FIRST EPSS, $epss_src" '{tool:"first-epss", pass:"deps", version:$v, installed:true}')" >> "$TOOLING"
+      EPSS_TMP="$OUTDIR/.findings.epss.jsonl"
+      jq -s -c --slurpfile al <(jq -s '.' "$KEV_ALIASES") \
+               --slurpfile ep <(jq -R -s 'split("\n") | map(select(length>0) | split("\t")
+                                   | {key:.[0], value:{score:(.[1]|tonumber), percentile:(.[2]|tonumber), date:.[3]}})
+                                   | from_entries' "$EPSS_TSV") '
+        ($al[0] | group_by(.id) | map({key:.[0].id, value:map(.alias)}) | from_entries) as $a |
+        .[] |
+        if (.tool != "deps" and .tool != "image") then . else
+          ([.rule] + ($a[.rule] // []) | map(ascii_upcase) | unique
+            | map(select($ep[0][.] != null) | {cve: ., s: $ep[0][.]})
+            | sort_by(-.s.score) | .[0]) as $h |
+          if $h == null then . else
+            . + { epss: ($h.s + {cve: $h.cve}),
+                  title: (.title + " [EPSS \($h.s.score * 1000 | round / 10)%, percentile \($h.s.percentile * 1000 | floor / 10)]") }
+          end
+        end' "$FINDINGS" > "$EPSS_TMP" && mv "$EPSS_TMP" "$FINDINGS"
+      EPSS_N="$(jq -s '[.[] | select(.epss != null)] | length' "$FINDINGS")"
+      dep_n="$(jq -s '[.[] | select(.tool=="deps" or (.tool=="image" and (.rule|startswith("image")|not)))] | length' "$FINDINGS")"
+      ok "EPSS: $EPSS_N of $dep_n dependency finding(s) scored ($epss_src)"
+      jq -s -r '[.[] | select(.epss != null)] | sort_by(-.epss.score) | .[0:5][]
+                | "      · \(.epss.cve)  \(.epss.score * 1000 | round / 10)% (percentile \(.epss.percentile * 1000 | floor / 10))  \(.file)"' "$FINDINGS"
+      set_status epss ok "$EPSS_N of $dep_n dependency finding(s) scored ($epss_src)"
+    fi
+  fi
+elif [ "$DO_EPSS" = 0 ]; then
+  set_status epss skipped "disabled by --no-epss"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 3d. dependency licences (opt-in: --licenses / --license-allow)
+# ═══════════════════════════════════════════════════════════════════
+# Read from the lockfiles via osv-scanner, which looks licences up in deps.dev -
+# so no node_modules / site-packages install is needed (trivy only sees
+# licences of installed packages, and reports none for a bare lockfile).
+# A licence is a legal finding, not a vulnerability: tool "license", filed
+# against the lockfile so --diff and the baseline work as usual.
+LIC_JQ='
+          ($allow | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $al |
+          .results[] | .source.path as $src | .packages[]? |
+          "\(.package.name)@\(.package.version)" as $pkg |
+          ((.licenses // []) | if length == 0 then ["UNKNOWN"] else . end) as $ls |
+          # An expression ("MIT OR GPL-3.0") is classified by its most permissive
+          # alternative only for OR; AND keeps the strictest - so take each id
+          # as written and let OR-expressions pass if any side is acceptable.
+          $ls[] as $l |
+          ( if ($al | length) > 0 then
+              (if ($l | split(" OR ") | map(gsub("[()]"; "")) | any(. as $x | $al | index($x))) then empty
+               else ["high", "not in --license-allow"] end)
+            elif ($l | test("^non-standard$"; "i")) then
+              ["medium", "custom licence text, not a standard SPDX licence - read its terms (dual AGPL/commercial packages often show up this way)"]
+            elif ($l | test("^(UNKNOWN|NOASSERTION|NONE)$"; "i")) then
+              ["medium", "no licence declared: without one, all rights are reserved - confirm terms with the author"]
+            elif ($l | split(" OR ") | any(test("^\\(?(MIT|Apache|BSD|ISC|0BSD|Unlicense|CC0|Zlib|PSF|Python|BlueOak|MPL|LGPL|EPL|CDDL|Artistic|WTFPL|BSL-1\\.0|UPL|PostgreSQL|X11|curl|OFL|CC-BY-[0-9])"; "i"))) then empty
+            elif ($l | test("AGPL|SSPL|BUSL|Elastic-2|Commons-Clause|CC-BY-NC|Confluent|PolyForm"; "i")) then
+              ["high", "network copyleft or source-available: using it in a hosted service can oblige you to publish your source, or is not permitted"]
+            elif ($l | test("GPL|EUPL|OSL|CPAL|RPL|SSPL"; "i")) then
+              ["medium", "strong copyleft: distributing your software can oblige you to release its source under the same licence"]
+            else empty end ) as $v |
+          [ $v[0], ($l | gsub("[^A-Za-z0-9.+-]"; "_")), $src, $pkg, $v[1] ]
+          | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")'
+if [ "$DO_LICENSES" = 0 ]; then
+  set_status license skipped "not requested (--licenses)"
+else
+  head2 "3d. Dependency licences"
+  if ! have osv-scanner; then
+    pass_error license "--licenses needs osv-scanner (licence data from lockfiles) - licences NOT checked"
+  else
+    lj="$OUTDIR/osv-licenses.json"; rm -f "$lj"
+    # Allowlist mode is the only mode that lists EVERY package: summary mode
+    # (--licenses alone) lists only packages that also have a vulnerability, so
+    # most of the tree would go unchecked. With --license-allow the user's list
+    # is passed through; the default policy passes 0BSD - a licence it permits
+    # anyway, so omitting those packages changes nothing - and classifies the rest.
+    lic_list="$(printf '%s' "${LICENSE_ALLOW:-0BSD}" | tr -d ' ')"
+    osv_args=(); while IFS= read -r -d '' a; do osv_args+=("$a"); done < <(osv_src)
+    osv-scanner scan source --licenses="$lic_list" --format json --output "$lj" "${osv_args[@]}" >/dev/null 2>"$OUTDIR/.osv-lic.err"; lr=$?
+    # osv-scanner: 0 clean, 1 issues found, 128 no packages, anything else an error.
+    if [ "$lr" = 128 ]; then
+      skip "licence check" "no packages found in any lockfile"; set_status license skipped "no packages found"
+    elif { [ "$lr" != 0 ] && [ "$lr" != 1 ]; } || ! jq -e '.results | type == "array"' "$lj" >/dev/null 2>&1; then
+      pass_error license "osv-scanner --licenses exited $lr without a usable report - licences NOT checked: $(tail -c 200 "$OUTDIR/.osv-lic.err" | tr '\n' ' ')"
+    else
+      lic_h=0; lic_m=0; lic_n=0; lic_rows="$OUTDIR/.licenses.tsv"
+      # Classified into a file first and checked: a filter error must be an
+      # ERROR, never an empty list that reads as "no licence problems".
+      if ! jq -r --arg allow "$LICENSE_ALLOW" "$LIC_JQ" "$lj" > "$lic_rows" 2>"$OUTDIR/.licenses.err"; then
+        pass_error license "licence classification failed: $(head -c 160 "$OUTDIR/.licenses.err" | tr '\n' ' ') - licences NOT checked"
+      else
+      while IFS=$'\x1f' read -r sev spdx src pkg why; do
+        [ -z "${pkg:-}" ] && continue
+        case "$sev" in high) lic_h=$((lic_h+1));; *) lic_m=$((lic_m+1));; esac
+        add_finding license "$sev" "license.$spdx" "$(rel "$src")" 0 "$pkg is licensed $spdx - $why" \
+          "https://spdx.org/licenses/$spdx.html"
+      done < <(sort -u "$lic_rows")
+      lic_n="$(jq '[.license_summary[]?.count] | add // 0' "$lj")"
+      [ "$lic_h" -gt 0 ] && warn "licences: $lic_h HIGH (see report)"
+      [ "$lic_m" -gt 0 ] && say  "  ${C_D}licences: $lic_m MEDIUM${C_0}"
+      if [ $((lic_h+lic_m)) -gt 0 ]; then set_status license findings "$lic_h high, $lic_m medium of $lic_n package(s)$([ -n "$LICENSE_ALLOW" ] && echo ' (--license-allow)')"
+      else ok "licences: $lic_n package(s), none outside policy"; set_status license ok "$lic_n package(s), none outside policy"; fi
+      fi
+    fi
+  fi
+fi
+
+# ── SBOM (opt-in: --sbom) - an inventory artifact, not a check ──
+if [ "$DO_SBOM" = 1 ]; then
+  head2 "SBOM"
+  if ! have trivy; then
+    pass_error sbom "--sbom needs trivy - SBOM NOT written"
+  else
+    sb_fail=""
+    sb_args=(fs --format cyclonedx --quiet --output "$OUTDIR/sbom.cdx.json")
+    while IFS= read -r -d '' a; do sb_args+=("$a"); done < <(trivy_skips)
+    trivy_t "${sb_args[@]}" >/dev/null 2>"$OUTDIR/.sbom.err" \
+      && jq -e '.bomFormat == "CycloneDX"' "$OUTDIR/sbom.cdx.json" >/dev/null 2>&1 \
+      || sb_fail="$sb_fail source"
+    sb_i=0
+    for img in "${IMAGES[@]+"${IMAGES[@]}"}"; do
+      sb_i=$((sb_i+1))
+      trivy image --format cyclonedx --quiet --output "$OUTDIR/sbom-image-$sb_i.cdx.json" "$img" >/dev/null 2>>"$OUTDIR/.sbom.err" \
+        && jq -e '.bomFormat == "CycloneDX"' "$OUTDIR/sbom-image-$sb_i.cdx.json" >/dev/null 2>&1 \
+        || sb_fail="$sb_fail $img"
+    done
+    if [ -n "$sb_fail" ]; then
+      pass_error sbom "SBOM could not be written for:$sb_fail - $(tail -c 160 "$OUTDIR/.sbom.err" | tr '\n' ' ')"
+    else
+      sb_n="$(jq '.components | length' "$OUTDIR/sbom.cdx.json")"
+      ok "SBOM: sbom.cdx.json (CycloneDX $(jq -r .specVersion "$OUTDIR/sbom.cdx.json"), $sb_n components)$([ "$sb_i" -gt 0 ] && echo " + $sb_i image SBOM(s)")"
+      set_status sbom ok "CycloneDX, $sb_n components$([ "$sb_i" -gt 0 ] && echo " + $sb_i image(s)")"
+    fi
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # 4. IaC / container misconfig
 # ═══════════════════════════════════════════════════════════════════
 head2 "4. IaC & container misconfig"
@@ -1053,8 +1394,8 @@ elif ! have trivy; then
 else
   ti="$OUTDIR/trivy-iac.json"; rm -f "$ti"
   ti_args=(config --severity 'MEDIUM,HIGH,CRITICAL' --quiet --format json --output "$ti")
-  for e in "${EXCLUDES[@]}"; do ti_args+=(--skip-dirs "$e"); done
-  trivy "${ti_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.trivy-iac.err"; ti_rc=$?
+  while IFS= read -r -d '' a; do ti_args+=("$a"); done < <(trivy_skips)
+  trivy_t "${ti_args[@]}" >/dev/null 2>"$OUTDIR/.trivy-iac.err"; ti_rc=$?
   if [ ! -f "$ti" ] || ! jq -e . "$ti" >/dev/null 2>&1; then
     pass_error iac "trivy config exited $ti_rc and produced no parseable JSON"
   elif pe="$(trivy_parse_errors "$OUTDIR/.trivy-iac.err")" && [ -n "$pe" ]; then
@@ -1081,6 +1422,66 @@ else
     [ "$m" -gt 0 ] && say  "  ${C_D}trivy config: $m MEDIUM misconfig(s)${C_0}"
     [ $((c+h+m)) -eq 0 ] && ok "trivy config: 0 MEDIUM+ misconfigs"
     if [ $((c+h+m)) -gt 0 ]; then set_status iac findings "$c critical, $h high, $m medium"; else set_status iac ok "0 misconfigs"; fi
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 4b. CI/CD workflows (GitHub Actions) - zizmor
+# ═══════════════════════════════════════════════════════════════════
+# The pipeline holds the deploy keys. Script injection from a PR title, a
+# pull_request_target job that checks out fork code, a mutable action tag, an
+# over-broad GITHUB_TOKEN: none of these is visible to SAST on the app code.
+# zizmor is new in 0.11, so by default a missing zizmor warns and is recorded
+# as NOT checked rather than turning an upgrade red; --ci-audit makes it an ERROR.
+CI_FILES="$(find "$TARGET" -mindepth 1 "${PRUNE[@]}" \( -path '*/.github/workflows/*.yml' -o -path '*/.github/workflows/*.yaml' \
+             -o -name 'action.yml' -o -name 'action.yaml' \) -type f -print 2>/dev/null | head -200)"
+if [ "$DO_CI" = 0 ]; then
+  set_status ci skipped "disabled by --no-ci-audit"
+elif [ -z "$CI_FILES" ]; then
+  [ "$CI_EXPLICIT" = 1 ] && { head2 "4b. CI/CD workflows"; skip "CI audit" "no GitHub Actions workflows found"; }
+  set_status ci skipped "no GitHub Actions workflows"
+else
+  head2 "4b. CI/CD workflows (GitHub Actions)"
+  if ! have zizmor; then
+    if [ "$CI_EXPLICIT" = 1 ]; then pass_error ci "workflows present but zizmor is not installed - CI/CD NOT audited"
+    else warn "workflows present but zizmor is not installed - CI/CD NOT audited (pipx install zizmor; --ci-audit makes this an error)"
+         set_status ci skipped "zizmor not installed - NOT audited"; fi
+  else
+    zj="$OUTDIR/zizmor.json"; rm -f "$zj"
+    z_mode="offline"; z_args=(--format json --no-progress)
+    if [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]; then z_mode="online"; else z_args+=(--offline); fi
+    # Paths, not the directory: zizmor's own discovery ignores our excludes.
+    # shellcheck disable=SC2086  # CI_FILES is a newline list of paths
+    # zizmor reads GH_TOKEN; it rejects an empty one, so export only a real token.
+    (IFS=$'\n'; [ "$z_mode" = online ] && export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+     zizmor "${z_args[@]}" $CI_FILES) > "$zj" 2>"$OUTDIR/.zizmor.err"; zr=$?
+    # zizmor exits 0 (clean) or 10 + the highest severity found; anything else is a failure.
+    case "$zr" in 0|1[0-4]) z_rc_ok=1;; *) z_rc_ok=0;; esac
+    if [ "$z_rc_ok" = 0 ] || ! jq -e 'type == "array"' "$zj" >/dev/null 2>&1; then
+      pass_error ci "zizmor exited $zr without a usable report - CI/CD NOT audited: $(grep -m2 -iE 'error|fatal' "$OUTDIR/.zizmor.err" | tr '\n' ' ' | head -c 200)"
+    else
+      z_h=0; z_m=0; z_l=0
+      while IFS=$'\x1f' read -r sev id file line title url; do
+        [ -z "${id:-}" ] && continue
+        case "$sev" in high) z_h=$((z_h+1));; medium) z_m=$((z_m+1));; *) z_l=$((z_l+1));; esac
+        add_finding zizmor "$sev" "zizmor.$id" "$(rel "$file")" "$line" "$title" "$url"
+      done < <(jq -r '.[] | (.locations | map(select(.symbolic.kind == "Primary")) | .[0] // .locations[0]) as $p |
+                 ((.determinations.severity // "Low") | ascii_downcase) as $s |
+                 select($s != "informational" and $s != "unknown") |
+                 [ $s, .ident,
+                   ($p.symbolic.key.Local.given_path // $p.symbolic.key.Local.verbatim_path // ""),
+                   ((($p.concrete.location.start_point.row // -1) + 1) | tostring),
+                   ("\(.desc): \($p.symbolic.annotation // "")"
+                     + (if (.determinations.confidence // "") == "Low" then " (confidence: low)" else "" end)),
+                   (.url // "") ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$zj" 2>/dev/null | sort -u)
+      n_wf="$(printf '%s\n' "$CI_FILES" | grep -c .)"
+      [ "$z_h" -gt 0 ] && bad  "zizmor: $z_h HIGH workflow issue(s)"
+      [ "$z_m" -gt 0 ] && warn "zizmor: $z_m MEDIUM"
+      [ "$z_l" -gt 0 ] && say  "  ${C_D}zizmor: $z_l LOW${C_0}"
+      [ "$z_mode" = offline ] && say "  ${C_D}offline mode: set GH_TOKEN for the online audits (known-vulnerable actions, impostor commits)${C_0}"
+      if [ $((z_h+z_m+z_l)) -gt 0 ]; then set_status ci findings "$z_h high, $z_m medium, $z_l low in $n_wf file(s) ($z_mode)"
+      else ok "zizmor: 0 issues in $n_wf workflow file(s) ($z_mode)"; set_status ci ok "0 issues in $n_wf file(s) ($z_mode)"; fi
+    fi
   fi
 fi
 
@@ -1240,6 +1641,170 @@ elif [ "$DYNAMIC" = 1 ]; then
 else
   head2 "5. Dynamic checks"; skip "dynamic checks" "pass --url https://your.app to enable"
   set_status dynamic skipped "no --url"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 5b. deeper DAST (opt-in: --dast) - still non-destructive
+# ═══════════════════════════════════════════════════════════════════
+# Pass 5 checks one response. A pentest starts by crawling the app and probing
+# what it exposes. These three tools do that without attack payloads:
+#   testssl.sh  every protocol/cipher and the known TLS attacks (5 only probes 1.0/1.1)
+#   ZAP         baseline: spider + PASSIVE rules (no active scan - that sends attacks)
+#   nuclei      exposure/misconfig templates; intrusive, dos, fuzz, brute-force
+#               excluded; -ni so no out-of-band callbacks leave target data with a third party
+# Each runs natively if installed, else from its pinned Docker image. A tool
+# that cannot run is an ERROR: "deep scan requested" must not degrade quietly.
+# Findings use tool "dynamic" (file = the URL), so --diff always keeps them.
+dast_docker_ok() { have docker && docker info >/dev/null 2>&1; }
+if [ "$DO_DAST" = 0 ]; then
+  set_status dast skipped "not requested (--dast)"
+elif [ -z "$URL" ]; then
+  head2 "5b. Deep DAST"; pass_error dast "--dast needs --url - nothing was scanned"
+else
+  head2 "5b. Deep DAST (non-destructive) - $URL"
+  say "  ${C_D}only scan targets you own or are authorised to test${C_0}"
+  dast_fail=""; dast_n=0; dast_tools=""
+  # A container cannot reach the host's "localhost": map it.
+  D_URL="$URL"; D_NET=()
+  case "$URL" in
+    *://localhost*|*://127.0.0.1*|*://\[::1\]*)
+      if [ "$(uname -s)" = Darwin ]; then
+        D_URL="$(printf '%s' "$URL" | sed -E 's#://(localhost|127\.0\.0\.1|\[::1\])#://host.docker.internal#')"
+      else D_NET=(--network host); fi;;
+  esac
+  dast_add() {  # severity rule title help source
+    dast_n=$((dast_n+1)); add_finding dynamic "$1" "$2" "$URL" 0 "$3" "$4" "$5"
+  }
+
+  # ── testssl.sh ──
+  if printf '%s' "$URL" | grep -q '^https://'; then
+    tj="$OUTDIR/testssl.json"; rm -f "$tj"
+    t_args=(--quiet --warnings off --color 0 --severity LOW --ip one --connect-timeout 10 --openssl-timeout 10)
+    if have testssl.sh || have testssl; then
+      t_bin="$(command -v testssl.sh || command -v testssl)"
+      "$t_bin" "${t_args[@]}" --jsonfile "$tj" "$URL" >/dev/null 2>"$OUTDIR/.testssl.err"; t_rc=$?; dast_tools="$dast_tools testssl.sh"
+    elif dast_docker_ok; then
+      docker run --rm "${D_NET[@]+"${D_NET[@]}"}" -v "$OUTDIR:/out" "$DAST_IMG_TESTSSL" \
+        "${t_args[@]}" --jsonfile /out/testssl.json "$D_URL" >/dev/null 2>"$OUTDIR/.testssl.err"; t_rc=$?; dast_tools="$dast_tools testssl.sh(docker)"
+    else t_rc=127; echo "testssl.sh not installed and Docker unavailable" > "$OUTDIR/.testssl.err"; fi
+    # testssl's exit code is the number of findings-ish; only the JSON tells.
+    if ! jq -e 'type == "array" and length > 0' "$tj" >/dev/null 2>&1; then
+      dast_fail="$dast_fail testssl.sh(exit $t_rc: $(tail -c 140 "$OUTDIR/.testssl.err" | tr '\n' ' '))"
+    elif jq -e 'any(.[]; .id == "scanProblem" and .severity == "FATAL")' "$tj" >/dev/null 2>&1; then
+      dast_fail="$dast_fail testssl.sh($(jq -r 'map(select(.id=="scanProblem"))[0].finding' "$tj" | head -c 140))"
+    else
+      while IFS=$'\x1f' read -r sev id fnd cve; do
+        [ -z "${id:-}" ] && continue
+        dast_add "$sev" "testssl.$id" "TLS: $id - $fnd$([ -n "$cve" ] && echo " ($cve)")" "https://testssl.sh/" testssl
+      # Dropped: one row per offered cipher (cipherlist_* already summarises
+      # them), the letter grade (a summary of the rows), and what pass 5 already
+      # reports from its own probe (HSTS, headers, TLS 1.0/1.1, expiry).
+      done < <(jq -r '.[] | select(.severity | IN("LOW","MEDIUM","HIGH","CRITICAL"))
+                 | select(.id | test("^(cipher-tls|cipher_order-tls|overall_grade$|HSTS|security_headers$|TLS1$|TLS1_1$|cert_notAfter$|cert_expirationStatus$)") | not) |
+                 [ (.severity|ascii_downcase), .id, (.finding|.[0:160]), (.cve // "") ]
+                 | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$tj" 2>/dev/null | sort -u)
+    fi
+  else
+    say "  ${C_D}testssl.sh: target is not https - TLS covered by pass 5 (no-tls finding)${C_0}"
+  fi
+
+  # ── ZAP baseline (spider + passive scan) ──
+  zj="$OUTDIR/zap.json"; rm -f "$zj"
+  # -I: do not fail on warnings (we gate); -m 1: one minute of spidering.
+  if have zap-baseline.py; then
+    (cd "$OUTDIR" && zap-baseline.py -t "$URL" -J zap.json -I -m 1 >/dev/null 2>"$OUTDIR/.zap.err"); z_rc=$?; dast_tools="$dast_tools zap"
+  elif dast_docker_ok; then
+    # The image writes reports to /zap/wrk as the zap user (uid 1000).
+    chmod 777 "$OUTDIR" 2>/dev/null
+    docker run --rm "${D_NET[@]+"${D_NET[@]}"}" -v "$OUTDIR:/zap/wrk:rw" "$DAST_IMG_ZAP" \
+      zap-baseline.py -t "$D_URL" -J zap.json -I -m 1 >/dev/null 2>"$OUTDIR/.zap.err"; z_rc=$?; dast_tools="$dast_tools zap(docker)"
+  else z_rc=127; echo "ZAP (zap-baseline.py) not installed and Docker unavailable" > "$OUTDIR/.zap.err"; fi
+  # zap-baseline exits 0/1/2 for pass/fail/warn and 3 for "could not scan".
+  if [ "$z_rc" -ge 3 ] || ! jq -e '.site | type == "array"' "$zj" >/dev/null 2>&1; then
+    dast_fail="$dast_fail zap(exit $z_rc: $(grep -m1 -iE 'error|fail|unable' "$OUTDIR/.zap.err" | head -c 140))"
+  else
+    while IFS=$'\x1f' read -r sev pid name n ref; do
+      [ -z "${pid:-}" ] && continue
+      dast_add "$sev" "zap.$pid" "ZAP: $name ($n URL(s))" "$ref" zap
+    # Rules pass 5 already reports from the same response are skipped, so one
+    # missing header is one finding: 10010/10011/10054 cookie flags, 10020
+    # framing, 10021 nosniff, 10035 HSTS, 10036 server banner, 10038 CSP, 10063
+    # Permissions-Policy.
+    done < <(jq -r '.site[].alerts[]? | select((.riskcode|tonumber) >= 1)
+               | select(.pluginid | IN("10010","10011","10054","10020","10021","10035","10036","10038","10063") | not) |
+               [ ({"1":"low","2":"medium","3":"high"}[.riskcode]), .pluginid, .alert,
+                 ((.instances // []) | length), ((.reference // "") | split("<p>")[1] // "" | sub("</p>.*"; "")) ]
+               | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$zj" 2>/dev/null | sort -u)
+  fi
+
+  # ── nuclei (safe templates) ──
+  nj="$OUTDIR/nuclei.jsonl"; : > "$nj"
+  # Not -silent: its log is how we know the scan happened (see below). -c 10 /
+  # -rl 50 keep the load modest so a small server is not knocked over.
+  # -sr: system DNS as fallback, for internal/staging names.
+  # -nmhe: never drop the host. By default nuclei skips a host after 30 errors,
+  # and a handful of malformed templates (encoded traversal paths) produce
+  # those errors against a perfectly healthy server - the other ~6,000
+  # templates are then skipped and the scan "finds nothing". Whether the target
+  # really died is checked by us after the scan instead.
+  n_args=(-nc -jsonl -ni -duc -sr -nmhe -c 10 -rl 50 -timeout 10 -severity "low,medium,high,critical"
+          -etags "intrusive,dos,fuzz,fuzzing,brute-force,bruteforce,default-login")
+  # Templates are fetched explicitly (-ut) and then the scan runs with update
+  # checks off (-duc). The template release is recorded in the report: it is the
+  # ruleset, and it changes what "clean" means.
+  n_tv=""
+  if have nuclei; then
+    nuclei -ut -silent >/dev/null 2>"$OUTDIR/.nuclei.err"
+    nuclei "${n_args[@]}" -u "$URL" -o "$nj" >/dev/null 2>>"$OUTDIR/.nuclei.err"; n_rc=$?; dast_tools="$dast_tools nuclei"
+    n_tv="$(nuclei -tv 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | tail -1)"
+  elif dast_docker_ok; then
+    # Templates are cached in a named volume, not re-downloaded per run.
+    # Templates AND nuclei's config (which records the template release) are
+    # kept in named volumes, so updates are incremental and -tv can answer.
+    n_docker=(docker run --rm "${D_NET[@]+"${D_NET[@]}"}" -v "$OUTDIR:/out" -v vibecheck-nuclei-templates:/root/nuclei-templates
+              -v vibecheck-nuclei-config:/root/.config/nuclei "$DAST_IMG_NUCLEI")
+    "${n_docker[@]}" -ut -silent >/dev/null 2>"$OUTDIR/.nuclei.err"
+    "${n_docker[@]}" "${n_args[@]}" -u "$D_URL" -o /out/nuclei.jsonl >/dev/null 2>>"$OUTDIR/.nuclei.err"; n_rc=$?; dast_tools="$dast_tools nuclei(docker)"
+    n_tv="$("${n_docker[@]}" -tv 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | tail -1)"
+  else n_rc=127; echo "nuclei not installed and Docker unavailable" > "$OUTDIR/.nuclei.err"; fi
+  [ -n "$n_tv" ] && printf '%s\n' "$(jq -cn --arg v "$n_tv" '{tool:"nuclei-templates", pass:"dast", version:$v, installed:true}')" >> "$TOOLING"
+  # nuclei exits 0 even when it scanned nothing: when the target stops
+  # answering it drops the host ("unresponsive permanently") and finishes
+  # clean. Both that and "no templates ran" are failures, not zero findings.
+  n_tpl="$(grep -oE 'Executing [0-9]+ (signed )?templates' "$OUTDIR/.nuclei.err" | grep -oE '[0-9]+' | head -1)"
+  # Only the TARGET being dropped counts: some templates probe other ports
+  # (e.g. :4040), and nuclei logs those closed ports the same way.
+  n_hp="${D_URL#*://}"; n_hp="${n_hp%%/*}"; n_hp="${n_hp##*@}"
+  case "$n_hp" in *:[0-9]*) ;; *) case "$D_URL" in https://*) n_hp="$n_hp:443";; *) n_hp="$n_hp:80";; esac;; esac
+  if [ "$n_rc" != 0 ] || { [ -s "$nj" ] && ! jq -e . "$nj" >/dev/null 2>&1; }; then
+    dast_fail="$dast_fail nuclei(exit $n_rc: $(grep -m1 -iE 'FTL|ERR|error' "$OUTDIR/.nuclei.err" | head -c 140))"
+  else
+    # What nuclei did find before a drop is still real: report it, AND fail.
+    if ! curl -s -o /dev/null --max-time 15 -k "$URL" 2>/dev/null; then
+      dast_fail="$dast_fail nuclei(the target stopped responding during the scan - results are partial)"
+    elif grep -qF "Skipped $n_hp from target list" "$OUTDIR/.nuclei.err"; then
+      dast_fail="$dast_fail nuclei(the target $n_hp stopped responding mid-scan and nuclei dropped it - results are partial)"
+    elif [ "${n_tpl:-0}" -eq 0 ]; then
+      dast_fail="$dast_fail nuclei(no templates were executed)"
+    fi
+    while IFS=$'\x1f' read -r sev tid name at cve ref; do
+      [ -z "${tid:-}" ] && continue
+      dast_add "$sev" "nuclei.$tid" "nuclei: $name at $at$([ -n "$cve" ] && echo " ($cve)")" "$ref" nuclei
+    # matched-at names the address the container used; report the user's URL.
+    done < <(jq -r --arg from "$D_URL" --arg to "$URL" '
+                    ($from | sub("^(?<b>[a-z]+://[^/]+).*"; "\(.b)")) as $f |
+                    ($to   | sub("^(?<b>[a-z]+://[^/]+).*"; "\(.b)")) as $t |
+                    [ .info.severity, ."template-id", .info.name, ((."matched-at" // .host) | if startswith($f) then $t + .[($f|length):] else . end),
+                      ((.info.classification."cve-id" // []) | if type=="array" then join(",") else . end),
+                      ((.info.reference // []) | if type=="array" then (.[0] // "") else . end) ]
+                    | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$nj" 2>/dev/null | sort -u)
+  fi
+
+  say "  ${C_D}tools:$dast_tools${C_0}"
+  if [ -n "$dast_fail" ]; then
+    pass_error dast "could not complete:$dast_fail - the deep scan is NOT complete"
+  elif [ "$dast_n" -gt 0 ]; then warn "deep DAST: $dast_n finding(s)"; set_status dast findings "$dast_n finding(s) from$dast_tools"
+  else ok "deep DAST: 0 findings from$dast_tools"; set_status dast ok "0 findings from$dast_tools"; fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1936,9 +2501,9 @@ if [ -n "$DIFF_REF" ]; then
     # file in the diff (their .file is a URL or command), so they always stay in
     # scope - otherwise --diff would silently never gate on them.
     jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
-      'select(.tool=="dynamic" or .tool=="mcp" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
+      'select(.tool=="dynamic" or .tool=="mcp" or .tool=="image" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
     jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
-      'select(.tool!="dynamic" and .tool!="mcp" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
+      'select(.tool!="dynamic" and .tool!="mcp" and .tool!="image" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
     DIFF_N=$(jq -s 'length' "$OUTSCOPE")
     mv "$OUTDIR/.inscope.jsonl" "$ACTIVE"
     [ "$DIFF_N" -gt 0 ] && warn "$DIFF_N pre-existing finding(s) outside the diff — reported, not gated" \
@@ -1953,7 +2518,7 @@ fi
 # A3: "no pass examined anything" is not a clean result. Disabling every scanner
 # — by flag or by config — used to yield 0 findings and exit 0, which is
 # indistinguishable from a repo with nothing wrong. An empty scan is unknown.
-EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","iac","dynamic","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
+EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","license","iac","ci","dynamic","dast","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
 if [ "${EXECUTED:-0}" -eq 0 ]; then
   pass_error coverage "no scan pass examined anything (all were skipped, disabled, or failed) — this result is unknown, not clean"
 fi

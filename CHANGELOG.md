@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.11.0] — 2026-11-05
+
+Closes most of the gap between an automated scan and the automated half of a
+pentest: exploit likelihood (EPSS), built container images, licences and an SBOM,
+the CI/CD pipeline, and a deeper but still non-destructive scan of the running app.
+A new detection benchmark proves VibeCheck still **finds** known flaws, not just
+that it fails closed; its first runs found four bugs that made scans silently
+incomplete, all fixed below.
+
 ### Added
 
 - **VibeCheck inside the coding assistant.** `AGENTS.md`'s *When you finish a
@@ -21,7 +32,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Both forbid making a scan pass by hiding findings (baseline or ignore-file
   edits, inline suppressions, skipped passes) without the user's approval.
 - Tests: the skill's frontmatter is checked, and every flag the skill or
-  `AGENTS.md` tells an assistant to use must exist in `--help` (58 tests).
+  `AGENTS.md` tells an assistant to use must exist in `--help`. 86 bats tests in total at release.
+- **EPSS exploit probability** (step 3c, on by default). Dependency CVEs, and the
+  CVE aliases of GHSA ids, are annotated with FIRST's EPSS score and percentile
+  (`epss` in `findings.json`, the score in the title, top five in the console).
+  Annotation only: severity, the gate and fingerprints are unchanged; an unscored
+  CVE is left unannotated rather than shown as 0%. Same failure contract as KEV:
+  unreachable API warns, `--epss` makes it an ERROR, `--epss-file` takes the daily
+  CSV (`.csv`/`.csv.gz`) for air-gapped runners. `--no-epss` turns it off.
+- **`--image REF`: container image scanning** (pass 3a, opt-in, repeatable). Reads the
+  built image, not just the Dockerfile: OS and language-package CVEs (through KEV and
+  EPSS, even with `--skip-deps`), secrets baked into layers, and an end-of-life base OS
+  (high). An image that cannot be scanned is an ERROR (exit 3). Findings are filed as
+  `image:REF` and always stay in scope under `--diff`.
+- **`--licenses` / `--license-allow`: dependency licence check** (step 3d, opt-in).
+  Licences come from the lockfiles via osv-scanner and deps.dev, so no install is
+  needed. Default policy: network-copyleft and source-available licences (AGPL,
+  SSPL, BUSL...) high; strong copyleft (GPL...) and custom or missing licences
+  medium; `OR` expressions pass if any side is acceptable. `--license-allow`
+  replaces the policy with an allowlist. Runs osv-scanner in allowlist mode, the
+  only mode that lists every package (summary mode lists only vulnerable ones).
+- **`--sbom`**: CycloneDX SBOM of the source tree and of each `--image`.
+- **CI/CD workflow audit** (pass 4b, on when GitHub Actions workflows exist):
+  [zizmor](https://docs.zizmor.sh) finds script injection, fork-code triggers,
+  unpinned actions and tools, over-broad tokens and credential persistence, filed on
+  the workflow file and line. A missing zizmor warns (recorded *NOT audited*);
+  `--ci-audit` makes it an ERROR, `--no-ci-audit` skips it. Online audits run when
+  `GH_TOKEN` is set. `--install` adds zizmor.
+- This repository's workflows: `persist-credentials: false` on every checkout,
+  `security-events: write` moved from the workflow to the one job that uploads
+  SARIF, trivy pinned in `setup-trivy`, and zizmor installed so the self-scan
+  audits its own pipeline.
+- **`--dast`: deeper, still non-destructive dynamic scan** (pass 5b). testssl.sh
+  (all protocols/ciphers, certificate chain, known TLS attacks), ZAP baseline (one
+  minute of spidering, passive rules only) and nuclei (exposure and misconfiguration
+  templates; intrusive, DoS, fuzz, brute-force and default-login excluded; no
+  out-of-band callbacks; rate-limited; system DNS so internal names resolve). Native
+  tools if installed, else Docker images pinned by digest; `localhost` is mapped
+  for the container. Fail-closed: a missing or failed tool is an ERROR, and so is a
+  target that stops answering during the scan (partial findings are kept). nuclei's
+  host-dropping is disabled because malformed templates trigger it against healthy
+  servers and the rest of the scan is then silently skipped. Pass-5 duplicates are
+  not counted twice. The nuclei template release is recorded.
+- **Detection benchmark** (`.github/workflows/vibecheck-benchmark.yml`, weekly and on
+  scanner/rule changes). Scans OWASP Juice Shop (pinned release: source + running
+  container with `--dast`) and asserts 15 documented vulnerabilities are still
+  detected (`tests/benchmark/expected.json`, checked by `tests/benchmark/check.sh`).
+  Catches the regression the fail-closed tests cannot: a scanner or ruleset change
+  that silently stops finding a class of bug. A pass that does not complete fails it.
+
+### Fixed
+
+- **Scanning a directory whose own name is a default exclude found nothing.**
+  `find` applied the exclude list (`node_modules dist build vendor .git coverage
+  .venv target`) to the scan root itself, so `--dir build/` or a checkout in
+  `target/` pruned the whole tree: no lockfile, IaC file or workflow was found, and
+  IaC/CI reported "no files" instead of scanning. Found by the new detection
+  benchmark on its first run.
+- **trivy excludes covered only the top level, and could prune the root.**
+  `--skip-dirs node_modules` skipped `./node_modules` but scanned
+  `packages/*/node_modules`, and a scan root named like an exclude returned no
+  results. trivy now runs from inside the root with `**/NAME` patterns.
+- **osv-scanner skipped git-ignored lockfiles and ignored excludes.** Left to walk
+  the tree, it skips files in `.gitignore`, so a project that does not commit its
+  lockfile (and ignores it) was never read by osv, even when a lockfile was
+  generated for the scan; and it walked `node_modules`. It is now given the
+  lockfiles explicitly (`-L`), found with the same exclude-aware search as
+  everything else, for both the dependency and licence checks.
+- osv-scanner errors now show the error line, not its leading deprecation warning.
 
 ## [0.10.0] — 2026-11-04
 
@@ -758,7 +836,8 @@ consolidated report plus a CI-friendly exit code.
 - Complementary to [benavlabs/vibe-check](https://github.com/benavlabs/vibe-check)
   (a checklist + AI-rules approach); VibeCheck adds the executable automation layer.
 
-[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.0...v0.10.0
 [0.2.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rabbai007/TestAndVibes/releases/tag/v0.1.0
