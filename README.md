@@ -19,6 +19,7 @@ read-only dynamic** checks against a URL you control, and an optional
 | 🧠 SAST | Insecure code patterns (injection, authz, crypto, XSS…) **+ AI/LLM (OWASP-LLM), SSRF, resource-exhaustion** | semgrep + [`rules/`](rules/) |
 | 📦 Dependencies | Known CVEs in your lockfiles (all sources run, results merged) **+ CISA KEV: actively exploited CVEs raised to critical** | trivy + osv-scanner + npm audit + grype + [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) |
 | 🐳 IaC / Containers | Dockerfile / Terraform / K8s misconfig | trivy config |
+| 🖼️ Images *(opt-in)* | Built container images: OS + package CVEs (with KEV/EPSS), secrets in layers, end-of-life base OS | trivy image |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
 | 🧭 Review *(default; needs a provider)* | Access control, tenant isolation, lifecycle, races, missing controls, prompt injection | an LLM |
 
@@ -74,6 +75,7 @@ targets). No config required.
 | `--dir PATH` | `.` | Directory to scan |
 | `--url URL` | — | Enable dynamic checks against this URL (implies `--dynamic`) |
 | `--all` | — | Static + dynamic |
+| `--image REF` | — | Scan a built container image (repeatable): CVEs with KEV/EPSS, secrets in layers, end-of-life base OS |
 | `--fail-on LEVEL` | `high` | Exit 1 at/above `never\|low\|medium\|high\|critical\|any` |
 | `--no-fail-on-error` | — | Don't exit 3 on an incomplete pass (**unsafe** — see above) |
 | `--out DIR` | `vibecheck-report` | Where to write the report + raw tool output |
@@ -191,7 +193,7 @@ KEV says a CVE is exploited **now**; [FIRST EPSS](https://www.first.org/epss/)
 estimates the probability it will be exploited **in the next 30 days**. That is
 the answer to "which of these 40 mediums first?". Each dependency CVE (and its
 CVE aliases) gets an `epss` object (`score`, `percentile`, `date`) in
-`findings.json`, and the score in its title, e.g. `[EPSS 84.9%, 99.7th pct]`. The
+`findings.json`, and the score in its title, e.g. `[EPSS 84.9%, percentile 99.7]`. The
 five highest are listed in the console.
 
 - **Annotation only.** EPSS is a likelihood, not an impact: it never changes a
@@ -202,6 +204,26 @@ five highest are listed in the console.
   recorded as *EPSS NOT checked*; `--epss` makes it an ERROR. Offline, download the
   [daily CSV](https://epss.empiricalsecurity.com/epss_scores-current.csv.gz) and pass
   `--epss-file` (`.csv` or `.csv.gz`); a copy older than 14 days warns.
+
+## Container images: what was built, not just the Dockerfile
+
+The IaC pass reads the Dockerfile; `--image` scans the image it produced:
+
+```bash
+docker build -t myapp:ci . && ./vibecheck.sh --image myapp:ci
+```
+
+- **OS and language-package CVEs** in every layer, base image included. They go
+  through CISA KEV and EPSS like dependency CVEs (base images are where most
+  KEV-listed CVEs, such as OpenSSL or glibc, actually sit), even with `--skip-deps`.
+- **Secrets baked into a layer.** Deleting a file in a later layer does not remove
+  it from the image: rotate it.
+- **End-of-life base OS** (high): it no longer gets security fixes, so "0 CVEs" on
+  it means nothing.
+
+Repeat `--image` for several images. Each image that cannot be scanned (bad
+reference, no registry access, no daemon) is an **ERROR (exit 3)**. Image
+findings have `file: "image:REF"` and always stay in scope under `--diff`.
 
 ## The adversarial review pass
 

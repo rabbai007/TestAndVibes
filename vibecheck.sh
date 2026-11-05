@@ -29,6 +29,7 @@ TOOL_URL="https://github.com/rabbai007/TestAndVibes"
 # ── defaults (overridable by vibecheck.yml, then CLI flags) ──
 TARGET="."
 URL=""
+IMAGES=()               # --image REF (repeatable): container images to scan for CVEs, secrets, EOL OS
 DYNAMIC=0
 FAIL_ON="high"          # never | low | medium | high | critical | any
 FAIL_ON_ERROR=1         # 1 = a pass that cannot run exits 3 (fail closed)
@@ -96,6 +97,9 @@ OPTIONS
   --url URL            Enable read-only dynamic checks against URL (implies --dynamic)
   --dynamic            Enable dynamic checks (requires --url)
   --all                Static + dynamic
+  --image REF          Scan a built container image (repeatable): OS + language
+                       package CVEs, secrets baked into layers, end-of-life base
+                       OS. Local image or registry ref (e.g. myapp:latest).
   --fail-on LEVEL      Gate threshold: never|low|medium|high|critical|any (default: high)
   --no-fail-on-error   Do NOT exit 3 when a pass cannot complete (unsafe; opts out
                        of fail-closed behavior)
@@ -288,6 +292,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dir) TARGET="${2:?--dir needs a path}"; shift 2;;
     --url) URL="${2:?--url needs a URL}"; DYNAMIC=1; shift 2;;
+    --image) IMAGES+=("${2:?--image needs an image reference}"); shift 2;;
     --dynamic) DYNAMIC=1; shift;;
     --all) DYNAMIC=1; shift;;
     --fail-on) FAIL_ON="${2:?--fail-on needs a level}"; shift 2;;
@@ -935,6 +940,70 @@ else
   fi
 fi
 
+# ═══════════════════════════════════════════════════════════════════
+# 3a. container images (opt-in: --image REF)
+# ═══════════════════════════════════════════════════════════════════
+# The Dockerfile check (pass 4) reads the recipe; this reads what was built.
+# Base-image CVEs, secrets left in a layer, and an end-of-life OS that no longer
+# gets security fixes are invisible from the source tree. Image CVEs go through
+# KEV and EPSS like dependency CVEs. Findings carry file "image:REF": they
+# describe the artifact, not a changed file, so --diff never scopes them out.
+if [ "${#IMAGES[@]}" -eq 0 ]; then
+  set_status image skipped "no --image"
+else
+  head2 "3a. Container images"
+  if ! have trivy; then
+    pass_error image "--image given but trivy is not installed - images NOT scanned"
+  else
+    img_c=0; img_h=0; img_m=0; img_s=0; img_eol=0; img_fail=""; img_i=0
+    for img in "${IMAGES[@]}"; do
+      img_i=$((img_i+1)); ij="$OUTDIR/trivy-image-$img_i.json"; rm -f "$ij"
+      trivy image --scanners vuln,secret --severity 'MEDIUM,HIGH,CRITICAL' --quiet \
+        --format json --output "$ij" "$img" >/dev/null 2>"$OUTDIR/.trivy-image-$img_i.err"; ir=$?
+      if [ ! -f "$ij" ] || ! jq -e 'has("Results") or has("ArtifactName")' "$ij" >/dev/null 2>&1; then
+        img_fail="$img_fail $img(exit $ir: $(grep -m1 -E 'FATAL|ERROR' "$OUTDIR/.trivy-image-$img_i.err" | tr '\t' ' ' | tail -c 160))"
+        continue
+      fi
+      loc="image:$img"
+      if [ "$(jq -r '.Metadata.OS.EOSL // false' "$ij")" = "true" ]; then
+        img_eol=$((img_eol+1))
+        add_finding image high "image.eol-os" "$loc" 0 \
+          "Base OS $(jq -r '"\(.Metadata.OS.Family) \(.Metadata.OS.Name)"' "$ij") is end-of-life - it no longer receives security fixes; rebuild on a supported base" \
+          "https://endoflife.date/$(jq -r '.Metadata.OS.Family' "$ij")"
+      fi
+      while IFS=$'\x1f' read -r kind sev id pkg title url; do
+        [ -z "${id:-}" ] && continue
+        case "$sev" in CRITICAL) vs=critical; img_c=$((img_c+1));; HIGH) vs=high; img_h=$((img_h+1));; *) vs=medium; img_m=$((img_m+1));; esac
+        if [ "$kind" = secret ]; then
+          img_s=$((img_s+1)); add_finding image "$vs" "image-secret.$id" "$loc" 0 "Secret in image layer: $title" ""
+        else
+          add_finding image "$vs" "$id" "$loc" 0 "$pkg: $title" "$url"
+        fi
+      done < <(jq -r '.Results[]? | .Target as $t |
+                 ((.Vulnerabilities // [])[] | ["vuln", .Severity, .VulnerabilityID,
+                    "\(.PkgName)@\(.InstalledVersion)",
+                    (((.Title // .Description // "known vulnerability") | .[0:150])
+                      + (if .FixedVersion then " (fixed in \(.FixedVersion))" else " (no fix yet)" end)),
+                    (.PrimaryURL // "")]),
+                 ((.Secrets // [])[] | ["secret", .Severity, (.RuleID // "secret"), "",
+                    "\(.Title // .RuleID) in \($t)" + (if .StartLine then ":\(.StartLine)" else "" end), ""])
+                 | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$ij" 2>/dev/null | sort -u)
+      printf '%s\n' "$(jq -cn --arg v "$(jq -r '.Metadata.ImageID // "unknown id"' "$ij" | cut -c1-19)" --arg t "image $img" \
+        '{tool:$t, pass:"image", version:$v, installed:true}')" >> "$TOOLING"
+    done
+    img_total=$((img_c+img_h+img_m+img_eol))
+    [ "$img_c" -gt 0 ] && bad  "images: $img_c CRITICAL"
+    [ "$img_h" -gt 0 ] && warn "images: $img_h HIGH"
+    [ "$img_m" -gt 0 ] && say  "  ${C_D}images: $img_m MEDIUM${C_0}"
+    [ "$img_s" -gt 0 ] && bad  "images: $img_s secret(s) baked into a layer - rotate them; deleting in a later layer does not remove them"
+    [ "$img_eol" -gt 0 ] && bad "images: $img_eol end-of-life base OS"
+    if [ -n "$img_fail" ]; then
+      pass_error image "could not scan:$img_fail - image(s) NOT scanned"
+    elif [ "$img_total" -gt 0 ]; then set_status image findings "$img_total finding(s) in ${#IMAGES[@]} image(s)"
+    else ok "images: 0 MEDIUM+ findings in ${#IMAGES[@]} image(s)"; set_status image ok "0 findings in ${#IMAGES[@]} image(s)"; fi
+  fi
+fi
+
 # ── --diff: the changed-file list, computed once, early ──
 # The review pass (6) puts changed files first in its budget, and the Diff
 # scope step gates on them. It used to be written only in the Diff scope step,
@@ -983,8 +1052,8 @@ kev_fail() {  # explicit -> fail closed; default-on -> loud warning, recorded
   else warn "$1 - CISA KEV NOT checked (pass --kev to make this an error, --kev-file for offline)"
        set_status kev skipped "$1"; fi
 }
-if [ "$DO_KEV" = 1 ] && [ "$DO_DEPS" = 1 ]; then
-  DEP_CVES="$(jq -s '[.[] | select(.tool=="deps")] | length' "$FINDINGS")"
+if [ "$DO_KEV" = 1 ] && { [ "$DO_DEPS" = 1 ] || [ "${#IMAGES[@]}" -gt 0 ]; }; then
+  DEP_CVES="$(jq -s '[.[] | select(.tool=="deps" or (.tool=="image" and (.rule|startswith("image")|not)))] | length' "$FINDINGS")"
   if [ "${DEP_CVES:-0}" -eq 0 ]; then
     set_status kev skipped "no dependency CVEs to check"
   else
@@ -1020,7 +1089,7 @@ if [ "$DO_KEV" = 1 ] && [ "$DO_DEPS" = 1 ]; then
           ($kev[0].vulnerabilities | map({key:.cveID, value:.}) | from_entries) as $k |
           ($al[0] | group_by(.id) | map({key:.[0].id, value:map(.alias)}) | from_entries) as $a |
           .[] |
-          if .tool != "deps" then . else
+          if (.tool != "deps" and .tool != "image") then . else
             ([.rule] + ($a[.rule] // []) | map(ascii_upcase) | unique
               | map(select(startswith("CVE-") and ($k[.] != null)))) as $hits |
             if ($hits|length) == 0 then . else
@@ -1063,11 +1132,11 @@ epss_fail() {  # explicit -> fail closed; default-on -> loud warning, recorded
   else warn "$1 - EPSS NOT checked (pass --epss to make this an error, --epss-file for offline)"
        set_status epss skipped "$1"; fi
 }
-if [ "$DO_EPSS" = 1 ] && [ "$DO_DEPS" = 1 ]; then
+if [ "$DO_EPSS" = 1 ] && { [ "$DO_DEPS" = 1 ] || [ "${#IMAGES[@]}" -gt 0 ]; }; then
   EPSS_CVES="$OUTDIR/.epss-cves.txt"
   jq -r --slurpfile al <(jq -s '.' "$KEV_ALIASES") '
       ($al[0] | group_by(.id) | map({key:.[0].id, value:map(.alias)}) | from_entries) as $a
-      | select(.tool=="deps") | [.rule] + ($a[.rule] // []) | .[] | ascii_upcase
+      | select(.tool=="deps" or .tool=="image") | [.rule] + ($a[.rule] // []) | .[] | ascii_upcase
       | select(test("^CVE-[0-9]{4}-[0-9]+$"))' "$FINDINGS" 2>/dev/null | sort -u > "$EPSS_CVES"
   n_cves=$(wc -l < "$EPSS_CVES" | tr -d ' ')
   if [ "$n_cves" -eq 0 ]; then
@@ -1123,20 +1192,20 @@ if [ "$DO_EPSS" = 1 ] && [ "$DO_DEPS" = 1 ]; then
                                    | from_entries' "$EPSS_TSV") '
         ($al[0] | group_by(.id) | map({key:.[0].id, value:map(.alias)}) | from_entries) as $a |
         .[] |
-        if .tool != "deps" then . else
+        if (.tool != "deps" and .tool != "image") then . else
           ([.rule] + ($a[.rule] // []) | map(ascii_upcase) | unique
             | map(select($ep[0][.] != null) | {cve: ., s: $ep[0][.]})
             | sort_by(-.s.score) | .[0]) as $h |
           if $h == null then . else
             . + { epss: ($h.s + {cve: $h.cve}),
-                  title: (.title + " [EPSS \($h.s.score * 1000 | round / 10)%, \($h.s.percentile * 1000 | floor / 10)th pct]") }
+                  title: (.title + " [EPSS \($h.s.score * 1000 | round / 10)%, percentile \($h.s.percentile * 1000 | floor / 10)]") }
           end
         end' "$FINDINGS" > "$EPSS_TMP" && mv "$EPSS_TMP" "$FINDINGS"
       EPSS_N="$(jq -s '[.[] | select(.epss != null)] | length' "$FINDINGS")"
-      dep_n="$(jq -s '[.[] | select(.tool=="deps")] | length' "$FINDINGS")"
+      dep_n="$(jq -s '[.[] | select(.tool=="deps" or (.tool=="image" and (.rule|startswith("image")|not)))] | length' "$FINDINGS")"
       ok "EPSS: $EPSS_N of $dep_n dependency finding(s) scored ($epss_src)"
       jq -s -r '[.[] | select(.epss != null)] | sort_by(-.epss.score) | .[0:5][]
-                | "      · \(.epss.cve)  \(.epss.score * 1000 | round / 10)% (\(.epss.percentile * 1000 | floor / 10)th pct)  \(.file)"' "$FINDINGS"
+                | "      · \(.epss.cve)  \(.epss.score * 1000 | round / 10)% (percentile \(.epss.percentile * 1000 | floor / 10))  \(.file)"' "$FINDINGS"
       set_status epss ok "$EPSS_N of $dep_n dependency finding(s) scored ($epss_src)"
     fi
   fi
@@ -2043,9 +2112,9 @@ if [ -n "$DIFF_REF" ]; then
     # file in the diff (their .file is a URL or command), so they always stay in
     # scope - otherwise --diff would silently never gate on them.
     jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
-      'select(.tool=="dynamic" or .tool=="mcp" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
+      'select(.tool=="dynamic" or .tool=="mcp" or .tool=="image" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
     jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
-      'select(.tool!="dynamic" and .tool!="mcp" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
+      'select(.tool!="dynamic" and .tool!="mcp" and .tool!="image" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
     DIFF_N=$(jq -s 'length' "$OUTSCOPE")
     mv "$OUTDIR/.inscope.jsonl" "$ACTIVE"
     [ "$DIFF_N" -gt 0 ] && warn "$DIFF_N pre-existing finding(s) outside the diff — reported, not gated" \
@@ -2060,7 +2129,7 @@ fi
 # A3: "no pass examined anything" is not a clean result. Disabling every scanner
 # — by flag or by config — used to yield 0 findings and exit 0, which is
 # indistinguishable from a repo with nothing wrong. An empty scan is unknown.
-EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","iac","dynamic","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
+EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","iac","dynamic","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
 if [ "${EXECUTED:-0}" -eq 0 ]; then
   pass_error coverage "no scan pass examined anything (all were skipped, disabled, or failed) — this result is unknown, not clean"
 fi

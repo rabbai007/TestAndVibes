@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CVE is left unannotated rather than shown as 0%. Same failure contract as KEV:
   unreachable API warns, `--epss` makes it an ERROR, `--epss-file` takes the daily
   CSV (`.csv`/`.csv.gz`) for air-gapped runners. `--no-epss` turns it off.
+- **`--image REF`: container image scanning** (pass 3a, opt-in, repeatable). Reads the
+  built image, not just the Dockerfile: OS and language-package CVEs (through KEV and
+  EPSS, even with `--skip-deps`), secrets baked into layers, and an end-of-life base OS
+  (high). An image that cannot be scanned is an ERROR (exit 3). Findings are filed as
+  `image:REF` and always stay in scope under `--diff`.
 
 ## [0.10.0] — 2026-11-04
 

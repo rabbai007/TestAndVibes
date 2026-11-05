@@ -747,7 +747,7 @@ epss_csv() {  # the FIRST daily CSV shape; CVE-2099-0002 deliberately unscored
   local f="$OUT/findings.json"
   [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .epss.score' "$f")" = "0.84887" ]
   [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .severity' "$f")" = "medium" ]
-  [[ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .title' "$f")" == *"[EPSS 84.9%, 99.7th pct]" ]] || false
+  [[ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .title' "$f")" == *"[EPSS 84.9%, percentile 99.7]" ]] || false
   [ "$(jq -r '.coverage.passes[] | select(.pass=="epss") | .status' "$f")" = "ok" ]
 }
 
@@ -800,4 +800,80 @@ SH
   grep -qx 'https://epss.invalid/v1?cve=CVE-2099-0001,CVE-2099-0002' "$FAKE_CURL_LOG"
   [ "$(grep -c . "$FAKE_CURL_LOG")" -eq 1 ]               # one batch, no empty trailing request
   [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0002") | .epss.score' "$OUT/findings.json")" = "0.5" ]
+}
+
+# ── --image: what was built, not just the Dockerfile ───────────────────────
+
+image_setup() {  # fake trivy: image "old:1" is EOL with a CVE and a secret; "clean:1" is clean; anything else fails
+  cat > "$BIN/trivy" <<'SH'
+#!/usr/bin/env bash
+case " $* " in *" --version "*) echo "Version: 0.0.0-fake"; exit 0;; esac
+[ "$1" = image ] || exit 0
+out=""; ref=""; while [ $# -gt 0 ]; do case "$1" in --output) out="$2"; shift 2;; --*) [ "$1" = --quiet ] && shift || shift 2;; *) ref="$1"; shift;; esac; done
+case "$ref" in
+  old:1) cat > "$out" <<'JSON'
+{"ArtifactName":"old:1","Metadata":{"ImageID":"sha256:0123456789abcdef","OS":{"Family":"alpine","Name":"3.12.12","EOSL":true}},
+ "Results":[{"Target":"old:1 (alpine 3.12.12)","Vulnerabilities":[
+   {"VulnerabilityID":"CVE-2099-0001","PkgName":"zlib","InstalledVersion":"1.2","FixedVersion":"1.3","Severity":"MEDIUM","Title":"zlib overflow"}]},
+  {"Target":"/app/.env","Class":"secret","Secrets":[{"RuleID":"aws-access-key-id","Severity":"CRITICAL","Title":"AWS Access Key ID","StartLine":3}]}]}
+JSON
+  ;;
+  clean:1) printf '{"ArtifactName":"clean:1","Metadata":{"OS":{"Family":"alpine","Name":"3.22.0"}},"Results":[]}' > "$out";;
+  *) echo "FATAL run error: could not parse reference: $ref" >&2; exit 1;;
+esac
+SH
+  chmod +x "$BIN/trivy"
+  IMG_ONLY=(--dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --no-kev --no-epss
+            --skip-secrets --skip-sast --skip-deps --skip-iac)
+}
+
+@test "image: CVEs, a secret in a layer and an end-of-life base OS are reported against the image" {
+  image_setup
+  kev_run "${IMG_ONLY[@]}" --image old:1
+  [ "$status" -eq 1 ]                                    # the critical secret gates
+  local f="$OUT/findings.json"
+  [ "$(jq -r '[.active[] | select(.file=="image:old:1")] | length' "$f")" -eq 3 ]
+  [ "$(jq -r '.active[] | select(.rule=="image.eol-os") | .severity' "$f")" = "high" ]
+  [ "$(jq -r '.active[] | select(.rule=="image-secret.aws-access-key-id") | .severity' "$f")" = "critical" ]
+  [[ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .title' "$f")" == *"zlib@1.2"*"(fixed in 1.3)"* ]] || false
+  [[ "$output" == *"baked into a layer - rotate them"* ]] || false
+}
+
+@test "image: a clean image passes and records an ok image pass" {
+  image_setup
+  kev_run "${IMG_ONLY[@]}" --image clean:1
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="image") | .status' "$OUT/findings.json")" = "ok" ]
+}
+
+@test "image: one image that cannot be scanned fails closed (exit 3), even if another scanned" {
+  image_setup
+  kev_run "${IMG_ONLY[@]}" --image clean:1 --image missing:9
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"missing:9"*"could not parse reference"* ]] || false
+}
+
+@test "image: --image without trivy is an error (exit 3); no --image is a recorded skip" {
+  PATH="$CLEAN_PATH" run "$VC" --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review \
+     --skip-secrets --skip-sast --skip-deps --skip-iac --image clean:1
+  [ "$status" -eq 3 ]
+  image_setup
+  kev_run "${IMG_ONLY[@]}"
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="image") | .detail' "$OUT/findings.json")" = "no --image" ]
+}
+
+@test "image: a KEV-listed CVE in an image is raised to critical, even with --skip-deps" {
+  kev_setup; image_setup                  # kev_setup writes kev.json; image_setup's trivy wins
+  kev_run --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --no-epss \
+          --skip-secrets --skip-sast --skip-deps --skip-iac \
+          --kev-file "$BATS_TEST_TMPDIR/kev.json" --image old:1
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .severity' "$OUT/findings.json")" = "critical" ]
+  [ "$(jq -r '.active[] | select(.rule=="CVE-2099-0001") | .kev.cve' "$OUT/findings.json")" = "CVE-2099-0001" ]
+}
+
+@test "image: --diff never scopes image findings out (they describe the artifact, not a file)" {
+  image_setup; diff_repo
+  kev_run "${IMG_ONLY[@]}" --image old:1 --diff main
+  [ "$status" -eq 1 ]
+  [ "$(jq -r '[.out_of_scope[] | select(.tool=="image")] | length' "$OUT/findings.json")" -eq 0 ]
 }
