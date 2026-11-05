@@ -89,6 +89,9 @@ targets). No config required.
 | `--epss` | **on** | Annotate dependency CVEs with their FIRST EPSS exploit probability. On by default (warns if the API is unreachable); with `--epss` that is an ERROR. Never changes severity |
 | `--no-epss` | — | Skip the EPSS lookup |
 | `--epss-file PATH` | — | Use a local copy of the daily EPSS CSV (`.csv`/`.csv.gz`; implies `--epss`) |
+| `--licenses` | — | Check dependency licences from the lockfiles (needs osv-scanner + network) |
+| `--license-allow LIST` | — | Allowed SPDX ids, comma-separated; anything else is high (implies `--licenses`) |
+| `--sbom` | — | Write a CycloneDX SBOM (`sbom.cdx.json`, plus one per `--image`) |
 | `--review` | **on** | Adversarial reasoning pass (report-only). Runs by default when a provider exists; **skips** if none. |
 | `--no-review` | — | Turn the review pass off |
 | `--fail-on-review` | — | Let surviving review findings affect the exit code |
@@ -224,6 +227,28 @@ docker build -t myapp:ci . && ./vibecheck.sh --image myapp:ci
 Repeat `--image` for several images. Each image that cannot be scanned (bad
 reference, no registry access, no daemon) is an **ERROR (exit 3)**. Image
 findings have `file: "image:REF"` and always stay in scope under `--diff`.
+
+## Licences and the SBOM
+
+**`--licenses`** classifies every dependency's licence, read from the lockfiles
+(osv-scanner with deps.dev data, so no `npm install` is needed; it needs network).
+Default policy:
+
+| Severity | Licences | Why |
+|---|---|---|
+| high | AGPL, SSPL, BUSL, Elastic-2.0, Commons Clause, CC-BY-NC, PolyForm | Network copyleft or source-available: running it in a hosted service can oblige you to publish your source, or is not permitted |
+| medium | GPL, EUPL, OSL and other strong copyleft | Distributing your software can oblige you to release its source |
+| medium | `non-standard`, no licence | Custom terms, or all rights reserved: read them |
+| — | MIT, Apache, BSD, ISC, MPL, LGPL, EPL and other permissive / weak copyleft | |
+
+An `OR` expression passes if any side is acceptable (`MIT OR GPL-3.0` passes).
+**`--license-allow MIT,Apache-2.0,...`** replaces the policy with your own
+allowlist: anything else is high. Findings are filed against the lockfile, so
+`--diff` and the baseline work as usual. This is engineering triage, not legal
+advice.
+
+**`--sbom`** writes `sbom.cdx.json` (CycloneDX) for the source tree, plus
+`sbom-image-N.cdx.json` for each `--image`. A failed SBOM is an ERROR.
 
 ## The adversarial review pass
 

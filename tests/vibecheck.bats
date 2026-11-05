@@ -877,3 +877,78 @@ SH
   [ "$status" -eq 1 ]
   [ "$(jq -r '[.out_of_scope[] | select(.tool=="image")] | length' "$OUT/findings.json")" -eq 0 ]
 }
+
+# ── --licenses / --sbom ────────────────────────────────────────────────────
+
+lic_setup() {  # fake osv-scanner in allowlist mode: lists every package not on the list
+  printf 'a==1\n' > "$APP/requirements.txt"
+  cat > "$BIN/osv-scanner" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = "--version" ] && { echo "osv-scanner version: 0.0.0-fake"; exit 0; }
+out=""; allow=""
+for a in "$@"; do case "$a" in --licenses=*) allow="${a#--licenses=}";; esac; done
+while [ $# -gt 0 ]; do [ "$1" = "--output" ] && out="$2"; shift; done
+echo "$allow" > "$FAKE_OSV_ALLOW"
+[ "${FAKE_OSV_MODE:-}" = crash ] && { echo "boom" >&2; exit 127; }
+cat > "$out" <<JSON
+{"results":[{"source":{"path":"$FAKE_APP/requirements.txt"},"packages":[
+  {"package":{"name":"agpl-lib","version":"1.0"},"licenses":["AGPL-3.0-only"]},
+  {"package":{"name":"gpl-lib","version":"2.0"},"licenses":["GPL-3.0-or-later"]},
+  {"package":{"name":"dual","version":"3.0"},"licenses":["MIT OR GPL-3.0-only"]},
+  {"package":{"name":"custom","version":"4.0"},"licenses":["non-standard"]},
+  {"package":{"name":"fine","version":"5.0"},"licenses":["Apache-2.0"]}]}],
+ "license_summary":[{"name":"x","count":6}]}
+JSON
+exit 1
+SH
+  chmod +x "$BIN/osv-scanner"
+  export FAKE_APP="$APP" FAKE_OSV_ALLOW="$BATS_TEST_TMPDIR/allow"
+  LIC_ONLY=(--dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review
+            --skip-secrets --skip-sast --skip-deps --skip-iac)
+}
+
+@test "licenses: default policy - AGPL high, GPL and custom medium, permissive and MIT-OR-GPL pass" {
+  lic_setup
+  kev_run "${LIC_ONLY[@]}" --licenses
+  [ "$status" -eq 1 ]                                         # AGPL is high: gates
+  local f="$OUT/findings.json"
+  [ "$(jq -r '.active[] | select(.title|startswith("agpl-lib")) | .severity' "$f")" = "high" ]
+  [ "$(jq -r '.active[] | select(.title|startswith("gpl-lib")) | .severity' "$f")" = "medium" ]
+  [ "$(jq -r '.active[] | select(.title|startswith("custom")) | .severity' "$f")" = "medium" ]
+  [ "$(jq -r '[.active[] | select(.title|startswith("dual") or startswith("fine"))] | length' "$f")" -eq 0 ]
+  [ "$(jq -r '.active[] | select(.title|startswith("agpl-lib")) | .file' "$f")" = "requirements.txt" ]
+  [ "$(cat "$FAKE_OSV_ALLOW")" = "0BSD" ]                    # allowlist mode: every package listed
+}
+
+@test "licenses: --license-allow replaces the policy and is passed to osv-scanner" {
+  lic_setup
+  kev_run "${LIC_ONLY[@]}" --license-allow 'MIT, Apache-2.0'
+  [ "$(cat "$FAKE_OSV_ALLOW")" = "MIT,Apache-2.0" ]
+  [ "$(jq -r '[.active[] | select(.tool=="license" and .severity=="high")] | length' "$OUT/findings.json")" -eq 3 ]  # agpl, gpl, custom
+}
+
+@test "licenses: an osv-scanner failure, or no osv-scanner, is an error (exit 3)" {
+  lic_setup
+  FAKE_OSV_MODE=crash kev_run "${LIC_ONLY[@]}" --licenses
+  [ "$status" -eq 3 ]
+  rm "$BIN/osv-scanner"
+  kev_run "${LIC_ONLY[@]}" --licenses
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"--licenses needs osv-scanner"* ]] || false
+}
+
+@test "sbom: --sbom writes a CycloneDX file; a trivy failure is an error (exit 3)" {
+  cat > "$BIN/trivy" <<'SH'
+#!/usr/bin/env bash
+case " $* " in *" --version "*) echo "Version: 0.0.0-fake"; exit 0;; esac
+out=""; while [ $# -gt 0 ]; do [ "$1" = "--output" ] && out="$2"; shift; done
+[ -n "${FAKE_TRIVY_FAIL:-}" ] && exit 1
+printf '{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"a"}]}' > "$out"
+SH
+  chmod +x "$BIN/trivy"
+  kev_run "${REVIEW_ONLY[@]}" --review --review-cmd 'echo "[]"' --sbom
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .bomFormat "$OUT/sbom.cdx.json")" = "CycloneDX" ]
+  FAKE_TRIVY_FAIL=1 kev_run "${REVIEW_ONLY[@]}" --review --review-cmd 'echo "[]"' --sbom
+  [ "$status" -eq 3 ]
+}

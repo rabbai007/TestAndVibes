@@ -60,6 +60,9 @@ EPSS_EXPLICIT=0         # 1 = user passed --epss / --epss-file (then an unavaila
 EPSS_FILE="${VIBECHECK_EPSS_FILE:-}" # local copy of the daily EPSS CSV (.csv or .csv.gz; air-gapped CI)
 EPSS_URL="${VIBECHECK_EPSS_URL:-https://api.first.org/data/v1/epss}"
 EPSS_STALE_DAYS=14      # warn when an --epss-file is older than this
+DO_LICENSES=0           # opt-in: classify dependency licences (osv-scanner + deps.dev; needs network)
+LICENSE_ALLOW=""        # comma list of SPDX ids; when set, any other licence is a high finding
+DO_SBOM=0               # opt-in: write a CycloneDX SBOM of the source tree (and of each --image)
 MCP_TARGET=""           # opt-in MCP server probe: URL (http/https) or a command to spawn (stdio)
 MCP_TIMEOUT=20          # seconds for the MCP handshake/list calls
 MCP_HEADER=""           # optional single HTTP header for an authed MCP endpoint (e.g. "Authorization: Bearer …")
@@ -121,6 +124,13 @@ OPTIONS
                        Annotation only: EPSS is a likelihood, it never changes severity.
   --no-epss            Skip the EPSS lookup
   --epss-file PATH     Use a local copy of the daily EPSS CSV (.csv or .csv.gz; implies --epss)
+  --licenses           Check dependency licences from the lockfiles (osv-scanner,
+                       deps.dev data; needs network). Default policy: AGPL/SSPL/BUSL
+                       and other source-available licences high; GPL and
+                       unknown/no licence medium.
+  --license-allow LIST Comma list of allowed SPDX ids (implies --licenses); any
+                       other licence is high. Replaces the default policy.
+  --sbom               Write a CycloneDX SBOM (sbom.cdx.json; one per --image too)
   --review             Adversarial review pass: an LLM reasons about trust
                        boundaries, lifecycle and logic — the classes no scanner
                        can reach. ON BY DEFAULT and REPORT-ONLY. Uses the first
@@ -320,6 +330,9 @@ while [ $# -gt 0 ]; do
     --epss) DO_EPSS=1; EPSS_EXPLICIT=1; shift;;
     --no-epss) DO_EPSS=0; shift;;
     --epss-file) EPSS_FILE="${2:?--epss-file needs a path}"; DO_EPSS=1; EPSS_EXPLICIT=1; shift 2;;
+    --licenses) DO_LICENSES=1; shift;;
+    --license-allow) LICENSE_ALLOW="${2:?--license-allow needs a comma list of SPDX ids}"; DO_LICENSES=1; shift 2;;
+    --sbom) DO_SBOM=1; shift;;
     --mcp) MCP_TARGET="${2:?--mcp needs a URL or command}"; shift 2;;
     --mcp-timeout) MCP_TIMEOUT="${2:?}"; shift 2;;
     --mcp-header) MCP_HEADER="${2:?}"; shift 2;;
@@ -1211,6 +1224,110 @@ if [ "$DO_EPSS" = 1 ] && { [ "$DO_DEPS" = 1 ] || [ "${#IMAGES[@]}" -gt 0 ]; }; t
   fi
 elif [ "$DO_EPSS" = 0 ]; then
   set_status epss skipped "disabled by --no-epss"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
+# 3d. dependency licences (opt-in: --licenses / --license-allow)
+# ═══════════════════════════════════════════════════════════════════
+# Read from the lockfiles via osv-scanner, which looks licences up in deps.dev -
+# so no node_modules / site-packages install is needed (trivy only sees
+# licences of installed packages, and reports none for a bare lockfile).
+# A licence is a legal finding, not a vulnerability: tool "license", filed
+# against the lockfile so --diff and the baseline work as usual.
+LIC_JQ='
+          ($allow | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $al |
+          .results[] | .source.path as $src | .packages[]? |
+          "\(.package.name)@\(.package.version)" as $pkg |
+          ((.licenses // []) | if length == 0 then ["UNKNOWN"] else . end) as $ls |
+          # An expression ("MIT OR GPL-3.0") is classified by its most permissive
+          # alternative only for OR; AND keeps the strictest - so take each id
+          # as written and let OR-expressions pass if any side is acceptable.
+          $ls[] as $l |
+          ( if ($al | length) > 0 then
+              (if ($l | split(" OR ") | map(gsub("[()]"; "")) | any(. as $x | $al | index($x))) then empty
+               else ["high", "not in --license-allow"] end)
+            elif ($l | test("^non-standard$"; "i")) then
+              ["medium", "custom licence text, not a standard SPDX licence - read its terms (dual AGPL/commercial packages often show up this way)"]
+            elif ($l | test("^(UNKNOWN|NOASSERTION|NONE)$"; "i")) then
+              ["medium", "no licence declared: without one, all rights are reserved - confirm terms with the author"]
+            elif ($l | split(" OR ") | any(test("^\\(?(MIT|Apache|BSD|ISC|0BSD|Unlicense|CC0|Zlib|PSF|Python|BlueOak|MPL|LGPL|EPL|CDDL|Artistic|WTFPL|BSL-1\\.0|UPL|PostgreSQL|X11|curl|OFL|CC-BY-[0-9])"; "i"))) then empty
+            elif ($l | test("AGPL|SSPL|BUSL|Elastic-2|Commons-Clause|CC-BY-NC|Confluent|PolyForm"; "i")) then
+              ["high", "network copyleft or source-available: using it in a hosted service can oblige you to publish your source, or is not permitted"]
+            elif ($l | test("GPL|EUPL|OSL|CPAL|RPL|SSPL"; "i")) then
+              ["medium", "strong copyleft: distributing your software can oblige you to release its source under the same licence"]
+            else empty end ) as $v |
+          [ $v[0], ($l | gsub("[^A-Za-z0-9.+-]"; "_")), $src, $pkg, $v[1] ]
+          | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")'
+if [ "$DO_LICENSES" = 0 ]; then
+  set_status license skipped "not requested (--licenses)"
+else
+  head2 "3d. Dependency licences"
+  if ! have osv-scanner; then
+    pass_error license "--licenses needs osv-scanner (licence data from lockfiles) - licences NOT checked"
+  else
+    lj="$OUTDIR/osv-licenses.json"; rm -f "$lj"
+    # Allowlist mode is the only mode that lists EVERY package: summary mode
+    # (--licenses alone) lists only packages that also have a vulnerability, so
+    # most of the tree would go unchecked. With --license-allow the user's list
+    # is passed through; the default policy passes 0BSD - a licence it permits
+    # anyway, so omitting those packages changes nothing - and classifies the rest.
+    lic_list="$(printf '%s' "${LICENSE_ALLOW:-0BSD}" | tr -d ' ')"
+    osv-scanner scan source --licenses="$lic_list" --format json --output "$lj" "$TARGET" >/dev/null 2>"$OUTDIR/.osv-lic.err"; lr=$?
+    # osv-scanner: 0 clean, 1 issues found, 128 no packages, anything else an error.
+    if [ "$lr" = 128 ]; then
+      skip "licence check" "no packages found in any lockfile"; set_status license skipped "no packages found"
+    elif { [ "$lr" != 0 ] && [ "$lr" != 1 ]; } || ! jq -e '.results | type == "array"' "$lj" >/dev/null 2>&1; then
+      pass_error license "osv-scanner --licenses exited $lr without a usable report - licences NOT checked: $(tail -c 200 "$OUTDIR/.osv-lic.err" | tr '\n' ' ')"
+    else
+      lic_h=0; lic_m=0; lic_n=0; lic_rows="$OUTDIR/.licenses.tsv"
+      # Classified into a file first and checked: a filter error must be an
+      # ERROR, never an empty list that reads as "no licence problems".
+      if ! jq -r --arg allow "$LICENSE_ALLOW" "$LIC_JQ" "$lj" > "$lic_rows" 2>"$OUTDIR/.licenses.err"; then
+        pass_error license "licence classification failed: $(head -c 160 "$OUTDIR/.licenses.err" | tr '\n' ' ') - licences NOT checked"
+      else
+      while IFS=$'\x1f' read -r sev spdx src pkg why; do
+        [ -z "${pkg:-}" ] && continue
+        case "$sev" in high) lic_h=$((lic_h+1));; *) lic_m=$((lic_m+1));; esac
+        add_finding license "$sev" "license.$spdx" "$(rel "$src")" 0 "$pkg is licensed $spdx - $why" \
+          "https://spdx.org/licenses/$spdx.html"
+      done < <(sort -u "$lic_rows")
+      lic_n="$(jq '[.license_summary[]?.count] | add // 0' "$lj")"
+      [ "$lic_h" -gt 0 ] && warn "licences: $lic_h HIGH (see report)"
+      [ "$lic_m" -gt 0 ] && say  "  ${C_D}licences: $lic_m MEDIUM${C_0}"
+      if [ $((lic_h+lic_m)) -gt 0 ]; then set_status license findings "$lic_h high, $lic_m medium of $lic_n package(s)$([ -n "$LICENSE_ALLOW" ] && echo ' (--license-allow)')"
+      else ok "licences: $lic_n package(s), none outside policy"; set_status license ok "$lic_n package(s), none outside policy"; fi
+      fi
+    fi
+  fi
+fi
+
+# ── SBOM (opt-in: --sbom) - an inventory artifact, not a check ──
+if [ "$DO_SBOM" = 1 ]; then
+  head2 "SBOM"
+  if ! have trivy; then
+    pass_error sbom "--sbom needs trivy - SBOM NOT written"
+  else
+    sb_fail=""
+    sb_args=(fs --format cyclonedx --quiet --output "$OUTDIR/sbom.cdx.json")
+    for e in "${EXCLUDES[@]}"; do sb_args+=(--skip-dirs "$e"); done
+    trivy "${sb_args[@]}" "$TARGET" >/dev/null 2>"$OUTDIR/.sbom.err" \
+      && jq -e '.bomFormat == "CycloneDX"' "$OUTDIR/sbom.cdx.json" >/dev/null 2>&1 \
+      || sb_fail="$sb_fail source"
+    sb_i=0
+    for img in "${IMAGES[@]+"${IMAGES[@]}"}"; do
+      sb_i=$((sb_i+1))
+      trivy image --format cyclonedx --quiet --output "$OUTDIR/sbom-image-$sb_i.cdx.json" "$img" >/dev/null 2>>"$OUTDIR/.sbom.err" \
+        && jq -e '.bomFormat == "CycloneDX"' "$OUTDIR/sbom-image-$sb_i.cdx.json" >/dev/null 2>&1 \
+        || sb_fail="$sb_fail $img"
+    done
+    if [ -n "$sb_fail" ]; then
+      pass_error sbom "SBOM could not be written for:$sb_fail - $(tail -c 160 "$OUTDIR/.sbom.err" | tr '\n' ' ')"
+    else
+      sb_n="$(jq '.components | length' "$OUTDIR/sbom.cdx.json")"
+      ok "SBOM: sbom.cdx.json (CycloneDX $(jq -r .specVersion "$OUTDIR/sbom.cdx.json"), $sb_n components)$([ "$sb_i" -gt 0 ] && echo " + $sb_i image SBOM(s)")"
+      set_status sbom ok "CycloneDX, $sb_n components$([ "$sb_i" -gt 0 ] && echo " + $sb_i image(s)")"
+    fi
+  fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2129,7 +2246,7 @@ fi
 # A3: "no pass examined anything" is not a clean result. Disabling every scanner
 # — by flag or by config — used to yield 0 findings and exit 0, which is
 # indistinguishable from a repo with nothing wrong. An empty scan is unknown.
-EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","iac","dynamic","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
+EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","license","iac","dynamic","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
 if [ "${EXECUTED:-0}" -eq 0 ]; then
   pass_error coverage "no scan pass examined anything (all were skipped, disabled, or failed) — this result is unknown, not clean"
 fi

@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   EPSS, even with `--skip-deps`), secrets baked into layers, and an end-of-life base OS
   (high). An image that cannot be scanned is an ERROR (exit 3). Findings are filed as
   `image:REF` and always stay in scope under `--diff`.
+- **`--licenses` / `--license-allow`: dependency licence check** (step 3d, opt-in).
+  Licences come from the lockfiles via osv-scanner and deps.dev, so no install is
+  needed. Default policy: network-copyleft and source-available licences (AGPL,
+  SSPL, BUSL...) high; strong copyleft (GPL...) and custom or missing licences
+  medium; `OR` expressions pass if any side is acceptable. `--license-allow`
+  replaces the policy with an allowlist. Runs osv-scanner in allowlist mode, the
+  only mode that lists every package (summary mode lists only vulnerable ones).
+- **`--sbom`**: CycloneDX SBOM of the source tree and of each `--image`.
 
 ## [0.10.0] — 2026-11-04
 
