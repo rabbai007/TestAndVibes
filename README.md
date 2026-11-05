@@ -493,8 +493,7 @@ cover the default scan only: the paid review pass runs only when you ask.
   | Assistant | Project | User (all projects) |
   |---|---|---|
   | Codex | `.agents/skills/` | `~/.agents/skills/` |
-  | Claude Code | `.claude/skills/` | `~/.claude/skills/` |
-  | Others that read Agent Skills | see the tool's docs | |
+  | Any other assistant that reads Agent Skills | see your tool's docs | see your tool's docs |
 
 Both forbid the assistant from making a scan pass by hiding findings (editing the
 baseline or ignore files, inline suppressions, skipping a pass) without your
