@@ -123,7 +123,7 @@ jobs:
 
       # Uploaded even when the gate fails, so findings reach the Security tab.
       - name: Upload SARIF to Code Scanning
-        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63   # v4
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63   # v4.38.0
         if: always()
         with:
           sarif_file: vibecheck-report/vibecheck.sarif
