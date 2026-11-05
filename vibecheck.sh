@@ -948,7 +948,15 @@ else
         [ -z "${id:-}" ] && continue
         case "$sev" in Critical) vs=critical;; High) vs=high;; Medium) vs=medium;; *) vs=low;; esac
         dep_row 4 "$vs" "$id" "${loc:-dependencies}" "$pkg" "known vulnerability" "$url" grype
-      done < <(jq -r '.matches[]? | [ (.vulnerability.severity//"Unknown"), (.vulnerability.id//""),
+      # grype's own --exclude globs do not reliably skip nested directories, so
+      # the exclude list is applied to its results instead: a match is dropped
+      # when its lockfile path contains an excluded directory as a whole
+      # component (target excludes app/target/x, not targets/x).
+      done < <(jq -r --argjson ex "$(printf '%s\n' "${EXCLUDES[@]}" | jq -R . | jq -s 'map(select(length > 0))')" '
+                 .matches[]? |
+                 select(("/" + ((.artifact.locations[0].path // "") | ltrimstr("/"))) as $pp
+                        | $ex | any(. as $e | $pp | contains("/" + $e + "/")) | not) |
+                 [ (.vulnerability.severity//"Unknown"), (.vulnerability.id//""),
                         (.artifact.name+"@"+(.artifact.version//"?")), (.vulnerability.dataSource//""),
                         ((.artifact.locations[0].path // "dependencies") | ltrimstr("/")) ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$gr" 2>/dev/null)
       DEP_SRC_OK="$DEP_SRC_OK grype"

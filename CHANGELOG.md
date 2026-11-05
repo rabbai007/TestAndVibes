@@ -7,7 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **grype ignored the exclude list.** Its `--exclude` globs do not reliably skip
+  nested directories, so CVEs in `node_modules/`, `vendor/`, `target/`... were
+  reported through grype even when every other scanner excluded them. The exclude
+  list is now applied to grype's results, by whole path component. All dependency
+  sources now honour excludes the same way.
 
 ## [0.11.0] — 2026-11-05
 

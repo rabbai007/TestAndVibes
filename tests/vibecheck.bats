@@ -1152,3 +1152,25 @@ SH
   grep -qx "$APP/requirements.txt" "$FAKE_OSV_ARGS"
   ! grep -q "node_modules" "$FAKE_OSV_ARGS"
 }
+
+@test "deps: grype results inside an excluded directory are dropped, at any depth (regression)" {
+  kev_setup
+  printf '{"Results":[{"Target":"requirements.txt","Vulnerabilities":[]}]}' > "$FAKE_TRIVY_JSON"
+  cat > "$BIN/grype" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = version ] && { echo "Version: 0.0.0-fake"; exit 0; }
+out=""; while [ $# -gt 0 ]; do [ "$1" = "--file" ] && out="$2"; shift; done
+cat > "$out" <<'JSON'
+{"matches":[
+ {"vulnerability":{"id":"CVE-2099-0011","severity":"High"},"artifact":{"name":"keep","version":"1","locations":[{"path":"/requirements.txt"}]}},
+ {"vulnerability":{"id":"CVE-2099-0012","severity":"High"},"artifact":{"name":"nested","version":"1","locations":[{"path":"/packages/a/node_modules/x/package-lock.json"}]}},
+ {"vulnerability":{"id":"CVE-2099-0013","severity":"High"},"artifact":{"name":"lookalike","version":"1","locations":[{"path":"/targets/requirements.txt"}]}}]}
+JSON
+SH
+  chmod +x "$BIN/grype"
+  kev_run "${DEPS_ONLY[@]}" --no-kev --no-epss
+  local f="$OUT/findings.json"
+  [ "$(jq -r '[.active[] | select(.rule=="CVE-2099-0011")] | length' "$f")" -eq 1 ]
+  [ "$(jq -r '[.active[] | select(.rule=="CVE-2099-0012")] | length' "$f")" -eq 0 ]   # node_modules, nested
+  [ "$(jq -r '[.active[] | select(.rule=="CVE-2099-0013")] | length' "$f")" -eq 1 ]   # "targets" is not "target"
+}
