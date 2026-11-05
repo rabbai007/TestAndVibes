@@ -1125,3 +1125,13 @@ SH
   [ "$status" -eq 3 ]
   [[ "$output" == *"stopped responding during the scan"* ]] || false
 }
+
+@test "a scan root whose own name is a default exclude (build/, target/...) is still scanned (regression)" {
+  local R="$BATS_TEST_TMPDIR/target"; mkdir -p "$R/.github/workflows"
+  printf 'on: push\njobs: {}\n' > "$R/.github/workflows/ci.yml"
+  zizmor_setup                                   # provides the fake zizmor
+  FAKE_ZZ_MODE=clean kev_run --dir "$R" --out "$OUT" --no-baseline --no-pdf --no-review \
+     --skip-secrets --skip-sast --skip-deps --skip-iac --ci-audit
+  [ "$status" -eq 0 ]
+  [[ "$(jq -r '.coverage.passes[] | select(.pass=="ci") | .detail' "$OUT/findings.json")" == "0 issues in 1 file(s)"* ]] || false
+}

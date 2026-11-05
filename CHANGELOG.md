@@ -70,6 +70,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Catches the regression the fail-closed tests cannot: a scanner or ruleset change
   that silently stops finding a class of bug. A pass that does not complete fails it.
 
+### Fixed
+
+- **Scanning a directory whose own name is a default exclude found nothing.**
+  `find` applied the exclude list (`node_modules dist build vendor .git coverage
+  .venv target`) to the scan root itself, so `--dir build/` or a checkout in
+  `target/` pruned the whole tree: no lockfile, IaC file or workflow was found, and
+  IaC/CI reported "no files" instead of scanning. Found by the new detection
+  benchmark on its first run.
+
 ## [0.10.0] — 2026-11-04
 
 Adds the **CISA Known Exploited Vulnerabilities** check, and fixes a fail-open in the

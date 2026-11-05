@@ -69,9 +69,11 @@ jobs:
           git clone -q --depth 1 --branch "$JUICE_SHOP_REF" https://github.com/juice-shop/juice-shop.git target
           # Juice Shop commits no lockfile; VibeCheck rightly refuses to call an
           # unlocked tree scanned. --package-lock-only installs nothing and
-          # --ignore-scripts runs no package code.
+          # --ignore-scripts runs no package code. Its .npmrc sets
+          # package-lock=false, so that has to be overridden explicitly.
           for d in target target/frontend; do
-            (cd "$d" && npm i --package-lock-only --ignore-scripts --no-audit --no-fund --legacy-peer-deps)
+            (cd "$d" && npm i --package-lock-only --package-lock=true --ignore-scripts --no-audit --no-fund --legacy-peer-deps)
+            test -s "$d/package-lock.json"
           done
           docker run -d --name juice -p 3000:3000 "$JUICE_SHOP_IMAGE"
           for _ in $(seq 60); do curl -sf -o /dev/null http://localhost:3000/ && break; sleep 2; done

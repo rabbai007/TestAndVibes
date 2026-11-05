@@ -585,7 +585,10 @@ PRUNE=(); for e in "${EXCLUDES[@]}"; do PRUNE+=(-name "$e" -prune -o); done
 # implicit -a, so `-type f -name a -o -name b -print` attaches -print to the last
 # term only: with several -o alternatives, every branch but the last silently
 # printed nothing. That quietly broke *.csproj, *.gradle and *.yaml detection.
-findx() { find "$TARGET" "${PRUNE[@]}" -type f \( "$@" \) -print 2>/dev/null; }
+# -mindepth 1: the exclude names must never match the scan ROOT. Without it,
+# scanning a directory that is itself called build/, dist/, target/, vendor/...
+# pruned the whole tree: no lockfile, IaC or workflow was ever found.
+findx() { find "$TARGET" -mindepth 1 "${PRUNE[@]}" -type f \( "$@" \) -print 2>/dev/null; }
 
 [ -n "$(findx -name '*.tf' | head -1)" ]        && { STACK="$STACK terraform"; ok "terraform (*.tf, recursive)"; }
 [ -n "$(findx -name '*.csproj' -o -name '*.fsproj' | head -1)" ] && { STACK="$STACK dotnet"; ok "dotnet (*.csproj)"; }
@@ -1409,7 +1412,7 @@ fi
 # over-broad GITHUB_TOKEN: none of these is visible to SAST on the app code.
 # zizmor is new in 0.11, so by default a missing zizmor warns and is recorded
 # as NOT checked rather than turning an upgrade red; --ci-audit makes it an ERROR.
-CI_FILES="$(find "$TARGET" "${PRUNE[@]}" \( -path '*/.github/workflows/*.yml' -o -path '*/.github/workflows/*.yaml' \
+CI_FILES="$(find "$TARGET" -mindepth 1 "${PRUNE[@]}" \( -path '*/.github/workflows/*.yml' -o -path '*/.github/workflows/*.yaml' \
              -o -name 'action.yml' -o -name 'action.yaml' \) -type f -print 2>/dev/null | head -200)"
 if [ "$DO_CI" = 0 ]; then
   set_status ci skipped "disabled by --no-ci-audit"
