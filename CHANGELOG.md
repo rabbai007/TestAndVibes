@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 _Nothing yet._
 
+## [0.12.0] — 2026-11-06
+
+Findings are now filed against the controls an auditor asks about (CWE, OWASP
+Top 10, ASVS), and every dependency source honours the exclude list.
+
+### Added
+
+- **Compliance mapping.** Every finding carries `taxonomy` (`cwe`, `owasp`,
+  `asvs`) in `findings.json`: CWE from the scanner's own metadata where it gives
+  one (semgrep, ZAP, nuclei, testssl.sh), else VibeCheck's mapping for its own
+  checks; OWASP Top 10 from semgrep's labels plus the 2021 category derived from the
+  CWE, normalised to one label per category; ASVS 4.0.3 only where a check maps to
+  one requirement. Unknown stays empty. `report.md` gains a CWE column and a
+  per-OWASP-category table; SARIF rules gain `external/cwe/cwe-N` tags for GitHub
+  Code Scanning. A mapping failure warns and keeps the findings.
+
+### Fixed
+
+- **grype ignored the exclude list.** Its `--exclude` globs do not reliably skip
+  nested directories, so CVEs in `node_modules/`, `vendor/`, `target/`... were
+  reported through grype even when every other scanner excluded them. The exclude
+  list is now applied to grype's results, by whole path component. All dependency
+  sources now honour excludes the same way.
+
 ## [0.11.0] — 2026-11-05
 
 Closes most of the gap between an automated scan and the automated half of a
@@ -836,7 +860,8 @@ consolidated report plus a CI-friendly exit code.
 - Complementary to [benavlabs/vibe-check](https://github.com/benavlabs/vibe-check)
   (a checklist + AI-rules approach); VibeCheck adds the executable automation layer.
 
-[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.0...v0.10.0
 [0.2.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.1.0...v0.2.0

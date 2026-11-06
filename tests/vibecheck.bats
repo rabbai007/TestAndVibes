@@ -1152,3 +1152,72 @@ SH
   grep -qx "$APP/requirements.txt" "$FAKE_OSV_ARGS"
   ! grep -q "node_modules" "$FAKE_OSV_ARGS"
 }
+
+@test "deps: grype results inside an excluded directory are dropped, at any depth (regression)" {
+  kev_setup
+  printf '{"Results":[{"Target":"requirements.txt","Vulnerabilities":[]}]}' > "$FAKE_TRIVY_JSON"
+  cat > "$BIN/grype" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = version ] && { echo "Version: 0.0.0-fake"; exit 0; }
+out=""; while [ $# -gt 0 ]; do [ "$1" = "--file" ] && out="$2"; shift; done
+cat > "$out" <<'JSON'
+{"matches":[
+ {"vulnerability":{"id":"CVE-2099-0011","severity":"High"},"artifact":{"name":"keep","version":"1","locations":[{"path":"/requirements.txt"}]}},
+ {"vulnerability":{"id":"CVE-2099-0012","severity":"High"},"artifact":{"name":"nested","version":"1","locations":[{"path":"/packages/a/node_modules/x/package-lock.json"}]}},
+ {"vulnerability":{"id":"CVE-2099-0013","severity":"High"},"artifact":{"name":"lookalike","version":"1","locations":[{"path":"/targets/requirements.txt"}]}}]}
+JSON
+SH
+  chmod +x "$BIN/grype"
+  kev_run "${DEPS_ONLY[@]}" --no-kev --no-epss
+  local f="$OUT/findings.json"
+  [ "$(jq -r '[.active[] | select(.rule=="CVE-2099-0011")] | length' "$f")" -eq 1 ]
+  [ "$(jq -r '[.active[] | select(.rule=="CVE-2099-0012")] | length' "$f")" -eq 0 ]   # node_modules, nested
+  [ "$(jq -r '[.active[] | select(.rule=="CVE-2099-0013")] | length' "$f")" -eq 1 ]   # "targets" is not "target"
+}
+
+# ── compliance mapping: CWE / OWASP Top 10 / ASVS ──────────────────────────
+
+@test "taxonomy: scanner CWE/OWASP metadata is carried, OWASP 2021 is normalised, and SARIF gets CWE tags" {
+  cat > "$BIN/semgrep" <<'SH'
+#!/usr/bin/env bash
+[ "$1" = "--version" ] && { echo "1.0.0"; exit 0; }
+out=""; for a in "$@"; do case "$a" in --output=*) out="${a#--output=}";; esac; done
+cat > "$out" <<JSON
+{"results":[{"check_id":"js.sqli","path":"$FAKE_APP/server.js","start":{"line":1},
+  "extra":{"severity":"ERROR","message":"SQL injection","metadata":{"cwe":["CWE-89: SQL Injection"],
+  "owasp":["A03:2021 - Injection","A03:2021 Injection","A05:2025 - Injection"]}}}],"errors":[]}
+JSON
+SH
+  chmod +x "$BIN/semgrep"; export FAKE_APP="$APP"
+  kev_run --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --skip-secrets --skip-deps --skip-iac --no-ci-audit
+  local t; t="$(jq -c '.active[] | select(.rule=="js.sqli") | .taxonomy' "$OUT/findings.json")"
+  [ "$(jq -r '.cwe | join(",")' <<<"$t")" = "CWE-89" ]
+  [ "$(jq -r '[.owasp[] | select(startswith("A03:2021"))] | length' <<<"$t")" -eq 1 ]     # two spellings, one label
+  [ "$(jq -r '[.owasp[] | select(startswith("A05:2025"))] | length' <<<"$t")" -eq 1 ]     # other years kept
+  jq -e '[.runs[0].tool.driver.rules[].properties.tags[]] | index("external/cwe/cwe-89")' "$OUT/vibecheck.sarif" >/dev/null
+  grep -q '| A03:2021 - Injection | 1 |' "$OUT/report.md"
+}
+
+@test "taxonomy: VibeCheck's own checks are mapped (dependency CVE, secret); a licence finding is left unmapped" {
+  kev_setup
+  kev_run "${DEPS_ONLY[@]}" --no-kev --no-epss
+  [ "$(jq -c '.active[] | select(.rule=="CVE-2099-0001") | .taxonomy' "$OUT/findings.json")" = \
+    '{"cwe":["CWE-1395"],"owasp":["A06:2021 - Vulnerable and Outdated Components"],"asvs":["V14.2.1"]}' ]
+  lic_setup
+  kev_run "${LIC_ONLY[@]}" --licenses
+  [ "$(jq -r '[.active[] | select(.tool=="license") | has("taxonomy")] | any' "$OUT/findings.json")" = "false" ]
+}
+
+@test "taxonomy: dynamic cookie findings map each missing flag to its own CWE and ASVS requirement" {
+  dast_setup
+  cat > "$BIN/curl" <<'SH'
+#!/usr/bin/env bash
+hdr=""; while [ $# -gt 0 ]; do [ "$1" = "-D" ] && hdr="$2"; shift; done
+[ -n "$hdr" ] && printf 'HTTP/1.1 200 OK\r\nstrict-transport-security: max-age=31536000\r\ncontent-security-policy: x\r\nx-content-type-options: nosniff\r\nreferrer-policy: no-referrer\r\npermissions-policy: a=()\r\nx-frame-options: DENY\r\nset-cookie: sessionid=abc; Secure\r\n\r\n' > "$hdr"
+exit 0
+SH
+  chmod +x "$BIN/curl"
+  kev_run --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --skip-secrets --skip-sast --skip-deps --skip-iac --url https://app.test/
+  [ "$(jq -c '.active[] | select(.rule=="cookie-flags.sessionid") | .taxonomy | {cwe, asvs}' "$OUT/findings.json")" = \
+    '{"cwe":["CWE-1004","CWE-1275"],"asvs":["V3.4.2","V3.4.3"]}' ]
+}

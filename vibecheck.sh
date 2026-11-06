@@ -21,7 +21,7 @@
 # unless you explicitly skip that pass (see --skip-* / vibecheck.yml).
 set -uo pipefail
 
-VERSION="0.11.0"
+VERSION="0.12.0"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RULESET_EXTRA=0
 TOOL_URL="https://github.com/rabbai007/TestAndVibes"
@@ -948,7 +948,15 @@ else
         [ -z "${id:-}" ] && continue
         case "$sev" in Critical) vs=critical;; High) vs=high;; Medium) vs=medium;; *) vs=low;; esac
         dep_row 4 "$vs" "$id" "${loc:-dependencies}" "$pkg" "known vulnerability" "$url" grype
-      done < <(jq -r '.matches[]? | [ (.vulnerability.severity//"Unknown"), (.vulnerability.id//""),
+      # grype's own --exclude globs do not reliably skip nested directories, so
+      # the exclude list is applied to its results instead: a match is dropped
+      # when its lockfile path contains an excluded directory as a whole
+      # component (target excludes app/target/x, not targets/x).
+      done < <(jq -r --argjson ex "$(printf '%s\n' "${EXCLUDES[@]}" | jq -R . | jq -s 'map(select(length > 0))')" '
+                 .matches[]? |
+                 select(("/" + ((.artifact.locations[0].path // "") | ltrimstr("/"))) as $pp
+                        | $ex | any(. as $e | $pp | contains("/" + $e + "/")) | not) |
+                 [ (.vulnerability.severity//"Unknown"), (.vulnerability.id//""),
                         (.artifact.name+"@"+(.artifact.version//"?")), (.vulnerability.dataSource//""),
                         ((.artifact.locations[0].path // "dependencies") | ltrimstr("/")) ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$gr" 2>/dev/null)
       DEP_SRC_OK="$DEP_SRC_OK grype"
@@ -2377,6 +2385,93 @@ fi
 
 
 # ═══════════════════════════════════════════════════════════════════
+# compliance mapping: CWE / OWASP Top 10 / ASVS on every finding
+# ═══════════════════════════════════════════════════════════════════
+# Auditors map findings to controls. Each finding gets a `taxonomy` object:
+#   cwe    collected from the scanner where it says (semgrep, ZAP, nuclei,
+#          testssl.sh), else VibeCheck's own mapping for its own checks
+#   owasp  semgrep's own labels (any year) + OWASP Top 10 2021 derived from
+#          the CWE through the official 2021 category lists (CWE-1395 for
+#          vulnerable components is set to A06 directly: it postdates them)
+#   asvs   OWASP ASVS 4.0.3 requirement, only where the check maps 1:1
+# Unknown stays empty; nothing is guessed. Runs before the baseline split, so
+# active, accepted, out_of_scope and SARIF all carry it. Fingerprints unchanged.
+TAX_LOOKUP="$OUTDIR/.taxonomy-lookup.json"
+{
+  [ -s "$OUTDIR/semgrep.json" ] && jq -c '.results[]? | {k: ("semgrep|" + .check_id),
+      cwe: ([(.extra.metadata.cwe // []) | if type=="array" then .[] else . end | tostring | scan("CWE-[0-9]+")] | unique),
+      owasp: ([(.extra.metadata.owasp // []) | if type=="array" then .[] else . end | tostring] | unique)}' "$OUTDIR/semgrep.json" 2>/dev/null
+  [ -s "$OUTDIR/zap.json" ] && jq -c '.site[]?.alerts[]? | select((.cweid // "-1") | tonumber? // -1 | . > 0)
+      | {k: ("dynamic|zap." + .pluginid), cwe: ["CWE-" + .cweid], owasp: []}' "$OUTDIR/zap.json" 2>/dev/null
+  [ -s "$OUTDIR/nuclei.jsonl" ] && jq -c '{k: ("dynamic|nuclei." + ."template-id"),
+      cwe: [(.info.classification."cwe-id" // []) | if type=="array" then .[] else . end | select(. != null) | ascii_upcase], owasp: []}' "$OUTDIR/nuclei.jsonl" 2>/dev/null
+  [ -s "$OUTDIR/testssl.json" ] && jq -c '.[]? | select(.cwe) | {k: ("dynamic|testssl." + .id), cwe: [.cwe | scan("CWE-[0-9]+")], owasp: []}' "$OUTDIR/testssl.json" 2>/dev/null
+  true   # under pipefail, a false [ -s ] above would fail the pipe and discard the lookup
+} | jq -s 'group_by(.k) | map({key: .[0].k, value: {cwe: (map(.cwe[]) | unique), owasp: (map(.owasp[]) | unique)}}) | from_entries' > "$TAX_LOOKUP" 2>/dev/null \
+  || echo '{}' > "$TAX_LOOKUP"
+TAX_TMP="$OUTDIR/.findings.tax.jsonl"
+if jq -c --slurpfile lk "$TAX_LOOKUP" '
+  def t21: {
+    "A01:2021 - Broken Access Control": ["CWE-22","CWE-23","CWE-35","CWE-59","CWE-200","CWE-284","CWE-285","CWE-352","CWE-538","CWE-548","CWE-552","CWE-601","CWE-639","CWE-862","CWE-863"],
+    "A02:2021 - Cryptographic Failures": ["CWE-295","CWE-310","CWE-311","CWE-319","CWE-326","CWE-327","CWE-328","CWE-916"],
+    "A03:2021 - Injection": ["CWE-20","CWE-74","CWE-77","CWE-78","CWE-79","CWE-89","CWE-94","CWE-116","CWE-917","CWE-943","CWE-1236"],
+    "A04:2021 - Insecure Design": ["CWE-209","CWE-256","CWE-501","CWE-522","CWE-1021"],
+    "A05:2021 - Security Misconfiguration": ["CWE-2","CWE-11","CWE-13","CWE-16","CWE-611","CWE-614","CWE-1004"],
+    "A06:2021 - Vulnerable and Outdated Components": ["CWE-937","CWE-1035","CWE-1104"],
+    "A07:2021 - Identification and Authentication Failures": ["CWE-259","CWE-287","CWE-297","CWE-307","CWE-384","CWE-521","CWE-613","CWE-798"],
+    "A08:2021 - Software and Data Integrity Failures": ["CWE-345","CWE-353","CWE-494","CWE-502","CWE-565","CWE-784","CWE-829","CWE-915"],
+    "A09:2021 - Security Logging and Monitoring Failures": ["CWE-117","CWE-223","CWE-532","CWE-778"],
+    "A10:2021 - Server-Side Request Forgery (SSRF)": ["CWE-918"] };
+  def own:
+    if .tool == "deps" or (.tool == "image" and (.rule | startswith("image") | not)) then
+      {cwe: ["CWE-1395"], owasp: ["A06:2021 - Vulnerable and Outdated Components"], asvs: ["V14.2.1"]}
+    elif .rule == "image.eol-os" then {cwe: ["CWE-1104"], asvs: ["V14.2.1"]}
+    elif (.tool | IN("trufflehog","gitleaks")) or (.rule | startswith("image-secret.")) then {cwe: ["CWE-798"], asvs: ["V2.10.4"]}
+    elif .tool == "trivy-config" then {cwe: ["CWE-16"]}
+    elif .tool == "zizmor" then
+      if .rule == "zizmor.template-injection" then {cwe: ["CWE-94"]}
+      elif (.rule | test("unpinned|ref-version|impostor|known-vulnerable|ref-confusion")) then {cwe: ["CWE-829"]}
+      else {owasp: ["A08:2021 - Software and Data Integrity Failures"]} end
+    elif .tool == "dynamic" then
+      if (.rule | IN("missing-hsts","hsts-short-max-age")) then {cwe: ["CWE-319"], asvs: ["V14.4.5"]}
+      elif (.rule | IN("missing-csp","csp-report-only")) then {cwe: ["CWE-693"], asvs: ["V14.4.3"]}
+      elif .rule == "missing-nosniff" then {cwe: ["CWE-693"], asvs: ["V14.4.4"]}
+      elif .rule == "missing-referrer-policy" then {cwe: ["CWE-200"], asvs: ["V14.4.6"]}
+      elif .rule == "missing-permissions-policy" then {cwe: ["CWE-693"]}
+      elif .rule == "missing-frame-protection" then {cwe: ["CWE-1021"], asvs: ["V14.4.7"]}
+      elif (.rule | startswith("cors-")) then {cwe: ["CWE-942"], asvs: ["V14.5.3"]}
+      elif (.rule | startswith("cookie-flags.")) then
+        (.title) as $t |
+        { cwe:  ([ (if ($t | test("Secure")) then "CWE-614" else empty end),
+                   (if ($t | test("HttpOnly")) then "CWE-1004" else empty end),
+                   (if ($t | test("SameSite")) then "CWE-1275" else empty end) ]),
+          asvs: ([ (if ($t | test("Secure")) then "V3.4.1" else empty end),
+                   (if ($t | test("HttpOnly")) then "V3.4.2" else empty end),
+                   (if ($t | test("SameSite")) then "V3.4.3" else empty end) ]) }
+      elif .rule == "server-banner" then {cwe: ["CWE-200"], asvs: ["V14.3.3"]}
+      elif .rule == "tls-legacy-protocol" then {cwe: ["CWE-327"], asvs: ["V9.1.3"]}
+      elif .rule == "no-tls" then {cwe: ["CWE-319"], asvs: ["V9.1.1"]}
+      else {} end
+    else {} end;
+  ($lk[0][.tool + "|" + .rule] // {}) as $s | own as $o |
+  ((($s.cwe // []) + ($o.cwe // [])) | unique) as $cwe |
+  ([t21 | to_entries[] | select(.value as $v | $cwe | any(. as $c | $v | index($c))) | .key]) as $derived |
+  # One label per category: 2021 labels take the official name (rule packs
+  # spell them differently); other years keep the first spelling seen.
+  ((($s.owasp // []) + ($o.owasp // []) + $derived)
+    | map(. as $l | if test("^A[0-9]{2}:2021") then ((t21 | keys | map(select(startswith($l[0:8]))) | .[0]) // $l) else $l end)
+    | group_by(.[0:8]) | map(.[0])) as $ow |
+  (($o.asvs // []) | unique) as $as |
+  if ($cwe + $ow + $as | length) == 0 then . else . + {taxonomy: {cwe: $cwe, owasp: $ow, asvs: $as}} end
+' "$FINDINGS" > "$TAX_TMP" 2>"$OUTDIR/.taxonomy.err"; then
+  mv "$TAX_TMP" "$FINDINGS"
+else
+  # Annotation only: a mapping failure must not lose findings - warn, keep them.
+  warn "compliance mapping failed ($(head -c 120 "$OUTDIR/.taxonomy.err")) - findings kept without taxonomy"
+  rm -f "$TAX_TMP"
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # baseline: split findings into active (gated) and accepted (suppressed)
 # ═══════════════════════════════════════════════════════════════════
 ERRORS=$(jq -s '[.[]|select(.status=="error")]|length' "$STATUS")
@@ -2596,6 +2691,17 @@ jq -s '{active: ., accepted: $acc[0], out_of_scope: $oos[0],
   echo "| Low | $LOW |"
   echo
   if [ "$TOTAL" -gt 0 ]; then
+    # Auditor's view: gated findings per OWASP Top 10 2021 category. A finding
+    # can sit in more than one; "unmapped" is reported, not hidden.
+    echo "## Compliance mapping"
+    echo
+    echo "| OWASP Top 10 (2021) | Findings |"
+    echo "|---|---|"
+    jq -rs '[.[] | (.taxonomy.owasp // []) | map(select(test(":2021"))) | if length == 0 then ["(unmapped)"] else . end | .[]]
+            | group_by(.) | map({k: .[0], n: length}) | sort_by(.k == "(unmapped)", .k) | .[] | "| \(.k) | \(.n) |"' "$GATED"
+    echo
+    echo "_CWE per finding in the tables below; CWE, OWASP and ASVS 4.0.3 per finding in \`findings.json\` (\`taxonomy\`) and as SARIF tags._"
+    echo
     echo "## Findings"
     echo
     for s in critical high medium low; do
@@ -2603,10 +2709,10 @@ jq -s '{active: ., accepted: $acc[0], out_of_scope: $oos[0],
       [ "$n" -eq 0 ] && continue
       echo "### $(printf '%s' "$s" | tr '[:lower:]' '[:upper:]') ($n)"
       echo
-      echo "| Tool | Rule | Location | Detail |"
-      echo "|---|---|---|---|"
+      echo "| Tool | Rule | CWE | Location | Detail |"
+      echo "|---|---|---|---|---|"
       jq -rs --arg s "$s" '.[] | select(.severity==$s)
-        | "| \(.tool) | `\(.rule)` | \(if .file=="" then "—" else "`\(.file)\(if .line>0 then ":\(.line)" else "" end)`" end) | \(.title|gsub("\\|";"\\\\|")) \(if .help=="" then "" else "([ref](\(.help)))" end) |"' "$GATED"
+        | "| \(.tool) | `\(.rule)` | \((.taxonomy.cwe // []) | if length == 0 then "—" else join(", ") end) | \(if .file=="" then "—" else "`\(.file)\(if .line>0 then ":\(.line)" else "" end)`" end) | \(.title|gsub("\\|";"\\\\|")) \(if .help=="" then "" else "([ref](\(.help)))" end) |"' "$GATED"
       echo
     done
   fi
@@ -2677,7 +2783,11 @@ jq -s --arg ver "$VERSION" --arg uri "$TOOL_URL" '
                    shortDescription: { text: (.title[0:120]) },
                    defaultConfiguration: { level: (.severity|level) },
                    properties: ({ "security-severity": (.severity|secsev),
-                                  tags: ["security", .tool] })
+                                  # external/cwe/cwe-N is the tag GitHub Code
+                                  # Scanning reads to show and filter by CWE.
+                                  tags: (["security", .tool]
+                                         + ((.taxonomy.cwe // []) | map("external/cwe/" + ascii_downcase))
+                                         + ((.taxonomy.owasp // []) | map(select(test(":2021"))) | map("owasp-" + (.[0:3] | ascii_downcase)))) })
                  } + (if .help == "" then {} else { helpUri: .help } end))
                  | unique_by(.id) )
       }},
