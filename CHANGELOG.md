@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`--api-spec SPEC`: API testing from the OpenAPI spec** (pass 5c, opt-in), with
+  Schemathesis. Read-only by construction: only GET/HEAD/OPTIONS operations, no
+  undeclared-method probing, no stateful phase. Reports secured operations that
+  answer anonymous callers (high), server errors and accepted invalid input
+  (medium), and spec drift (low), each filed per operation with its CWE. An auth
+  header comes from `VIBECHECK_API_HEADER` and reaches Schemathesis only through its
+  environment, never argv, disk or the report. Deterministic (fixed seed). A crash,
+  an incomplete report, nothing testable or an errored operation is an ERROR.
+  Native `st` or a digest-pinned Docker image; `--install` adds it.
 
 ## [0.12.0] — 2026-11-06
 
