@@ -1875,9 +1875,12 @@ else
     D_URL="$URL"; D_NET=()
     if have st || have schemathesis; then
       st_bin="$(command -v st || command -v schemathesis)"; ap_tool="schemathesis"
+      # Run from the report's work dir: st writes a .schemathesis/ cache into
+      # the current directory, which must not land in the user's checkout.
       ap_spec="$API_SPEC"
-      "$st_bin" --config-file "$AP_DIR/schemathesis.toml" "${ap_run[@]}" --report-json-path "$AP_DIR/report.json" \
-        ${URL:+--url "$URL"} "$ap_spec" > "$AP_DIR/out.txt" 2>&1; ap_rc=$?
+      printf '%s' "$ap_spec" | grep -qE '^https?://' || ap_spec="$(cd "$(dirname "$ap_spec")" && pwd)/$(basename "$ap_spec")"
+      (cd "$AP_DIR" && "$st_bin" --config-file "$AP_DIR/schemathesis.toml" "${ap_run[@]}" --report-json-path "$AP_DIR/report.json" \
+        ${URL:+--url "$URL"} "$ap_spec") > "$AP_DIR/out.txt" 2>&1; ap_rc=$?
     elif dast_docker_ok; then
       ap_tool="schemathesis(docker)"
       case "$URL$API_SPEC" in
