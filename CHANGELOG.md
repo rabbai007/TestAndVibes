@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.12.0] — 2026-11-06
+
+Findings are now filed against the controls an auditor asks about (CWE, OWASP
+Top 10, ASVS), and every dependency source honours the exclude list.
+
 ### Added
 
 - **Compliance mapping.** Every finding carries `taxonomy` (`cwe`, `owasp`,
@@ -853,7 +860,8 @@ consolidated report plus a CI-friendly exit code.
 - Complementary to [benavlabs/vibe-check](https://github.com/benavlabs/vibe-check)
   (a checklist + AI-rules approach); VibeCheck adds the executable automation layer.
 
-[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.0...v0.10.0
 [0.2.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.1.0...v0.2.0
