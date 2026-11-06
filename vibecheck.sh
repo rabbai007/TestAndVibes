@@ -65,6 +65,9 @@ LICENSE_ALLOW=""        # comma list of SPDX ids; when set, any other licence is
 DO_SBOM=0               # opt-in: write a CycloneDX SBOM of the source tree (and of each --image)
 DO_CI=1                 # default ON when CI workflows exist: audit them with zizmor
 CI_EXPLICIT=0           # 1 = user passed --ci-audit (then a missing zizmor fails closed)
+API_SPEC=""             # opt-in (--api-spec SPEC): read-only Schemathesis run against --url
+API_EXAMPLES=25         # test cases per operation (--api-examples)
+DAST_IMG_SCHEMATHESIS="${VIBECHECK_IMG_SCHEMATHESIS:-schemathesis/schemathesis@sha256:ddf8b3c9e0b3ee7edfa65dad4d0c0e05c53fb5d92f99db379d40da01883474c7}"  # v4.33.1
 DO_DAST=0               # opt-in (--dast): testssl.sh + ZAP baseline + nuclei (safe templates) against --url
 # Pinned by digest: a moving tag would change what "clean" means without a commit.
 DAST_IMG_TESTSSL="${VIBECHECK_IMG_TESTSSL:-ghcr.io/testssl/testssl.sh@sha256:53766ec224a2d841b5516bc3923a8586379069ad01c65bbae9244aa24d72a18d}"  # 3.2.5
@@ -106,6 +109,15 @@ OPTIONS
   --dir PATH           Directory to scan (default: .)
   --url URL            Enable read-only dynamic checks against URL (implies --dynamic)
   --dynamic            Enable dynamic checks (requires --url)
+  --api-spec SPEC      API testing from an OpenAPI spec (file or URL) against
+                       --url, with Schemathesis. READ-ONLY: only GET, HEAD and
+                       OPTIONS operations are tested, and undeclared-method
+                       probing is off. Finds server errors, responses that break
+                       the spec, invalid input accepted, and secured endpoints
+                       that answer without authentication. For a secured API set
+                       VIBECHECK_API_HEADER to one header line ("Authorization:
+                       Bearer ..."); it is read from the environment only.
+  --api-examples N     Test cases per operation (default: 25)
   --dast               Deeper dynamic scan of --url (implies --dynamic), still
                        non-destructive: testssl.sh (ciphers, protocols, TLS
                        attacks), ZAP baseline (spider + passive rules, no attack
@@ -321,6 +333,8 @@ while [ $# -gt 0 ]; do
     --dir) TARGET="${2:?--dir needs a path}"; shift 2;;
     --url) URL="${2:?--url needs a URL}"; DYNAMIC=1; shift 2;;
     --dast) DO_DAST=1; DYNAMIC=1; shift;;
+    --api-spec) API_SPEC="${2:?--api-spec needs an OpenAPI file or URL}"; shift 2;;
+    --api-examples) API_EXAMPLES="${2:?--api-examples needs a number}"; shift 2;;
     --image) IMAGES+=("${2:?--image needs an image reference}"); shift 2;;
     --dynamic) DYNAMIC=1; shift;;
     --all) DYNAMIC=1; shift;;
@@ -395,8 +409,8 @@ if [ "$SELF_INSTALL" = 1 ]; then
     say "    osv-scanner: https://google.github.io/osv-scanner/installation/"
   fi
   # semgrep and zizmor ship as Python wheels; pipx avoids compiling from source.
-  if have pipx; then pipx install semgrep 2>/dev/null || true; pipx install zizmor 2>/dev/null || true
-  elif have pip3; then pip3 install --user semgrep zizmor 2>/dev/null || true
+  if have pipx; then for t in semgrep zizmor schemathesis; do pipx install "$t" 2>/dev/null || true; done
+  elif have pip3; then pip3 install --user semgrep zizmor schemathesis 2>/dev/null || true
   else say "    semgrep   : pipx install semgrep  (https://semgrep.dev)"
        say "    zizmor    : pipx install zizmor   (https://docs.zizmor.sh)"; fi
   ok "install pass complete (re-run without --install to scan)"
@@ -1816,6 +1830,112 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════
+# 5c. API testing from the OpenAPI spec (opt-in: --api-spec) - read-only
+# ═══════════════════════════════════════════════════════════════════
+# The spec is a contract; Schemathesis generates requests from it and checks
+# the API keeps it: no 5xx on odd input, responses that match their schema,
+# invalid input rejected, and secured operations refusing anonymous callers.
+# Read-only by construction: only GET/HEAD/OPTIONS operations are selected,
+# the coverage phase's undeclared-method probing is switched off, and the
+# stateful phase and the checks that need it (which create and delete
+# resources) are excluded. An auth header comes from the environment and
+# reaches Schemathesis through ${VAR} interpolation in its config file, so the
+# secret is never in argv, on disk, or in a report.
+if [ -z "$API_SPEC" ]; then
+  set_status api skipped "not requested (--api-spec)"
+else
+  head2 "5c. API testing from the spec (Schemathesis, read-only)"
+  say "  ${C_D}only test APIs you own or are authorised to test${C_0}"
+  api_hdr="${VIBECHECK_API_HEADER:-}"; api_hname=""
+  [ -n "$api_hdr" ] && api_hname="${api_hdr%%:*}"
+  case "$API_EXAMPLES" in ''|*[!0-9]*) API_EXAMPLES=x;; esac
+  if [ -z "$URL" ] && ! printf '%s' "$API_SPEC" | grep -qE '^https?://'; then
+    pass_error api "--api-spec FILE needs --url (the API base URL)"
+  elif [ "$API_EXAMPLES" = x ] || [ "$API_EXAMPLES" -lt 1 ]; then
+    pass_error api "--api-examples must be a positive number"
+  elif [ -n "$api_hdr" ] && { [ "$api_hname" = "$api_hdr" ] || ! printf '%s' "$api_hname" | grep -qE '^[A-Za-z0-9-]+$'; }; then
+    pass_error api "VIBECHECK_API_HEADER must be one header line, \"Name: value\" - API NOT tested"
+  elif ! printf '%s' "$API_SPEC" | grep -qE '^https?://' && [ ! -f "$API_SPEC" ]; then
+    pass_error api "--api-spec file not found: $API_SPEC"
+  else
+    AP_DIR="$OUTDIR/.api"; rm -rf "$AP_DIR"; mkdir -p "$AP_DIR"
+    {
+      [ -n "$api_hname" ] && printf 'headers = { "%s" = "${VC_API_HDR_VALUE}" }\n' "$api_hname"
+      printf '[phases.coverage]\nunexpected-methods = []\n'
+    } > "$AP_DIR/schemathesis.toml"
+    export VC_API_HDR_VALUE="${api_hdr#*:}"; VC_API_HDR_VALUE="${VC_API_HDR_VALUE# }"
+    ap_run=(run --include-method-regex '^(GET|HEAD|OPTIONS)$'
+            --exclude-checks "unsupported_method,use_after_free,ensure_resource_availability,object_level_authorization"
+            --phases "examples,coverage,fuzzing" -n "$API_EXAMPLES" --rate-limit 20/s -w 2
+            --request-timeout 10 --no-color --report json
+            # Same spec + same API = same findings: a gate that flaps between
+            # identical runs gets ignored.
+            --generation-deterministic --seed 1)
+    # Same localhost mapping as --dast when the run happens in a container.
+    D_URL="$URL"; D_NET=()
+    if have st || have schemathesis; then
+      st_bin="$(command -v st || command -v schemathesis)"; ap_tool="schemathesis"
+      ap_spec="$API_SPEC"
+      "$st_bin" --config-file "$AP_DIR/schemathesis.toml" "${ap_run[@]}" --report-json-path "$AP_DIR/report.json" \
+        ${URL:+--url "$URL"} "$ap_spec" > "$AP_DIR/out.txt" 2>&1; ap_rc=$?
+    elif dast_docker_ok; then
+      ap_tool="schemathesis(docker)"
+      case "$URL$API_SPEC" in
+        *://localhost*|*://127.0.0.1*|*://\[::1\]*)
+          if [ "$(uname -s)" = Darwin ]; then
+            D_URL="$(printf '%s' "$URL" | sed -E 's#://(localhost|127\.0\.0\.1|\[::1\])#://host.docker.internal#')"
+          else D_NET=(--network host); fi;;
+      esac
+      if printf '%s' "$API_SPEC" | grep -qE '^https?://'; then
+        ap_spec="$(printf '%s' "$API_SPEC" | { if [ "$(uname -s)" = Darwin ]; then sed -E 's#://(localhost|127\.0\.0\.1|\[::1\])#://host.docker.internal#'; else cat; fi; })"; ap_mount=()
+      else
+        cp "$API_SPEC" "$AP_DIR/spec.${API_SPEC##*.}"; ap_spec="/work/spec.${API_SPEC##*.}"; ap_mount=()
+      fi
+      chmod 777 "$AP_DIR" 2>/dev/null
+      # -e NAME without a value copies it from our environment: not in argv.
+      docker run --rm "${D_NET[@]+"${D_NET[@]}"}" -e VC_API_HDR_VALUE -v "$AP_DIR:/work" "${ap_mount[@]+"${ap_mount[@]}"}" \
+        "$DAST_IMG_SCHEMATHESIS" --config-file /work/schemathesis.toml "${ap_run[@]}" --report-json-path /work/report.json \
+        ${URL:+--url "$D_URL"} "$ap_spec" > "$AP_DIR/out.txt" 2>&1; ap_rc=$?
+    else
+      ap_rc=127; ap_tool="none"; echo "Schemathesis (st) not installed and Docker unavailable" > "$AP_DIR/out.txt"
+    fi
+    unset VC_API_HDR_VALUE
+    aj="$AP_DIR/report.json"
+    # st exits 0 (no failures) or 1 (failures); anything else, or a report that
+    # is missing or incomplete, means the API was not (fully) tested.
+    if { [ "$ap_rc" != 0 ] && [ "$ap_rc" != 1 ]; } || ! jq -e '.complete == true and (.operations | type == "object")' "$aj" >/dev/null 2>&1; then
+      pass_error api "Schemathesis exited $ap_rc without a complete report - API NOT tested: $(grep -m2 -iE 'error|fail|unable|invalid' "$AP_DIR/out.txt" | tr '\n' ' ' | head -c 220)"
+    elif [ "$(jq '.operations.tested' "$aj")" -eq 0 ]; then
+      pass_error api "no GET/HEAD/OPTIONS operation could be tested ($(jq -r '.operations | "\(.total) in spec, \(.selected) selected"' "$aj")) - API NOT tested"
+    elif [ "$(jq '.operations.errored' "$aj")" -gt 0 ]; then
+      pass_error api "$(jq -r '.operations.errored' "$aj") operation(s) errored and were NOT tested: $(jq -r '[.errors[]? | (.title // .message // tostring)] | .[0:2] | join("; ")' "$aj" | head -c 200)"
+    else
+      ap_n=0
+      while IFS=$'\x1f' read -r code title opn; do
+        [ -z "${code:-}" ] && continue
+        # Severity by what the failure means for security, not test severity:
+        # an unauthenticated secured endpoint gates; a 5xx or accepted invalid
+        # input is a robustness/validation issue; spec drift is low.
+        case "$code" in
+          ST401) vs=high;;
+          ST101|ST201|ST202|ST203) vs=medium;;
+          *) vs=low;;
+        esac
+        meth="${opn%% *}"; pth="${opn#* }"
+        ap_n=$((ap_n+1))
+        add_finding api "$vs" "schemathesis.$code" "${URL%/}$pth" 0 "$title: $meth $pth" "https://schemathesis.readthedocs.io/" "$ap_tool"
+      done < <(jq -r '.failures[]? | .code as $c | .title as $t | .operations[]
+                      | [ $c, $t, . ] | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$aj" | sort -u)
+      ap_ops="$(jq -r '.operations | "\(.tested) of \(.total) operation(s) tested (\(.total - .selected) non-read operation(s) not sent)"' "$aj")"
+      say "  ${C_D}$ap_ops; $(jq -r '.test_cases | "\(.total // .generated // "?") test case(s)"' "$aj" 2>/dev/null)${C_0}"
+      [ -n "$api_hname" ] && say "  ${C_D}auth: $api_hname header supplied (value not logged)${C_0}"
+      if [ "$ap_n" -gt 0 ]; then warn "API: $ap_n finding(s)"; set_status api findings "$ap_n finding(s); $ap_ops"
+      else ok "API: 0 findings; $ap_ops"; set_status api ok "0 findings; $ap_ops"; fi
+    fi
+  fi
+fi
+
+# ═══════════════════════════════════════════════════════════════════
 # 6. adversarial review (opt-in, report-only by default)
 # ═══════════════════════════════════════════════════════════════════
 # Everything above matches patterns. This pass reasons: it is given the code and
@@ -2428,6 +2548,11 @@ if jq -c --slurpfile lk "$TAX_LOOKUP" '
     elif .rule == "image.eol-os" then {cwe: ["CWE-1104"], asvs: ["V14.2.1"]}
     elif (.tool | IN("trufflehog","gitleaks")) or (.rule | startswith("image-secret.")) then {cwe: ["CWE-798"], asvs: ["V2.10.4"]}
     elif .tool == "trivy-config" then {cwe: ["CWE-16"]}
+    elif .tool == "api" then
+      if .rule == "schemathesis.ST401" then {cwe: ["CWE-306"]}
+      elif (.rule | IN("schemathesis.ST201","schemathesis.ST202","schemathesis.ST203")) then {cwe: ["CWE-20"]}
+      elif .rule == "schemathesis.ST101" then {cwe: ["CWE-755"]}
+      else {} end
     elif .tool == "zizmor" then
       if .rule == "zizmor.template-injection" then {cwe: ["CWE-94"]}
       elif (.rule | test("unpinned|ref-version|impostor|known-vulnerable|ref-confusion")) then {cwe: ["CWE-829"]}
@@ -2596,9 +2721,9 @@ if [ -n "$DIFF_REF" ]; then
     # file in the diff (their .file is a URL or command), so they always stay in
     # scope - otherwise --diff would silently never gate on them.
     jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
-      'select(.tool=="dynamic" or .tool=="mcp" or .tool=="image" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
+      'select(.tool=="dynamic" or .tool=="mcp" or .tool=="image" or .tool=="api" or (.file as $f | $ch[0] | index($f)) != null)' "$ACTIVE" > "$OUTDIR/.inscope.jsonl"
     jq -c --slurpfile ch <(jq -R -s 'split("\n")|map(select(length>0))' "$CHANGED") \
-      'select(.tool!="dynamic" and .tool!="mcp" and .tool!="image" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
+      'select(.tool!="dynamic" and .tool!="mcp" and .tool!="image" and .tool!="api" and (.file as $f | $ch[0] | index($f)) == null)' "$ACTIVE" > "$OUTSCOPE"
     DIFF_N=$(jq -s 'length' "$OUTSCOPE")
     mv "$OUTDIR/.inscope.jsonl" "$ACTIVE"
     [ "$DIFF_N" -gt 0 ] && warn "$DIFF_N pre-existing finding(s) outside the diff — reported, not gated" \
@@ -2613,7 +2738,7 @@ fi
 # A3: "no pass examined anything" is not a clean result. Disabling every scanner
 # — by flag or by config — used to yield 0 findings and exit 0, which is
 # indistinguishable from a repo with nothing wrong. An empty scan is unknown.
-EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","license","iac","ci","dynamic","dast","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
+EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","license","iac","ci","dynamic","dast","api","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
 if [ "${EXECUTED:-0}" -eq 0 ]; then
   pass_error coverage "no scan pass examined anything (all were skipped, disabled, or failed) — this result is unknown, not clean"
 fi
