@@ -39,7 +39,7 @@ env:
 
 jobs:
   benchmark:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04   # pinned: a new Ubuntu is a deliberate change, not a surprise
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
@@ -85,11 +85,20 @@ jobs:
       # --fail-on never: this job asks "was it detected", not "is it clean"
       # (Juice Shop is meant to fail). Exit 3 is still a failure: a pass that
       # did not complete makes its checks meaningless (check.sh reports it).
-      - name: Scan (source + running app)
+      # Logged in, as a throwaway user registered for this run: the session
+      # checks (expected.json, pass "auth") only fire if the login was verified.
+      - name: Scan (source + running app, logged in)
         run: |
+          email="benchmark-$(date +%s)@example.test"; pw="$(openssl rand -hex 12)Aa1!"
+          curl -sf -o /dev/null -H 'Content-Type: application/json' \
+            -d "{\"email\":\"$email\",\"password\":\"$pw\",\"passwordRepeat\":\"$pw\",\"securityQuestion\":{\"id\":1},\"securityAnswer\":\"x\"}" \
+            http://localhost:3000/api/Users
+          token="$(curl -sf -H 'Content-Type: application/json' -d "{\"email\":\"$email\",\"password\":\"$pw\"}" \
+            http://localhost:3000/rest/user/login | jq -r '.authentication.token // empty')"
+          test -n "$token"; echo "::add-mask::$token"
           rc=0
-          ./vibecheck.sh --dir target --url http://localhost:3000 --dast \
-            --semgrep-config p/ci --fail-on never --no-review --no-pdf --no-baseline || rc=$?
+          VIBECHECK_AUTH_HEADER="Authorization: Bearer $token" ./vibecheck.sh --dir target --url http://localhost:3000 --dast \
+            --auth-check /api/Users --semgrep-config p/ci --fail-on never --no-review --no-pdf --no-baseline || rc=$?
           echo "vibecheck exit $rc"
           [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]   # 3 is judged by check.sh, with the reason
 

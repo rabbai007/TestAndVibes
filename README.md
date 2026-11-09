@@ -23,6 +23,7 @@ read-only dynamic** checks against a URL you control, and an optional
 | 🖼️ Images *(opt-in)* | Built container images: OS + package CVEs (with KEV/EPSS), secrets in layers, end-of-life base OS | trivy image |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
 | 🔌 API *(opt-in, `--api-spec`)* | Read-only tests generated from your OpenAPI spec: server errors, responses that break the spec, invalid input accepted, secured endpoints answering anonymous callers | [Schemathesis](https://schemathesis.io) |
+| 🔑 Logged-in scanning *(opt-in, `--auth-check`)* | DAST and API tests run as a test user, with the login proven before and after; the session token and cookies are checked (unsigned or never-expiring JWTs, secrets in claims, cookie flags) | ZAP, nuclei, Schemathesis |
 | 🕷️ Deep DAST *(opt-in, `--dast`)* | Every TLS protocol/cipher and known TLS attack; crawl + passive web-app rules; exposed files, panels and misconfigurations | testssl.sh, ZAP baseline, nuclei |
 | 🧭 Review *(default; needs a provider)* | Access control, tenant isolation, lifecycle, races, missing controls, prompt injection | an LLM |
 
@@ -78,8 +79,9 @@ targets). No config required.
 | `--dir PATH` | `.` | Directory to scan |
 | `--url URL` | — | Enable dynamic checks against this URL (implies `--dynamic`) |
 | `--all` | — | Static + dynamic |
-| `--api-spec SPEC` | — | Read-only API tests from an OpenAPI spec (file or URL) against `--url`, with Schemathesis. Auth header from `VIBECHECK_API_HEADER` |
+| `--api-spec SPEC` | — | Read-only API tests from an OpenAPI spec (file or URL) against `--url`, with Schemathesis. Auth header from `VIBECHECK_API_HEADER`, else `VIBECHECK_AUTH_HEADER` |
 | `--api-examples N` | `25` | Test cases per API operation |
+| `--auth-check PATH` | — | Scan as a logged-in user: `VIBECHECK_AUTH_HEADER` holds one header line from a test account's session, and PATH is a page that answers only when logged in. The login is verified before and after the scan |
 | `--dast` | — | Deeper, still non-destructive scan of `--url`: testssl.sh + ZAP baseline + nuclei (safe templates). Native tools, else pinned Docker images |
 | `--image REF` | — | Scan a built container image (repeatable): CVEs with KEV/EPSS, secrets in layers, end-of-life base OS |
 | `--fail-on LEVEL` | `high` | Exit 1 at/above `never\|low\|medium\|high\|critical\|any` |
@@ -285,11 +287,67 @@ Fail-closed, as everywhere:
   templates trip it against a healthy server, after which nuclei silently skips
   the remaining thousands and reports nothing. If the target did go down, the
   findings so far are kept and the pass is an ERROR, never "0 findings".
+- **nuclei must really send requests.** Thousands of templates "executed" over a
+  handful of HTTP connections is an ERROR: nuclei can load every template, send
+  almost nothing, and still print "No results found".
 - Findings already reported by pass 5 (headers, cookies, HSTS, legacy TLS, expiry)
   are not counted twice.
 
 A full run takes about 5 minutes. Active scanning (ZAP's attack mode) is
 deliberately not offered: it sends payloads that can change data.
+
+## Scanning as a logged-in user
+
+```bash
+VIBECHECK_AUTH_HEADER="Authorization: Bearer $TEST_USER_TOKEN" \
+  ./vibecheck.sh --url https://staging.my-app.com --dast --auth-check /account
+```
+
+Without a session, `--dast` and `--api-spec` see only what an anonymous visitor
+sees, which in most apps is the login page. Give VibeCheck one header line from
+a logged-in session of a **throwaway test account** (`Authorization: Bearer ...`
+or `Cookie: session=...`) and a page that only answers when logged in.
+
+**The login is proven, not assumed.** The danger of authenticated scanning is a
+login that silently does not work: every tool then scans the login page and the
+report says clean. So:
+
+| Check | When | If it fails |
+|---|---|---|
+| The `--auth-check` page answers 2xx **with** the header | before the scan | ERROR: the login did not work |
+| ...and does **not** answer 2xx without it | before the scan | ERROR: that page cannot prove a login (pick one that requires it) |
+| It still answers 2xx with the header | **after** the scan | ERROR: the session expired mid-scan, so the logged-in results are partial |
+
+Then ZAP, nuclei and Schemathesis (`--api-spec` falls back to this header) scan
+as that user. VibeCheck never logs in itself: no passwords, no login forms, no
+writes.
+
+**The session itself is checked**, from what the app issued:
+
+| Finding | Severity |
+|---|---|
+| Session JWT is unsigned (`alg: none`) | critical |
+| Session JWT carries passwords, secrets, password hashes or OTP seeds in its payload (claim names reported, never values) | high |
+| Session JWT has no expiry | medium |
+| Session JWT is valid for more than 24 hours | low |
+| A cookie set on the logged-in page lacks `HttpOnly`, `Secure` or `SameSite` | high for session-like cookies |
+
+**Keeping the credential contained:**
+
+- It is read from the environment once, then removed from it, so no scanner,
+  package manager or AI review CLI started later inherits it.
+- It is never in a command line: curl reads it from a file descriptor, ZAP from
+  its `ZAP_AUTH_HEADER*` environment (scoped to the target host), nuclei from a
+  header file in a private temp directory that is deleted straight after the scan,
+  with raw requests left out of its output (`-or`).
+- It is only sent to `--url`'s origin: an `--auth-check` on another origin is an
+  error.
+- After the scan the report directory is searched for it, and any copy a tool
+  wrote is replaced with `[REDACTED]`.
+
+Use a test account whose data you can lose and a session you can revoke. Logged
+in, the tools reach more of the app, and nuclei's checks are still read-only but
+now run with that user's rights.
 
 ## API testing from the OpenAPI spec
 
@@ -317,7 +375,9 @@ own or are authorised to test.
 - **Auth:** set `VIBECHECK_API_HEADER` to one header line. It reaches Schemathesis
   only through its environment (`${VAR}` in its config file): never the command
   line, the disk, or the report. Without it, secured operations can still be
-  checked for refusing anonymous callers.
+  checked for refusing anonymous callers. With `--auth-check` (see *Scanning as a
+  logged-in user*), `VIBECHECK_AUTH_HEADER` is used when `VIBECHECK_API_HEADER`
+  is not set.
 - **Deterministic:** a fixed seed, so the same API gives the same findings and the
   gate does not flap between identical runs.
 - **Fail-closed:** a crash, an incomplete report, no testable operation, or any
@@ -737,7 +797,9 @@ and running container, `--dast`) and asserts each of its documented flaws is sti
 found: SQL injection in login and search, SSRF, code injection, reflected XSS, an
 open redirect, a hard-coded JWT secret and RSA key, the deliberately outdated
 `jsonwebtoken` / `express-jwt` / `sanitize-html`, a workflow template injection, and
-ZAP / nuclei / header findings on the live app. The API pass is benchmarked against
+ZAP / nuclei / header findings on the live app. The live scan runs logged in, as a
+user registered for the run, and two checks (the session token's exposed password
+hash and its missing expiry) can only pass if that login was verified. The API pass is benchmarked against
 [a small API with planted bugs](tests/benchmark/api/server.py) (an endpoint that
 ignores its API key, a crash on bad input, a response that breaks its schema), and
 the job fails if that pass sends anything but `GET`, `HEAD` or `OPTIONS`. It runs

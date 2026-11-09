@@ -52,7 +52,7 @@ concurrency:
 
 jobs:
   review:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04   # pinned: a new Ubuntu is a deliberate change, not a surprise
     timeout-minutes: 45          # reasoning passes are slow; do not hang a runner all day
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1
