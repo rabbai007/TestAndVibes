@@ -22,6 +22,7 @@ read-only dynamic** checks against a URL you control, and an optional
 | ⚙️ CI/CD | GitHub Actions: script injection, fork-code triggers, unpinned actions/tools, over-broad tokens, credential persistence | [zizmor](https://docs.zizmor.sh) |
 | 🖼️ Images *(opt-in)* | Built container images: OS + package CVEs (with KEV/EPSS), secrets in layers, end-of-life base OS | trivy image |
 | 🌐 Dynamic *(opt-in)* | HTTP security headers, cookie flags, CORS, TLS version + cert expiry | curl, openssl |
+| 🔌 API *(opt-in, `--api-spec`)* | Read-only tests generated from your OpenAPI spec: server errors, responses that break the spec, invalid input accepted, secured endpoints answering anonymous callers | [Schemathesis](https://schemathesis.io) |
 | 🕷️ Deep DAST *(opt-in, `--dast`)* | Every TLS protocol/cipher and known TLS attack; crawl + passive web-app rules; exposed files, panels and misconfigurations | testssl.sh, ZAP baseline, nuclei |
 | 🧭 Review *(default; needs a provider)* | Access control, tenant isolation, lifecycle, races, missing controls, prompt injection | an LLM |
 
@@ -77,6 +78,8 @@ targets). No config required.
 | `--dir PATH` | `.` | Directory to scan |
 | `--url URL` | — | Enable dynamic checks against this URL (implies `--dynamic`) |
 | `--all` | — | Static + dynamic |
+| `--api-spec SPEC` | — | Read-only API tests from an OpenAPI spec (file or URL) against `--url`, with Schemathesis. Auth header from `VIBECHECK_API_HEADER` |
+| `--api-examples N` | `25` | Test cases per API operation |
 | `--dast` | — | Deeper, still non-destructive scan of `--url`: testssl.sh + ZAP baseline + nuclei (safe templates). Native tools, else pinned Docker images |
 | `--image REF` | — | Scan a built container image (repeatable): CVEs with KEV/EPSS, secrets in layers, end-of-life base OS |
 | `--fail-on LEVEL` | `high` | Exit 1 at/above `never\|low\|medium\|high\|critical\|any` |
@@ -287,6 +290,40 @@ Fail-closed, as everywhere:
 
 A full run takes about 5 minutes. Active scanning (ZAP's attack mode) is
 deliberately not offered: it sends payloads that can change data.
+
+## API testing from the OpenAPI spec
+
+```bash
+VIBECHECK_API_HEADER="Authorization: Bearer $STAGING_TOKEN" \
+  ./vibecheck.sh --url https://staging.my-app.com --api-spec openapi.json
+```
+
+The spec is a contract. [Schemathesis](https://schemathesis.io) generates requests
+from it (valid, edge-case and invalid) and checks the API keeps the contract:
+
+| Finding | Severity | Meaning |
+|---|---|---|
+| `ST401` API accepts requests without authentication | high | An operation the spec marks as secured answers anonymous callers |
+| `ST101` server error | medium | Input the API should reject crashes it instead (a robustness issue, often an error-message leak) |
+| `ST201`/`ST203` invalid input accepted | medium | Missing input validation |
+| spec drift (schema, status, content type) | low | The API does not do what its contract says |
+
+**Read-only by construction.** Only `GET`, `HEAD` and `OPTIONS` operations are
+tested; Schemathesis's probing of undeclared methods is switched off; the stateful
+phase and the checks that need it (which create and delete resources) are not run.
+Operations that write are counted and reported as *not sent*. Only test APIs you
+own or are authorised to test.
+
+- **Auth:** set `VIBECHECK_API_HEADER` to one header line. It reaches Schemathesis
+  only through its environment (`${VAR}` in its config file): never the command
+  line, the disk, or the report. Without it, secured operations can still be
+  checked for refusing anonymous callers.
+- **Deterministic:** a fixed seed, so the same API gives the same findings and the
+  gate does not flap between identical runs.
+- **Fail-closed:** a crash, an incomplete report, no testable operation, or any
+  operation that errored is an ERROR (exit 3).
+- Native `st` if installed (`pipx install schemathesis` or `--install`), else its
+  Docker image pinned by digest; `localhost` is mapped as for `--dast`.
 
 ## Licences and the SBOM
 
@@ -700,15 +737,19 @@ and running container, `--dast`) and asserts each of its documented flaws is sti
 found: SQL injection in login and search, SSRF, code injection, reflected XSS, an
 open redirect, a hard-coded JWT secret and RSA key, the deliberately outdated
 `jsonwebtoken` / `express-jwt` / `sanitize-html`, a workflow template injection, and
-ZAP / nuclei / header findings on the live app. It runs weekly and on any change to
-the scanner or its rules.
+ZAP / nuclei / header findings on the live app. The API pass is benchmarked against
+[a small API with planted bugs](tests/benchmark/api/server.py) (an endpoint that
+ignores its API key, a crash on bad input, a response that breaks its schema), and
+the job fails if that pass sends anything but `GET`, `HEAD` or `OPTIONS`. It runs
+weekly and on any change to the scanner or its rules.
 
 ```bash
 tests/benchmark/check.sh vibecheck-report/findings.json                # all checks
 tests/benchmark/check.sh vibecheck-report/findings.json "" sast,secrets   # source-only run
 ```
 
-The expectations live in [`tests/benchmark/expected.json`](tests/benchmark/expected.json),
+The expectations live in [`tests/benchmark/expected.json`](tests/benchmark/expected.json)
+and [`expected-api.json`](tests/benchmark/expected-api.json),
 one `jq` selector per known vulnerability. A pass that did not complete fails the
 benchmark too: its checks would mean nothing.
 

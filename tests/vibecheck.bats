@@ -38,7 +38,7 @@ setup_file() {
     [ -d "$d" ] || continue
     for f in "$d"/*; do
       n="${f##*/}"
-      case "$n" in claude|codex|gemini|gemini-api|agy|ant|trivy|osv-scanner|grype|npm|semgrep|trufflehog|gitleaks|zizmor|syft|nuclei|testssl.sh|testssl|zap.sh|zap-baseline.py|docker) continue;; esac
+      case "$n" in claude|codex|gemini|gemini-api|agy|ant|trivy|osv-scanner|grype|npm|semgrep|trufflehog|gitleaks|zizmor|syft|nuclei|testssl.sh|testssl|zap.sh|zap-baseline.py|docker|st|schemathesis) continue;; esac
       [ -x "$f" ] && [ ! -e "$clean/$n" ] && ln -s "$f" "$clean/$n"
     done
   done
@@ -1220,4 +1220,97 @@ SH
   kev_run --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --skip-secrets --skip-sast --skip-deps --skip-iac --url https://app.test/
   [ "$(jq -c '.active[] | select(.rule=="cookie-flags.sessionid") | .taxonomy | {cwe, asvs}' "$OUT/findings.json")" = \
     '{"cwe":["CWE-1004","CWE-1275"],"asvs":["V3.4.2","V3.4.3"]}' ]
+}
+
+# ── --api-spec: read-only Schemathesis ─────────────────────────────────────
+
+api_setup() {  # fake st: records argv, config and env; writes a report per FAKE_ST_MODE
+  printf '{"openapi":"3.0.3","info":{"title":"t","version":"1"},"paths":{}}' > "$BATS_TEST_TMPDIR/spec.json"
+  cat > "$BIN/st" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$FAKE_ST_ARGS"
+cfg=""; out=""; prev=""
+for a in "$@"; do [ "$prev" = --config-file ] && cfg="$a"; [ "$prev" = --report-json-path ] && out="$a"; prev="$a"; done
+cp "$cfg" "$FAKE_ST_CFG"
+[ "${VC_API_HDR_VALUE:-}" = "s3cret-value" ] && echo env-ok > "$FAKE_ST_ENV"
+case "${FAKE_ST_MODE:-findings}" in
+  crash) echo "error: boom" >&2; exit 2;;
+  none)  echo '{"complete":true,"operations":{"total":2,"selected":0,"tested":0,"errored":0},"failures":[],"test_cases":{}}' > "$out"; exit 0;;
+  errored) echo '{"complete":true,"operations":{"total":2,"selected":2,"tested":1,"errored":1},"errors":[{"title":"bad schema"}],"failures":[],"test_cases":{}}' > "$out"; exit 1;;
+  clean) echo '{"complete":true,"operations":{"total":2,"selected":2,"tested":2,"errored":0},"failures":[],"test_cases":{"total":40}}' > "$out"; exit 0;;
+  findings) cat > "$out" <<'JSON'
+{"complete":true,"operations":{"total":3,"selected":2,"tested":2,"errored":0},"test_cases":{"total":50},
+ "failures":[{"code":"ST401","title":"API accepts requests without authentication","severity":"critical","count":1,"operations":["GET /admin/stats"]},
+             {"code":"ST101","title":"Server error","severity":"critical","count":2,"operations":["GET /items/{id}"]},
+             {"code":"ST108","title":"Response violates schema","severity":"high","count":1,"operations":["GET /items/{id}"]}]}
+JSON
+  exit 1;;
+esac
+SH
+  chmod +x "$BIN/st"
+  export FAKE_ST_ARGS="$BATS_TEST_TMPDIR/st.args" FAKE_ST_CFG="$BATS_TEST_TMPDIR/st.toml" FAKE_ST_ENV="$BATS_TEST_TMPDIR/st.env"
+  API_ONLY=(--dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --no-ci-audit
+            --skip-secrets --skip-sast --skip-deps --skip-iac --url https://api.test --api-spec "$BATS_TEST_TMPDIR/spec.json")
+  cat > "$BIN/curl" <<'SH'
+#!/usr/bin/env bash
+hdr=""; while [ $# -gt 0 ]; do [ "$1" = "-D" ] && hdr="$2"; shift; done
+[ -n "$hdr" ] && printf 'HTTP/1.1 200 OK\r\nstrict-transport-security: max-age=31536000\r\ncontent-security-policy: x\r\nx-content-type-options: nosniff\r\nreferrer-policy: no-referrer\r\npermissions-policy: a=()\r\nx-frame-options: DENY\r\n\r\n' > "$hdr"
+exit 0
+SH
+  chmod +x "$BIN/curl"
+}
+
+@test "api: failures become findings per operation, with security severities; an unauthenticated endpoint gates" {
+  api_setup
+  kev_run "${API_ONLY[@]}"
+  [ "$status" -eq 1 ]
+  local f="$OUT/findings.json"
+  [ "$(jq -r '.active[] | select(.rule=="schemathesis.ST401") | "\(.severity) \(.file)"' "$f")" = "high https://api.test/admin/stats" ]
+  [ "$(jq -r '.active[] | select(.rule=="schemathesis.ST101") | .severity' "$f")" = "medium" ]
+  [ "$(jq -r '.active[] | select(.rule=="schemathesis.ST108") | .severity' "$f")" = "low" ]
+  [ "$(jq -r '.active[] | select(.rule=="schemathesis.ST401") | .taxonomy.cwe[0]' "$f")" = "CWE-306" ]
+}
+
+@test "api: the run is read-only and deterministic (GET/HEAD/OPTIONS only, no method probing, no stateful phase)" {
+  api_setup
+  kev_run "${API_ONLY[@]}"
+  grep -qx -- '--include-method-regex' "$FAKE_ST_ARGS"; grep -qxF '^(GET|HEAD|OPTIONS)$' "$FAKE_ST_ARGS"
+  grep -qx 'examples,coverage,fuzzing' "$FAKE_ST_ARGS"                      # no "stateful"
+  grep -q 'unsupported_method' "$FAKE_ST_ARGS"; grep -q 'use_after_free' "$FAKE_ST_ARGS"
+  grep -qx -- '--generation-deterministic' "$FAKE_ST_ARGS"
+  grep -q '^unexpected-methods = \[\]' "$FAKE_ST_CFG"
+}
+
+@test "api: the auth header reaches Schemathesis through the environment only - never argv or config" {
+  api_setup
+  VIBECHECK_API_HEADER="Authorization: s3cret-value" kev_run "${API_ONLY[@]}"
+  [ "$(cat "$FAKE_ST_ENV")" = "env-ok" ]
+  grep -q '"Authorization" = "${VC_API_HDR_VALUE}"' "$FAKE_ST_CFG"
+  ! grep -q 's3cret-value' "$FAKE_ST_ARGS" "$FAKE_ST_CFG"
+  ! grep -rq 's3cret-value' "$OUT"
+  [[ "$output" != *s3cret-value* ]] || false
+}
+
+@test "api: crash, nothing testable, or an errored operation is an error (exit 3); clean is ok" {
+  api_setup
+  for m in crash none errored; do
+    FAKE_ST_MODE=$m kev_run "${API_ONLY[@]}"
+    [ "$status" -eq 3 ] || { echo "mode $m exited $status"; false; }
+  done
+  FAKE_ST_MODE=clean kev_run "${API_ONLY[@]}"
+  [ "$status" -eq 0 ]
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="api") | .status' "$OUT/findings.json")" = "ok" ]
+}
+
+@test "api: bad input is an error, not a skipped test (malformed header, file spec without --url, no tool)" {
+  api_setup
+  VIBECHECK_API_HEADER="no-colon-here" kev_run "${API_ONLY[@]}"
+  [ "$status" -eq 3 ]
+  kev_run --dir "$APP" --out "$OUT" --no-baseline --no-pdf --no-review --no-ci-audit --skip-secrets --skip-sast --skip-deps --skip-iac \
+          --api-spec "$BATS_TEST_TMPDIR/spec.json"
+  [ "$status" -eq 3 ]
+  rm "$BIN/st"
+  kev_run "${API_ONLY[@]}"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"not installed and Docker unavailable"* || "$output" == *"API NOT tested"* ]] || false
 }

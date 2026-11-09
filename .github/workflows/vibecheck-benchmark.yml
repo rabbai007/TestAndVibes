@@ -5,7 +5,10 @@
 # whole class of finding while every test stays green. This job scans a
 # deliberately vulnerable app with known, documented flaws - OWASP Juice Shop,
 # source and running container - and asserts each one is still detected
-# (tests/benchmark/expected.json).
+# (tests/benchmark/expected.json). The API pass (--api-spec) is benchmarked
+# against tests/benchmark/api/server.py, a small API with planted bugs
+# (tests/benchmark/expected-api.json), because Juice Shop's spec has no
+# read-only operations to test.
 #
 # Weekly, because scanners and rulesets change underneath us without a commit
 # here; and on any change to the scanner or its rules. ~15 minutes.
@@ -51,9 +54,9 @@ jobs:
         with:
           version: v0.69.3
 
-      - name: Install scanners (semgrep, zizmor, gitleaks, osv-scanner, jq)
+      - name: Install scanners (semgrep, zizmor, schemathesis, gitleaks, osv-scanner, jq)
         run: |
-          pipx install semgrep && pipx install zizmor==1.32.0
+          pipx install semgrep && pipx install zizmor==1.32.0 && pipx install schemathesis==4.33.1
           sudo apt-get update -qq && sudo apt-get install -y -qq jq
           v=8.30.1
           curl -sSfL -o /tmp/gitleaks.tar.gz \
@@ -98,9 +101,38 @@ jobs:
           { echo '```'; cat benchmark.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
 
+      # Planted-bug API: detection, plus proof the pass stayed read-only (every
+      # request the server received is logged).
+      - name: API pass (--api-spec against the planted-bug API)
+        if: always()
+        run: |
+          mkdir -p api-target && : > api-methods.log
+          python3 -I tests/benchmark/api/server.py 8778 "$PWD/api-methods.log" > api-server.log 2>&1 &
+          for _ in $(seq 30); do curl -sf -o /dev/null http://127.0.0.1:8778/health && break; sleep 1; done
+          curl -sf -o api-openapi.json http://127.0.0.1:8778/openapi.json
+          rc=0
+          ./vibecheck.sh --dir api-target --out vibecheck-report-api --url http://127.0.0.1:8778 \
+            --api-spec api-openapi.json --skip-secrets --skip-sast --skip-deps --skip-iac --no-ci-audit \
+            --fail-on never --no-review --no-pdf --no-baseline || rc=$?
+          echo "vibecheck exit $rc"
+          rc=0
+          tests/benchmark/check.sh vibecheck-report-api/findings.json tests/benchmark/expected-api.json api > benchmark-api.txt || rc=$?
+          if grep -vE '^(GET|HEAD|OPTIONS) ' api-methods.log > api-writes.txt; then
+            printf '\nFAIL: the API pass sent a non-read request:\n' >> benchmark-api.txt
+            cat api-writes.txt >> benchmark-api.txt; rc=1
+          else
+            printf '\nread-only: %s requests, all GET/HEAD/OPTIONS\n' "$(wc -l < api-methods.log | tr -d ' ')" >> benchmark-api.txt
+          fi
+          cat benchmark-api.txt
+          { echo '```'; cat benchmark-api.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9   # v7.0.2
         if: always()
         with:
           name: benchmark-report
-          path: vibecheck-report/
+          path: |
+            vibecheck-report/
+            vibecheck-report-api/
+            api-methods.log
           include-hidden-files: true   # the .*.err scanner logs explain a failed pass
