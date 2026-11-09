@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-11-09
+
+API testing from the OpenAPI spec, read-only, with a detection benchmark that also
+proves it stays read-only.
+
 ### Added
 
 - **`--api-spec SPEC`: API testing from the OpenAPI spec** (pass 5c, opt-in), with
@@ -18,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   environment, never argv, disk or the report. Deterministic (fixed seed). A crash,
   an incomplete report, nothing testable or an errored operation is an ERROR.
   Native `st` or a digest-pinned Docker image; `--install` adds it.
+- **API benchmark.** The detection benchmark scans a small API with three planted
+  bugs (missing auth check, crash on bad input, schema-breaking response) with
+  `--api-spec`, and fails if the pass sends any request other than GET, HEAD or
+  OPTIONS.
 
 ## [0.12.0] — 2026-11-06
 
@@ -870,7 +879,8 @@ consolidated report plus a CI-friendly exit code.
 - Complementary to [benavlabs/vibe-check](https://github.com/benavlabs/vibe-check)
   (a checklist + AI-rules approach); VibeCheck adds the executable automation layer.
 
-[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/rabbai007/TestAndVibes/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/rabbai007/TestAndVibes/compare/v0.9.0...v0.10.0

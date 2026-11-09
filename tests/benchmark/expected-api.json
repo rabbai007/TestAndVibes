@@ -1,0 +1,9 @@
+{
+  "target": "tests/benchmark/api/server.py: a small API with three planted bugs, scanned with --api-spec",
+  "note": "Juice Shop's spec has no read-only operations to test, so the API pass is benchmarked against this target. The workflow also asserts the pass sent only GET, HEAD and OPTIONS.",
+  "checks": [
+    {"id": "api-no-auth",     "pass": "api", "why": "Secured /admin/stats answers without the API key (ST401)",  "select": ".tool == \"api\" and .rule == \"schemathesis.ST401\" and (.file | endswith(\"/admin/stats\"))"},
+    {"id": "api-server-error","pass": "api", "why": "GET /items/{id} crashes on a non-integer id (ST101)",       "select": ".tool == \"api\" and .rule == \"schemathesis.ST101\" and (.file | endswith(\"/items/{id}\"))"},
+    {"id": "api-schema",      "pass": "api", "why": "GET /items/{id} returns a body that breaks its schema (ST108)", "select": ".tool == \"api\" and .rule == \"schemathesis.ST108\" and (.file | endswith(\"/items/{id}\"))"}
+  ]
+}

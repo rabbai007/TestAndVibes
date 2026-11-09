@@ -737,15 +737,19 @@ and running container, `--dast`) and asserts each of its documented flaws is sti
 found: SQL injection in login and search, SSRF, code injection, reflected XSS, an
 open redirect, a hard-coded JWT secret and RSA key, the deliberately outdated
 `jsonwebtoken` / `express-jwt` / `sanitize-html`, a workflow template injection, and
-ZAP / nuclei / header findings on the live app. It runs weekly and on any change to
-the scanner or its rules.
+ZAP / nuclei / header findings on the live app. The API pass is benchmarked against
+[a small API with planted bugs](tests/benchmark/api/server.py) (an endpoint that
+ignores its API key, a crash on bad input, a response that breaks its schema), and
+the job fails if that pass sends anything but `GET`, `HEAD` or `OPTIONS`. It runs
+weekly and on any change to the scanner or its rules.
 
 ```bash
 tests/benchmark/check.sh vibecheck-report/findings.json                # all checks
 tests/benchmark/check.sh vibecheck-report/findings.json "" sast,secrets   # source-only run
 ```
 
-The expectations live in [`tests/benchmark/expected.json`](tests/benchmark/expected.json),
+The expectations live in [`tests/benchmark/expected.json`](tests/benchmark/expected.json)
+and [`expected-api.json`](tests/benchmark/expected-api.json),
 one `jq` selector per known vulnerability. A pass that did not complete fails the
 benchmark too: its checks would mean nothing.
 
