@@ -16,6 +16,8 @@
     {"id": "ci-injection",      "pass": "ci",      "why": "GitHub Actions template injection in update-challenges workflows", "select": ".tool == \"zizmor\" and (.file | test(\"update-challenges\")) and (.rule | test(\"template-injection\"))"},
     {"id": "dast-zap",          "pass": "dast",    "why": "ZAP passive rules fire on the running app",                   "select": ".tool == \"dynamic\" and .sources[0] == \"zap\""},
     {"id": "dast-nuclei",       "pass": "dast",    "why": "nuclei finds an exposure on the running app",                 "select": ".tool == \"dynamic\" and .sources[0] == \"nuclei\""},
+    {"id": "session-jwt-claims", "pass": "auth",  "why": "Logged in: the session JWT carries the password hash and TOTP secret", "select": ".rule == \"session.jwt-sensitive-claims\" and (.title | test(\"password\"))"},
+    {"id": "session-jwt-expiry", "pass": "auth",  "why": "Logged in: the session JWT has no expiry",                      "select": ".rule == \"session.jwt-no-expiry\""},
     {"id": "dast-headers",      "pass": "dynamic", "why": "Missing security headers on the running app (pass 5)",        "select": ".tool == \"dynamic\" and (.rule | startswith(\"missing-\"))"}
   ]
 }

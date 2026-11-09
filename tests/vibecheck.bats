@@ -1314,3 +1314,138 @@ SH
   [ "$status" -eq 3 ]
   [[ "$output" == *"not installed and Docker unavailable"* || "$output" == *"API NOT tested"* ]] || false
 }
+
+# ── authenticated scanning: VIBECHECK_AUTH_HEADER + --auth-check ─────────────
+
+b64u() { printf '%s' "$1" | base64 | tr '+/' '-_' | tr -d '=\n'; }
+mkjwt() { printf '%s.%s.sig' "$(b64u "$1")" "$(b64u "$2")"; }   # header-json payload-json
+
+auth_setup() {  # dast fakes, plus a curl that answers /account only when logged in
+  dast_setup
+  cat > "$BIN/curl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_CURL_ARGV"
+[ -f "${FAKE_TARGET_DEAD:-/nonexistent}" ] && exit 7
+hdr=""; body=""; w=""; url=""; sent=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -D) hdr="$2"; shift;; -o) body="$2"; shift;; -w) w="$2"; shift;;
+    -H) case "$2" in @*) sent="$(cat "${2#@}")";; *) sent="$2";; esac; shift;;
+    --max-time) shift;; -*) ;; *) url="$1";;
+  esac; shift
+done
+code=200; extra=""
+case "$url" in
+  */account)
+    if [ -n "$sent" ] && [ "$sent" = "$FAKE_GOOD_HDR" ]; then
+      n=$(( $(cat "$FAKE_AUTH_CALLS" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAKE_AUTH_CALLS"
+      if [ -n "${FAKE_EXPIRE_AFTER:-}" ] && [ "$n" -gt "$FAKE_EXPIRE_AFTER" ]; then code=401
+      else extra=$'set-cookie: sid=abc123; Path=/\r\n'; fi
+    else code="${FAKE_ANON_CODE:-401}"; fi;;
+esac
+[ -n "$hdr" ] && [ "$hdr" != /dev/null ] && printf 'HTTP/1.1 %s X\r\n%sstrict-transport-security: max-age=31536000\r\ncontent-security-policy: default-src self\r\nx-content-type-options: nosniff\r\nreferrer-policy: no-referrer\r\npermissions-policy: camera=()\r\nx-frame-options: DENY\r\n\r\n' "$code" "$extra" > "$hdr"
+[ -n "$body" ] && [ "$body" != /dev/null ] && echo '{}' > "$body"
+[ -n "$w" ] && printf '%s' "$code"
+exit 0
+SH
+  # ZAP and nuclei record how the credential reached them.
+  sed -i.bak 's|^\[ -n "${FAKE_ZAP_RC:-}" \]|printf "%s\\n" "${ZAP_AUTH_HEADER:-} ${ZAP_AUTH_HEADER_VALUE:-} ${ZAP_AUTH_HEADER_SITE:-} env=${VIBECHECK_AUTH_HEADER:-none}" > "$FAKE_ZAP_ENV"\n[ -n "${FAKE_ZAP_RC:-}" ]|' "$BIN/zap-baseline.py"
+  sed -i.bak 's|^out=""; while|for x in "$@"; do echo "$x"; done > "$(dirname "$FAKE_NUCLEI_SF")/nuclei.args"; prev=""; for a in "$@"; do [ "$prev" = -H ] \&\& { cp "$a" "$FAKE_NUCLEI_SECRETS"; echo "$a" > "$FAKE_NUCLEI_SF"; }; prev="$a"; done\nout=""; while|' "$BIN/nuclei"
+  rm -f "$BIN"/*.bak
+  chmod +x "$BIN/curl"
+  export FAKE_CURL_ARGV="$BATS_TEST_TMPDIR/curl.argv" FAKE_AUTH_CALLS="$BATS_TEST_TMPDIR/auth.calls" \
+         FAKE_ZAP_ENV="$BATS_TEST_TMPDIR/zap.env" FAKE_NUCLEI_SECRETS="$BATS_TEST_TMPDIR/nuclei.secrets" \
+         FAKE_NUCLEI_SF="$BATS_TEST_TMPDIR/nuclei.sf"
+  JWT="$(mkjwt '{"alg":"RS256","typ":"JWT"}' '{"sub":7,"data":{"email":"t@x.test","password":"pw-VALUE-9f3a","totpSecret":"totp-VALUE-77c1"},"iat":1700000000}')"
+  export FAKE_GOOD_HDR="Authorization: Bearer $JWT"
+}
+
+@test "auth: login verified before and after; the session is checked; ZAP and nuclei scan logged in" {
+  auth_setup
+  VIBECHECK_AUTH_HEADER="$FAKE_GOOD_HDR" kev_run "${DAST_ONLY[@]}" --auth-check /account
+  [ "$status" -eq 1 ]
+  local f="$OUT/findings.json"
+  [ "$(jq -r '.coverage.passes[] | select(.pass=="auth") | .status' "$f")" = "findings" ]
+  [[ "$(jq -r '.coverage.passes[] | select(.pass=="auth") | .detail' "$f")" == *"verified before and after"* ]] || false
+  [ "$(cat "$FAKE_AUTH_CALLS")" -eq 2 ]                                     # once before, once after
+  # session checks: claim NAMES are reported, never their values
+  [ "$(jq -r '.active[] | select(.rule=="session.jwt-sensitive-claims") | .severity' "$f")" = "high" ]
+  [[ "$(jq -r '.active[] | select(.rule=="session.jwt-sensitive-claims") | .title' "$f")" == *"data.password, data.totpSecret"* ]] || false
+  [ "$(jq -r '.active[] | select(.rule=="session.jwt-no-expiry") | .taxonomy.cwe[0]' "$f")" = "CWE-613" ]
+  [ "$(jq -r '.active[] | select(.rule=="cookie-flags.sid") | "\(.severity) \(.file)"' "$f")" = "high https://app.test/account" ]
+  ! grep -rqF -e 'pw-VALUE-9f3a' -e 'totp-VALUE-77c1' "$OUT"
+  # ZAP gets the header from its environment, scoped to the target host
+  [ "$(cat "$FAKE_ZAP_ENV")" = "Authorization Bearer $JWT app.test env=none" ]
+  # nuclei gets the header as a file (-H PATH), deleted after the scan, raw requests omitted
+  grep -qxF "Authorization: Bearer $JWT" "$FAKE_NUCLEI_SECRETS"
+  grep -qx -- '-or' "$BATS_TEST_TMPDIR/nuclei.args"
+  [ ! -e "$(cat "$FAKE_NUCLEI_SF")" ]
+  # the credential is in no argv and nowhere in the report directory
+  ! grep -qF "$JWT" "$FAKE_CURL_ARGV"
+  ! grep -rqF "$JWT" "$OUT"
+}
+
+@test "auth: an unsigned (alg none) session token is critical; a long-lived one is low" {
+  auth_setup
+  local now; now=$(date +%s)
+  JWT="$(mkjwt '{"alg":"none"}' "{\"sub\":1,\"iat\":$now,\"exp\":$((now + 30*86400))}")"
+  export FAKE_GOOD_HDR="Authorization: Bearer $JWT"
+  VIBECHECK_AUTH_HEADER="$FAKE_GOOD_HDR" kev_run "${DAST_ONLY[@]}" --auth-check /account
+  local f="$OUT/findings.json"
+  [ "$(jq -r '.active[] | select(.rule=="session.jwt-alg-none") | .severity' "$f")" = "critical" ]
+  [[ "$(jq -r '.active[] | select(.rule=="session.jwt-long-lived") | "\(.severity) \(.title)"' "$f")" == "low "*"720 hours"* ]] || false
+  [ "$(jq -r '[.active[] | select(.rule | IN("session.jwt-no-expiry","session.jwt-sensitive-claims"))] | length' "$f")" -eq 0 ]
+}
+
+@test "auth: a login that does not work is an error, never a logged-out scan reported clean" {
+  auth_setup
+  VIBECHECK_AUTH_HEADER="Authorization: Bearer wrong" kev_run "${DAST_ONLY[@]}" --auth-check /account
+  [ "$status" -eq 3 ]; [[ "$output" == *"login did NOT work"*"401"* ]] || false
+  [ ! -s "$FAKE_ZAP_ENV" ] || [ "$(cut -d' ' -f1 "$FAKE_ZAP_ENV")" != Authorization ]   # tools were not given it
+  FAKE_ANON_CODE=200 VIBECHECK_AUTH_HEADER="$FAKE_GOOD_HDR" kev_run "${DAST_ONLY[@]}" --auth-check /account
+  [ "$status" -eq 3 ]; [[ "$output" == *"answers anonymous callers too"* ]] || false
+}
+
+@test "auth: a session that expires during the scan is an error (results are partial)" {
+  auth_setup
+  FAKE_EXPIRE_AFTER=1 VIBECHECK_AUTH_HEADER="$FAKE_GOOD_HDR" kev_run "${DAST_ONLY[@]}" --auth-check /account
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"session stopped working during the scan"* ]] || false
+}
+
+@test "auth: bad input is an error (no --auth-check, check on another origin, malformed header, no header)" {
+  auth_setup
+  VIBECHECK_AUTH_HEADER="$FAKE_GOOD_HDR" kev_run "${DAST_ONLY[@]}"
+  [ "$status" -eq 3 ]; [[ "$output" == *"needs --auth-check"* ]] || false
+  VIBECHECK_AUTH_HEADER="$FAKE_GOOD_HDR" kev_run "${DAST_ONLY[@]}" --auth-check https://evil.test/account
+  [ "$status" -eq 3 ]; [[ "$output" == *"never sent to another origin"* ]] || false
+  ! grep -q 'evil.test' "$FAKE_CURL_ARGV"
+  VIBECHECK_AUTH_HEADER="Bearer abc" kev_run "${DAST_ONLY[@]}" --auth-check /account
+  [ "$status" -eq 3 ]; [[ "$output" == *"one header line"* ]] || false
+  kev_run "${DAST_ONLY[@]}" --auth-check /account
+  [ "$status" -eq 3 ]; [[ "$output" == *"VIBECHECK_AUTH_HEADER is not set"* ]] || false
+}
+
+@test "auth: --api-spec falls back to the login header, still through the environment only" {
+  api_setup
+  VIBECHECK_AUTH_HEADER="Authorization: s3cret-value" kev_run "${API_ONLY[@]}"
+  [ "$(cat "$FAKE_ST_ENV")" = "env-ok" ]
+  ! grep -qF 's3cret-value' "$FAKE_ST_ARGS"
+}
+
+@test "dast: nuclei executing thousands of templates over a handful of connections is an error, not 'no results'" {
+  dast_setup
+  sed -i.bak 's|^exit 0$|echo "[INF] HTTP connections: 6 total, 6 new, 0 reused (0.0%)" >\&2; exit 0|' "$BIN/nuclei"; rm -f "$BIN/nuclei.bak"
+  kev_run "${DAST_ONLY[@]}"
+  [ "$status" -eq 3 ]
+  [[ "$output" == *"over only 6 HTTP connection(s)"* ]] || false
+}
+
+@test "auth: a credential a tool wrote into the report directory is redacted" {
+  auth_setup
+  sed -i.bak 's|^exit 2$|echo "$ZAP_AUTH_HEADER_VALUE" > leaked.txt; exit 2|' "$BIN/zap-baseline.py"; rm -f "$BIN/zap-baseline.py.bak"
+  VIBECHECK_AUTH_HEADER="$FAKE_GOOD_HDR" kev_run "${DAST_ONLY[@]}" --auth-check /account
+  [ "$(cat "$OUT/leaked.txt")" = "[REDACTED]" ]
+  [[ "$output" == *"redacted"* ]] || false
+  ! grep -rqF "$JWT" "$OUT"
+}

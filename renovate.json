@@ -1,0 +1,81 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Keeps every pinned scanner, image and action current. Each update is its own PR, so the detection benchmark and the tests judge it before it lands.",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "schedule": [
+    "before 6am on monday"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "prConcurrentLimit": 5,
+  "minimumReleaseAge": "3 days",
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Scanner images pinned by digest in vibecheck.sh: VAR=\"${OVERRIDE:-image@sha256:...}\"  # tag",
+      "managerFilePatterns": [
+        "/^vibecheck\\.sh$/"
+      ],
+      "matchStrings": [
+        "\\$\\{VIBECHECK_IMG_[A-Z]+:-(?<depName>[^@\"]+)@(?<currentDigest>sha256:[a-f0-9]{64})\\}\"\\s+#\\s*(?<currentValue>\\S+)"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "Python scanners installed with pipx in the workflows",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "pipx install (?<depName>[a-z0-9-]+)==(?<currentValue>[0-9][^\\s&]*)"
+      ],
+      "datasourceTemplate": "pypi"
+    },
+    {
+      "customType": "regex",
+      "description": "Release binaries downloaded in the benchmark workflow",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "(?:v|o)=(?<currentValue>[0-9][0-9.]*)\\s*\\n[^\\n]*\\n\\s*\"https://github\\.com/(?<depName>[^/]+/[^/]+)/releases/"
+      ],
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v?(?<version>.*)$"
+    },
+    {
+      "customType": "regex",
+      "description": "trivy version given to aquasecurity/setup-trivy",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "setup-trivy@[^\\n]*\\n\\s*with:\\s*\\n\\s*version:\\s*(?<currentValue>v[0-9.]+)"
+      ],
+      "depNameTemplate": "aquasecurity/trivy",
+      "datasourceTemplate": "github-releases"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "The benchmark target must not move: its expected detections are written against this exact release",
+      "matchDepNames": [
+        "bkimminich/juice-shop",
+        "juice-shop/juice-shop"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "The copy-paste templates in ci/ use readable tags on purpose",
+      "matchFileNames": [
+        "ci/**"
+      ],
+      "enabled": false
+    }
+  ]
+}

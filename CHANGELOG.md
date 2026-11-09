@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Authenticated scanning (`VIBECHECK_AUTH_HEADER` + `--auth-check PATH`).**
+  `--dast` and `--api-spec` scan as a logged-in test user. The login is proven
+  before the scan (the check page must answer 2xx with the header and not without
+  it) and again after it; a login that does not work, a check page that answers
+  anonymous callers, or a session that expired mid-scan is an ERROR, never a
+  logged-out scan reported clean. VibeCheck never logs in itself.
+- **Session checks.** With a session, the token and cookies the app issued are
+  checked: an unsigned JWT (`alg: none`, critical), passwords, secrets, hashes or
+  OTP seeds in JWT claims (high; claim names only, never values), a JWT with no
+  expiry (medium) or one valid for over 24 hours (low), and cookie flags on the
+  logged-in page. Each carries its CWE.
+- **The credential is contained.** Read from the environment once and removed
+  from it, so no later process (scanners, AI review CLIs) inherits it; never in a
+  command line; sent only to `--url`'s origin; and the report directory is
+  scrubbed of any copy a tool wrote.
+- **Renovate** keeps the pinned scanner images, Python scanners, release binaries
+  and action SHAs current, one PR per update, so the benchmark and tests judge
+  each before it lands. The benchmark target (Juice Shop) and the copy-paste
+  templates in `ci/` are deliberately not updated.
+
+### Changed
+
+- CI runs on `ubuntu-26.04`, pinned, instead of `ubuntu-latest`. It is the image
+  every recent run already used; a new Ubuntu is now a deliberate change.
+
+### Fixed
+
+- **nuclei could "execute" every template while sending almost no requests**
+  and report "No results found". Thousands of templates over a handful of HTTP
+  connections is now an ERROR.
+
 ## [0.13.0] — 2026-11-09
 
 API testing from the OpenAPI spec, read-only, with a detection benchmark that also

@@ -70,9 +70,17 @@ API_EXAMPLES=25         # test cases per operation (--api-examples)
 DAST_IMG_SCHEMATHESIS="${VIBECHECK_IMG_SCHEMATHESIS:-schemathesis/schemathesis@sha256:ddf8b3c9e0b3ee7edfa65dad4d0c0e05c53fb5d92f99db379d40da01883474c7}"  # v4.33.1
 DO_DAST=0               # opt-in (--dast): testssl.sh + ZAP baseline + nuclei (safe templates) against --url
 # Pinned by digest: a moving tag would change what "clean" means without a commit.
-DAST_IMG_TESTSSL="${VIBECHECK_IMG_TESTSSL:-ghcr.io/testssl/testssl.sh@sha256:53766ec224a2d841b5516bc3923a8586379069ad01c65bbae9244aa24d72a18d}"  # 3.2.5
+DAST_IMG_TESTSSL="${VIBECHECK_IMG_TESTSSL:-ghcr.io/testssl/testssl.sh@sha256:53766ec224a2d841b5516bc3923a8586379069ad01c65bbae9244aa24d72a18d}"  # 3.2 (testssl.sh 3.2.5; the image publishes minor tags only)
 DAST_IMG_ZAP="${VIBECHECK_IMG_ZAP:-ghcr.io/zaproxy/zaproxy@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af}"            # 2.17.0
 DAST_IMG_NUCLEI="${VIBECHECK_IMG_NUCLEI:-projectdiscovery/nuclei@sha256:582d5546902e67052097cb2d07296c642d50a1afc5e44623cb038845df9a32eb}"     # v3.11.1
+AUTH_CHECK=""           # --auth-check PATH|URL: a page that answers 2xx only when logged in
+# Credentials for authenticated scanning are read ONCE into unexported shell
+# variables and removed from the environment, so no scanner, package manager or
+# AI CLI started later inherits them. Each tool that needs one gets it for that
+# one command only (an env prefix, or a private file deleted straight after).
+AUTH_HDR="${VIBECHECK_AUTH_HEADER:-}"
+API_HDR="${VIBECHECK_API_HEADER:-$AUTH_HDR}"   # --api-spec falls back to the login header
+unset VIBECHECK_AUTH_HEADER VIBECHECK_API_HEADER
 MCP_TARGET=""           # opt-in MCP server probe: URL (http/https) or a command to spawn (stdio)
 MCP_TIMEOUT=20          # seconds for the MCP handshake/list calls
 MCP_HEADER=""           # optional single HTTP header for an authed MCP endpoint (e.g. "Authorization: Bearer …")
@@ -125,6 +133,19 @@ OPTIONS
                        fuzz and brute-force templates excluded; no OOB callbacks).
                        Native tools if installed, else their pinned Docker images.
                        Only scan targets you own or are authorised to test.
+  --auth-check PATH    Authenticated scanning: set VIBECHECK_AUTH_HEADER to one
+                       header line from a logged-in session of a THROWAWAY test
+                       account ("Authorization: Bearer ..." or "Cookie: sid=...")
+                       and give a page that answers 2xx only when logged in
+                       (/account, or a URL on --url's origin). The login is
+                       verified before the scan (with and without the header)
+                       and again after it; a login that does not work, or a
+                       session that expires mid-scan, is an ERROR, never a clean
+                       logged-out scan. --dast and --api-spec then scan as that
+                       user, and the session itself is checked (cookie flags;
+                       JWT algorithm, expiry and sensitive claims). The header
+                       is read from the environment only and scrubbed from the
+                       report directory.
   --all                Static + dynamic
   --image REF          Scan a built container image (repeatable): OS + language
                        package CVEs, secrets baked into layers, end-of-life base
@@ -333,6 +354,7 @@ while [ $# -gt 0 ]; do
     --dir) TARGET="${2:?--dir needs a path}"; shift 2;;
     --url) URL="${2:?--url needs a URL}"; DYNAMIC=1; shift 2;;
     --dast) DO_DAST=1; DYNAMIC=1; shift;;
+    --auth-check) AUTH_CHECK="${2:?--auth-check needs a path such as /account, or a URL on the --url origin}"; shift 2;;
     --api-spec) API_SPEC="${2:?--api-spec needs an OpenAPI file or URL}"; shift 2;;
     --api-examples) API_EXAMPLES="${2:?--api-examples needs a number}"; shift 2;;
     --image) IMAGES+=("${2:?--image needs an image reference}"); shift 2;;
@@ -1507,6 +1529,122 @@ else
   fi
 fi
 
+# check_cookies  HEADERS  URL  -> findings per Set-Cookie; sets CK_N, CK_TOTAL.
+# Evaluated PER COOKIE. 0.1.0 passed if *any* cookie had HttpOnly, so a session
+# cookie missing it hid behind a compliant tracker.
+check_cookies() {
+  local ck name sensitive sev miss
+  CK_N=0; CK_TOTAL=0
+  while IFS= read -r ck; do
+    [ -z "$ck" ] && continue
+    CK_TOTAL=$((CK_TOTAL+1))
+    name="$(printf '%s' "$ck" | sed 's/^[^:]*:[[:space:]]*//; s/=.*//')"
+    sensitive=0
+    printf '%s' "$name" | grep -qiE '(sess|sid|auth|token|jwt|login|remember|csrf)' && sensitive=1
+    sev=low; [ "$sensitive" = 1 ] && sev=high
+    miss=""
+    printf '%s' "$ck" | grep -iq 'httponly'  || miss="$miss HttpOnly"
+    printf '%s' "$ck" | grep -iq 'secure'    || miss="$miss Secure"
+    printf '%s' "$ck" | grep -iq 'samesite'  || miss="$miss SameSite"
+    if [ -n "$miss" ]; then
+      CK_N=$((CK_N+1))
+      if [ "$sensitive" = 1 ]; then bad "cookie '$name' (session-like) missing:$miss"
+      else warn "cookie '$name' missing:$miss"; fi
+      add_finding dynamic "$sev" "cookie-flags.$name" "$2" 0 \
+        "Set-Cookie '$name' missing:$miss" \
+        "https://developer.mozilla.org/docs/Web/HTTP/Headers/Set-Cookie"
+    else ok "cookie '$name': HttpOnly + Secure + SameSite"; fi
+  done < <(printf '%s\n' "$1" | grep -i '^set-cookie:')
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# 5a. authenticated scanning (opt-in: VIBECHECK_AUTH_HEADER + --auth-check)
+# ═══════════════════════════════════════════════════════════════════
+# The scanners only see what an anonymous visitor sees unless they carry a
+# session. The danger of authenticated scanning is a login that silently does
+# not work: every tool then scans the login page and reports "clean". So the
+# login is PROVEN before the scan (the check page must answer 2xx with the
+# header and not without it) and re-checked after it (a session that expired
+# mid-scan makes the logged-in results partial). Either failure is an ERROR.
+# VibeCheck never logs in itself: no passwords, no login forms, no writes.
+AUTH_ON=0; AUTH_HNAME=""; AUTH_VAL=""; AUTH_CHECK_URL=""; AUTH_N=0
+url_origin() { printf '%s' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/?#]+).*#\1#' | tr '[:upper:]' '[:lower:]'; }
+# The header reaches curl through a file descriptor (-H @fd), never argv.
+auth_get() {  # with|without  BODY  HEADERS  -> HTTP status
+  if [ "$1" = with ]; then
+    curl -s -o "$2" -D "$3" -w '%{http_code}' --max-time 20 -H @<(printf '%s\n' "$AUTH_HDR") "$AUTH_CHECK_URL" 2>/dev/null
+  else
+    curl -s -o "$2" -D "$3" -w '%{http_code}' --max-time 20 "$AUTH_CHECK_URL" 2>/dev/null
+  fi
+}
+b64url_json() { jq -Rr 'gsub("-";"+") | gsub("_";"/") | . + ("=" * ((4 - length % 4) % 4)) | @base64d' 2>/dev/null; }
+if [ -z "$AUTH_HDR" ] && [ -z "$AUTH_CHECK" ]; then
+  set_status auth skipped "not requested (VIBECHECK_AUTH_HEADER + --auth-check)"
+else
+  head2 "5a. Authenticated scanning - login check"
+  say "  ${C_D}use a throwaway test account on a non-production deployment${C_0}"
+  AUTH_HNAME="${AUTH_HDR%%:*}"
+  case "$AUTH_CHECK" in
+    /*) AUTH_CHECK_URL="$(url_origin "$URL")$AUTH_CHECK";;
+    *)  AUTH_CHECK_URL="$AUTH_CHECK";;
+  esac
+  if [ -z "$URL" ]; then
+    pass_error auth "authenticated scanning needs --url - nothing was scanned logged in"
+  elif [ -z "$AUTH_HDR" ]; then
+    pass_error auth "--auth-check given but VIBECHECK_AUTH_HEADER is not set - nothing was scanned logged in"
+  elif [ "$AUTH_HNAME" = "$AUTH_HDR" ] || ! printf '%s' "$AUTH_HNAME" | grep -qE '^[A-Za-z0-9-]+$'; then
+    pass_error auth "VIBECHECK_AUTH_HEADER must be one header line, \"Name: value\" - nothing was scanned logged in"
+  elif [ -z "$AUTH_CHECK" ]; then
+    pass_error auth "VIBECHECK_AUTH_HEADER needs --auth-check PATH, a page that answers only when logged in: without it a login that does not work would look like a clean scan"
+  elif ! printf '%s' "$AUTH_CHECK_URL" | grep -qE '^https?://' || [ "$(url_origin "$AUTH_CHECK_URL")" != "$(url_origin "$URL")" ]; then
+    pass_error auth "--auth-check must be a path (/account) or a URL on $(url_origin "$URL"): the credential is never sent to another origin"
+  else
+    AUTH_VAL="${AUTH_HDR#*:}"; AUTH_VAL="${AUTH_VAL# }"
+    A_DIR="$OUTDIR/.auth"; rm -rf "$A_DIR"; mkdir -p "$A_DIR"
+    a_anon="$(auth_get without /dev/null "$A_DIR/anon.headers")"
+    a_with="$(auth_get with "$A_DIR/with.body" "$A_DIR/with.headers")"
+    case "$a_with" in
+      2??) a_ok=1;;
+      *)   a_ok=0;;
+    esac
+    if [ "$a_ok" = 0 ]; then
+      pass_error auth "login did NOT work: $AUTH_CHECK_URL answered $a_with with the $AUTH_HNAME header (expired or wrong credential?) - nothing was scanned logged in"
+    elif printf '%s' "$a_anon" | grep -qE '^2'; then
+      pass_error auth "$AUTH_CHECK_URL answers anonymous callers too ($a_anon), so it cannot prove the login worked: choose a page that requires login - nothing was scanned logged in"
+    else
+      AUTH_ON=1
+      ok "login verified: $AUTH_CHECK_URL answers $a_with with the $AUTH_HNAME header, $a_anon without (value not logged)"
+      # ── session checks: what did the app issue? ──
+      check_cookies "$(tr -d '\r' < "$A_DIR/with.headers")" "$AUTH_CHECK_URL"; AUTH_N=$((AUTH_N+CK_N))
+      jwt="$(printf '%s' "$AUTH_VAL" | grep -oE 'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*' | head -1)"
+      if [ -n "$jwt" ]; then
+        j_h="$(printf '%s' "${jwt%%.*}" | b64url_json)"; j_p="$(printf '%s' "$jwt" | cut -d. -f2 | b64url_json)"
+        if jq -e 'type == "object"' <<<"$j_h" >/dev/null 2>&1 && jq -e 'type == "object"' <<<"$j_p" >/dev/null 2>&1; then
+          while IFS=$'\x1f' read -r sev rule title; do
+            [ -z "${rule:-}" ] && continue
+            AUTH_N=$((AUTH_N+1))
+            case "$sev" in critical|high) bad "$title";; *) warn "$title";; esac
+            add_finding dynamic "$sev" "$rule" "$AUTH_CHECK_URL" 0 "$title" "https://cheatsheetseries.owasp.org/cheatsheets/JSON_Web_Token_for_Java_Cheat_Sheet.html"
+          # Claim NAMES only: the values are the user's data and never reach a report.
+          done < <(jq -rn --argjson h "$j_h" --argjson p "$j_p" --argjson now "$(date +%s)" '
+            def sensitive: [ $p | paths as $pa | select(($pa[-1] | type) == "string")
+                             | select($pa[-1] | test("^(pass(word|wd)?|pwd|.*secret|.*_?hash|totp.*|otp_?seed|ssn|cvv|card_?number|credit_?card)$"; "i"))
+                             | $pa | map(tostring) | join(".") ] | unique;
+            (if (($h.alg // "") | ascii_downcase) == "none" then
+               ["critical", "session.jwt-alg-none", "Session JWT is unsigned (alg: none): anyone can forge a session"] else empty end),
+            (if $p.exp == null then
+               ["medium", "session.jwt-no-expiry", "Session JWT has no expiry (exp): a stolen token works until the signing key changes"]
+             else ((($p.exp | tonumber) - (($p.iat // $now) | tonumber)) / 3600 | floor) as $hrs |
+               if $hrs > 24 then ["low", "session.jwt-long-lived", "Session JWT is valid for \($hrs) hours (over 24): a stolen token stays useful"] else empty end end),
+            (sensitive | if length > 0 then
+               ["high", "session.jwt-sensitive-claims", "Session JWT exposes \(join(", ")) in its payload: JWT claims are encoded, not encrypted, so anyone holding the token can read them"] else empty end)
+            | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' 2>/dev/null)
+        else say "  ${C_D}credential looks like a JWT but does not decode - JWT checks skipped${C_0}"; fi
+      else say "  ${C_D}credential is not a JWT - JWT checks not applicable${C_0}"; fi
+    fi
+  fi
+fi
+
 # ═══════════════════════════════════════════════════════════════════
 # 5. dynamic (opt-in, read-only)
 # ═══════════════════════════════════════════════════════════════════
@@ -1585,29 +1723,7 @@ elif [ "$DYNAMIC" = 1 ]; then
       fi
     else ok "no wildcard CORS on this response"; fi
 
-    # Cookies — evaluated PER COOKIE. 0.1.0 passed if *any* cookie had
-    # HttpOnly, so a session cookie missing it hid behind a compliant tracker.
-    ck_total=0
-    while IFS= read -r ck; do
-      [ -z "$ck" ] && continue
-      ck_total=$((ck_total+1))
-      name="$(printf '%s' "$ck" | sed 's/^[^:]*:[[:space:]]*//; s/=.*//')"
-      sensitive=0
-      printf '%s' "$name" | grep -qiE '(sess|sid|auth|token|jwt|login|remember|csrf)' && sensitive=1
-      sev=low; [ "$sensitive" = 1 ] && sev=high
-      miss=""
-      printf '%s' "$ck" | grep -iq 'httponly'  || miss="$miss HttpOnly"
-      printf '%s' "$ck" | grep -iq 'secure'    || miss="$miss Secure"
-      printf '%s' "$ck" | grep -iq 'samesite'  || miss="$miss SameSite"
-      if [ -n "$miss" ]; then
-        dyn_n=$((dyn_n+1))
-        if [ "$sensitive" = 1 ]; then bad "cookie '$name' (session-like) missing:$miss"
-        else warn "cookie '$name' missing:$miss"; fi
-        add_finding dynamic "$sev" "cookie-flags.$name" "$URL" 0 \
-          "Set-Cookie '$name' missing:$miss" \
-          "https://developer.mozilla.org/docs/Web/HTTP/Headers/Set-Cookie"
-      else ok "cookie '$name': HttpOnly + Secure + SameSite"; fi
-    done < <(printf '%s\n' "$hdrs" | grep -i '^set-cookie:')
+    check_cookies "$hdrs" "$URL"; dyn_n=$((dyn_n+CK_N)); ck_total=$CK_TOTAL
     [ "$ck_total" = 0 ] && say "  ${C_D}no cookies on this response${C_0}"
 
     srv="$(hdr_val server)"
@@ -1733,12 +1849,21 @@ else
   # ── ZAP baseline (spider + passive scan) ──
   zj="$OUTDIR/zap.json"; rm -f "$zj"
   # -I: do not fail on warnings (we gate); -m 1: one minute of spidering.
+  # Logged in: ZAP adds the header itself, from its ZAP_AUTH_HEADER* environment
+  # (never argv), and only to requests for the target host (_SITE).
+  z_env=(); z_denv=()
+  if [ "$AUTH_ON" = 1 ]; then
+    z_site="${D_URL#*://}"; z_site="${z_site%%/*}"; z_site="${z_site%:*}"
+    z_env=(ZAP_AUTH_HEADER="$AUTH_HNAME" ZAP_AUTH_HEADER_VALUE="$AUTH_VAL" ZAP_AUTH_HEADER_SITE="$z_site")
+    z_denv=(-e ZAP_AUTH_HEADER -e ZAP_AUTH_HEADER_VALUE -e ZAP_AUTH_HEADER_SITE)
+  fi
   if have zap-baseline.py; then
-    (cd "$OUTDIR" && zap-baseline.py -t "$URL" -J zap.json -I -m 1 >/dev/null 2>"$OUTDIR/.zap.err"); z_rc=$?; dast_tools="$dast_tools zap"
+    (cd "$OUTDIR" && env "${z_env[@]+"${z_env[@]}"}" zap-baseline.py -t "$URL" -J zap.json -I -m 1 >/dev/null 2>"$OUTDIR/.zap.err"); z_rc=$?; dast_tools="$dast_tools zap"
   elif dast_docker_ok; then
     # The image writes reports to /zap/wrk as the zap user (uid 1000).
     chmod 777 "$OUTDIR" 2>/dev/null
-    docker run --rm "${D_NET[@]+"${D_NET[@]}"}" -v "$OUTDIR:/zap/wrk:rw" "$DAST_IMG_ZAP" \
+    # `env A=b docker run -e A` copies the value from docker's environment: not in argv.
+    env "${z_env[@]+"${z_env[@]}"}" docker run --rm "${D_NET[@]+"${D_NET[@]}"}" "${z_denv[@]+"${z_denv[@]}"}" -v "$OUTDIR:/zap/wrk:rw" "$DAST_IMG_ZAP" \
       zap-baseline.py -t "$D_URL" -J zap.json -I -m 1 >/dev/null 2>"$OUTDIR/.zap.err"; z_rc=$?; dast_tools="$dast_tools zap(docker)"
   else z_rc=127; echo "ZAP (zap-baseline.py) not installed and Docker unavailable" > "$OUTDIR/.zap.err"; fi
   # zap-baseline exits 0/1/2 for pass/fail/warn and 3 for "could not scan".
@@ -1775,9 +1900,22 @@ else
   # checks off (-duc). The template release is recorded in the report: it is the
   # ruleset, and it changes what "clean" means.
   n_tv=""
+  # -or: no raw request/response in the output (a logged-in request carries the
+  # credential). Logged in, the header reaches nuclei as a header FILE (-H
+  # accepts a path), never argv, in a private temp dir deleted straight after
+  # the scan. Not nuclei's host-scoped secrets file (-sf): with the full
+  # template set it loaded every template and then sent ~6 requests (0.14
+  # development). -H applies to every request, but nuclei only talks to the
+  # target: out-of-band callbacks are off (-ni).
+  n_args+=(-or); n_sf=(); n_dsf=(); N_SEC=""
+  if [ "$AUTH_ON" = 1 ]; then
+    N_SEC="$(mktemp -d)"; chmod 700 "$N_SEC"; trap 'rm -rf "$N_SEC"' EXIT
+    ( umask 077; printf '%s: %s\n' "$AUTH_HNAME" "$AUTH_VAL" > "$N_SEC/headers.txt" )
+    n_sf=(-H "$N_SEC/headers.txt"); n_dsf=(-H /vcauth/headers.txt)
+  fi
   if have nuclei; then
     nuclei -ut -silent >/dev/null 2>"$OUTDIR/.nuclei.err"
-    nuclei "${n_args[@]}" -u "$URL" -o "$nj" >/dev/null 2>>"$OUTDIR/.nuclei.err"; n_rc=$?; dast_tools="$dast_tools nuclei"
+    nuclei "${n_args[@]}" "${n_sf[@]+"${n_sf[@]}"}" -u "$URL" -o "$nj" >/dev/null 2>>"$OUTDIR/.nuclei.err"; n_rc=$?; dast_tools="$dast_tools nuclei"
     n_tv="$(nuclei -tv 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | tail -1)"
   elif dast_docker_ok; then
     # Templates are cached in a named volume, not re-downloaded per run.
@@ -1786,9 +1924,13 @@ else
     n_docker=(docker run --rm "${D_NET[@]+"${D_NET[@]}"}" -v "$OUTDIR:/out" -v vibecheck-nuclei-templates:/root/nuclei-templates
               -v vibecheck-nuclei-config:/root/.config/nuclei "$DAST_IMG_NUCLEI")
     "${n_docker[@]}" -ut -silent >/dev/null 2>"$OUTDIR/.nuclei.err"
-    "${n_docker[@]}" "${n_args[@]}" -u "$D_URL" -o /out/nuclei.jsonl >/dev/null 2>>"$OUTDIR/.nuclei.err"; n_rc=$?; dast_tools="$dast_tools nuclei(docker)"
+    n_auth=(); [ -n "$N_SEC" ] && n_auth=(-v "$N_SEC:/vcauth:ro")
+    docker run --rm "${D_NET[@]+"${D_NET[@]}"}" -v "$OUTDIR:/out" -v vibecheck-nuclei-templates:/root/nuclei-templates \
+      -v vibecheck-nuclei-config:/root/.config/nuclei "${n_auth[@]+"${n_auth[@]}"}" "$DAST_IMG_NUCLEI" \
+      "${n_args[@]}" "${n_dsf[@]+"${n_dsf[@]}"}" -u "$D_URL" -o /out/nuclei.jsonl >/dev/null 2>>"$OUTDIR/.nuclei.err"; n_rc=$?; dast_tools="$dast_tools nuclei(docker)"
     n_tv="$("${n_docker[@]}" -tv 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | tail -1)"
   else n_rc=127; echo "nuclei not installed and Docker unavailable" > "$OUTDIR/.nuclei.err"; fi
+  [ -n "$N_SEC" ] && rm -rf "$N_SEC"
   [ -n "$n_tv" ] && printf '%s\n' "$(jq -cn --arg v "$n_tv" '{tool:"nuclei-templates", pass:"dast", version:$v, installed:true}')" >> "$TOOLING"
   # nuclei exits 0 even when it scanned nothing: when the target stops
   # answering it drops the host ("unresponsive permanently") and finishes
@@ -1808,6 +1950,12 @@ else
       dast_fail="$dast_fail nuclei(the target $n_hp stopped responding mid-scan and nuclei dropped it - results are partial)"
     elif [ "${n_tpl:-0}" -eq 0 ]; then
       dast_fail="$dast_fail nuclei(no templates were executed)"
+    # Thousands of templates "executed" over a handful of connections is not a
+    # scan: nuclei can load every template and then send almost nothing (seen
+    # with a secrets file, 0.14 development), and still say "No results found".
+    elif n_conn="$(grep -oE 'HTTP connections: [0-9]+ total' "$OUTDIR/.nuclei.err" | grep -oE '[0-9]+' | tail -1)" \
+         && [ -n "$n_conn" ] && [ "${n_tpl:-0}" -ge 500 ] && [ "$n_conn" -lt 100 ]; then
+      dast_fail="$dast_fail nuclei(ran $n_tpl templates over only $n_conn HTTP connection(s) - the scan did not really happen)"
     fi
     while IFS=$'\x1f' read -r sev tid name at cve ref; do
       [ -z "${tid:-}" ] && continue
@@ -1822,7 +1970,7 @@ else
                     | map(tostring | gsub("[\n\r\t]"; " ")) | join("\u001f")' "$nj" 2>/dev/null | sort -u)
   fi
 
-  say "  ${C_D}tools:$dast_tools${C_0}"
+  say "  ${C_D}tools:$dast_tools$([ "$AUTH_ON" = 1 ] && echo " - logged in ($AUTH_HNAME header)")${C_0}"
   if [ -n "$dast_fail" ]; then
     pass_error dast "could not complete:$dast_fail - the deep scan is NOT complete"
   elif [ "$dast_n" -gt 0 ]; then warn "deep DAST: $dast_n finding(s)"; set_status dast findings "$dast_n finding(s) from$dast_tools"
@@ -1846,7 +1994,7 @@ if [ -z "$API_SPEC" ]; then
 else
   head2 "5c. API testing from the spec (Schemathesis, read-only)"
   say "  ${C_D}only test APIs you own or are authorised to test${C_0}"
-  api_hdr="${VIBECHECK_API_HEADER:-}"; api_hname=""
+  api_hdr="$API_HDR"; api_hname=""
   [ -n "$api_hdr" ] && api_hname="${api_hdr%%:*}"
   case "$API_EXAMPLES" in ''|*[!0-9]*) API_EXAMPLES=x;; esac
   if [ -z "$URL" ] && ! printf '%s' "$API_SPEC" | grep -qE '^https?://'; then
@@ -1935,6 +2083,33 @@ else
       if [ "$ap_n" -gt 0 ]; then warn "API: $ap_n finding(s)"; set_status api findings "$ap_n finding(s); $ap_ops"
       else ok "API: 0 findings; $ap_ops"; set_status api ok "0 findings; $ap_ops"; fi
     fi
+  fi
+fi
+
+# ── authenticated scanning: is the session still valid? ──
+# Checked AFTER every logged-in pass: a session that expired mid-scan means the
+# tools spent the rest of the run on the login page, so their "clean" is not.
+if [ "$AUTH_ON" = 1 ]; then
+  a_after="$(auth_get with /dev/null /dev/null)"
+  if printf '%s' "$a_after" | grep -qE '^2'; then
+    a_det="login verified before and after the scan ($AUTH_HNAME header, $AUTH_CHECK_URL)"
+    if [ "$AUTH_N" -gt 0 ]; then set_status auth findings "$AUTH_N session finding(s); $a_det"
+    else set_status auth ok "0 session findings; $a_det"; fi
+  else
+    pass_error auth "the session stopped working during the scan ($AUTH_CHECK_URL now answers $a_after): logged-in results are partial - use a test session that outlives the scan"
+  fi
+fi
+# Defence in depth: whatever a tool wrote, the credential never stays in the
+# report directory. (perl reads the value from its environment, not argv.)
+if [ "${#AUTH_VAL}" -ge 8 ] || [ "${#API_HDR}" -ge 12 ]; then
+  a_api="${API_HDR#*:}"; a_api="${a_api# }"
+  a_hits="$( { [ "${#AUTH_VAL}" -ge 8 ] && grep -rlF -- "$AUTH_VAL" "$OUTDIR" 2>/dev/null
+              [ "${#a_api}" -ge 8 ] && grep -rlF -- "$a_api" "$OUTDIR" 2>/dev/null; } | sort -u)"
+  if [ -n "$a_hits" ]; then
+    while IFS= read -r f; do
+      VC_S1="$AUTH_VAL" VC_S2="$a_api" perl -pi -e 'for my $k ("VC_S1","VC_S2") { my $v = $ENV{$k}; next if length($v) < 8; s/\Q$v\E/[REDACTED]/g }' "$f"
+    done <<<"$a_hits"
+    warn "credential found in $(printf '%s\n' "$a_hits" | wc -l | tr -d ' ') report file(s) and redacted"
   fi
 fi
 
@@ -2579,6 +2754,9 @@ if jq -c --slurpfile lk "$TAX_LOOKUP" '
       elif .rule == "server-banner" then {cwe: ["CWE-200"], asvs: ["V14.3.3"]}
       elif .rule == "tls-legacy-protocol" then {cwe: ["CWE-327"], asvs: ["V9.1.3"]}
       elif .rule == "no-tls" then {cwe: ["CWE-319"], asvs: ["V9.1.1"]}
+      elif .rule == "session.jwt-alg-none" then {cwe: ["CWE-347"]}
+      elif (.rule | IN("session.jwt-no-expiry","session.jwt-long-lived")) then {cwe: ["CWE-613"]}
+      elif .rule == "session.jwt-sensitive-claims" then {cwe: ["CWE-312"]}
       else {} end
     else {} end;
   ($lk[0][.tool + "|" + .rule] // {}) as $s | own as $o |
@@ -2741,7 +2919,7 @@ fi
 # A3: "no pass examined anything" is not a clean result. Disabling every scanner
 # — by flag or by config — used to yield 0 findings and exit 0, which is
 # indistinguishable from a repo with nothing wrong. An empty scan is unknown.
-EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","license","iac","ci","dynamic","dast","api","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
+EXECUTED=$(jq -s '[.[]|select(.pass|IN("secrets","sast","deps","image","license","iac","ci","dynamic","auth","dast","api","review","mcp"))|select(.status=="ok" or .status=="findings")]|length' "$STATUS")
 if [ "${EXECUTED:-0}" -eq 0 ]; then
   pass_error coverage "no scan pass examined anything (all were skipped, disabled, or failed) — this result is unknown, not clean"
 fi
